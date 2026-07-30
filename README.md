@@ -1,11 +1,13 @@
 # agent-session-router
 
-`agent-session-router` routes messages to a named, currently connected AI agent
-session and returns the result to the requesting session.
+`agent-session-router` routes messages between named, explicitly connected AI
+agent sessions and returns each result to the requesting session.
 
-The project keeps each AgentBridge pair isolated. A small router is added above
-those pairs so a coordinator can select a recipient by `agentId` instead of
-sharing one pair between several agents.
+Each system runs a provider connector for its local agent. The connector opens
+an outbound WebSocket to the router, registers a neutral `agentId`, translates
+inbound deliveries through a provider-specific session adapter, and exposes
+router messaging tools back to the local agent. Agents never connect directly
+to one another.
 
 ## Status
 
@@ -15,10 +17,15 @@ This repository currently contains the local-first routing foundation:
 - WebSocket registration and discovery
 - targeted request delivery
 - correlated replies with timeouts
+- a provider-neutral gateway client and session adapter boundary
+- an in-memory mock session adapter with two-worker isolation tests
+- a reviewed provider-native integration and central connection design
 - neutral, environment-independent examples
 
-AgentBridge adapters and an MCP-facing coordinator tool are planned next. They
-are intentionally not represented by placeholder implementations.
+AgentBridge was evaluated as a reference implementation but is not a runtime
+dependency and will not be modified or forked for this project. The decision is
+recorded in [docs/agentbridge-integration.md](docs/agentbridge-integration.md).
+Provider adapters and the agent-facing messaging tool are the next phase.
 
 ## Run locally
 
@@ -51,6 +58,11 @@ If the router uses a different port, pass the same endpoint to the smoke client:
 ROUTER_URL=ws://127.0.0.1:18787/ws bun run smoke
 ```
 
+The current implementation is local-first. A multi-system deployment must keep
+the router behind authenticated TLS and use outbound gateway connections with
+per-agent credentials before changing the loopback default. See
+[docs/provider-integration.md](docs/provider-integration.md).
+
 ## Protocol sketch
 
 A worker first registers a globally unique identifier:
@@ -77,8 +89,11 @@ A coordinator can then send a request:
 }
 ```
 
-See [docs/design.md](docs/design.md) for the architecture, security boundary,
-and implementation phases.
+See [docs/design.md](docs/design.md) for the architecture and implementation
+phases, [docs/provider-integration.md](docs/provider-integration.md) for the
+provider and central-routing boundary, and
+[docs/agentbridge-integration.md](docs/agentbridge-integration.md) for the
+AgentBridge evaluation decision.
 
 ## Privacy rule
 

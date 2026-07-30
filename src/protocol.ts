@@ -49,7 +49,13 @@ export type ServerMessage =
   | { type: "registered"; agent: AgentDescriptor }
   | { type: "agents"; requestId: string; agents: AgentDescriptor[] }
   | { type: "accepted"; requestId: string; to: string }
-  | { type: "deliver"; requestId: string; from: string; content: string }
+  | {
+      type: "deliver";
+      requestId: string;
+      from: string;
+      content: string;
+      timeoutMs?: number;
+    }
   | {
       type: "result";
       requestId: string;
@@ -121,4 +127,3 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       return null;
   }
 }
-

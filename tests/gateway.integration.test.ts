@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
+import { DelegatedMessengerClient } from "../src/delegated-messenger-client";
 import { GatewayClient } from "../src/gateway-client";
 import { MockSessionAdapter } from "../src/mock-session-adapter";
 import { PROTOCOL_VERSION, type AgentSide, type ClientMessage, type ServerMessage } from "../src/protocol";
@@ -458,6 +459,92 @@ describe("GatewayClient with router", () => {
       ]);
       expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThan(1_000);
     } finally {
+      coordinator.disconnect();
+      workerA.disconnect();
+      workerB.disconnect();
+      server.stop(true);
+    }
+  });
+
+  test("lets an authorized delegate send as its owning agent and caps the nested timeout", async () => {
+    const { server, url } = await startTestRouter();
+    const delegationToken = "d".repeat(64);
+    const coordinator = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:coordinator", side: "generic" },
+      adapter: new MockSessionAdapter(async () => ({ ok: false, error: "unexpected_delivery" })),
+    });
+    const delegate = new DelegatedMessengerClient({
+      routerUrl: url,
+      agentId: "local:worker-a",
+      delegationToken,
+    });
+    const workerBAdapter = new MockSessionAdapter(async (request) => ({
+      ok: true,
+      content: `worker-b:${request.content}`,
+    }));
+    const workerB = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:worker-b", side: "generic" },
+      adapter: workerBAdapter,
+    });
+    const workerA = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:worker-a", side: "generic" },
+      delegationToken,
+      adapter: new MockSessionAdapter(async (request) => {
+        if (!delegate.connected) await delegate.connect();
+        const agents = await delegate.listAgents("delegate-list");
+        expect(agents.map(({ agentId }) => agentId).sort()).toEqual([
+          "local:coordinator",
+          "local:worker-a",
+          "local:worker-b",
+        ]);
+        const child = await delegate.send("local:worker-b", `delegated:${request.content}`, {
+          requestId: "delegate-child",
+          timeoutMs: 5_000,
+        });
+        return child.ok
+          ? { ok: true, content: `worker-a:${child.content}` }
+          : { ok: false, error: child.error };
+      }),
+    });
+
+    try {
+      await Promise.all([coordinator.connect(), workerA.connect(), workerB.connect()]);
+      const rejected = new DelegatedMessengerClient({
+        routerUrl: url,
+        agentId: "local:worker-a",
+        delegationToken: "x".repeat(64),
+      });
+      await expect(rejected.connect()).rejects.toThrow("unauthorized");
+      rejected.disconnect();
+
+      const result = await coordinator.send("local:worker-a", "parent-task", {
+        requestId: "delegate-parent",
+        timeoutMs: 1_000,
+      });
+
+      expect(result).toEqual({
+        requestId: "delegate-parent",
+        from: "local:worker-a",
+        ok: true,
+        content: "worker-a:worker-b:delegated:parent-task",
+      });
+      expect(workerBAdapter.requests).toEqual([
+        expect.objectContaining({
+          requestId: "delegate-child",
+          from: "local:worker-a",
+          content: "delegated:parent-task",
+        }),
+      ]);
+      expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThan(1_000);
+
+      workerA.disconnect();
+      await Bun.sleep(10);
+      expect(delegate.connected).toBe(false);
+    } finally {
+      delegate.disconnect();
       coordinator.disconnect();
       workerA.disconnect();
       workerB.disconnect();

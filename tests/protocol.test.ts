@@ -24,6 +24,35 @@ describe("parseClientMessage", () => {
     });
   });
 
+  test("accepts an agent-scoped delegate registration", () => {
+    const delegationToken = "d".repeat(64);
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "register_delegate",
+          protocolVersion: 1,
+          agentId: "local:worker-a",
+          delegationToken,
+        }),
+      ),
+    ).toEqual({
+      type: "register_delegate",
+      protocolVersion: 1,
+      agentId: "local:worker-a",
+      delegationToken,
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "register_delegate",
+          protocolVersion: 1,
+          agentId: "local:worker-a",
+          delegationToken: "too-short",
+        }),
+      ),
+    ).toBeNull();
+  });
+
   test("rejects invalid identifiers", () => {
     expect(
       parseClientMessage(

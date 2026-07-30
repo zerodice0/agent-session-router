@@ -7,13 +7,16 @@ gateway-owned thread. It does not attach to or take over an arbitrary thread
 already controlled by another Codex UI. The adapter can start a new thread or
 resume one explicitly selected by runtime configuration.
 
-The implementation has no package dependency beyond Bun:
+The implementation uses Bun plus the official MCP server SDK and Zod schema
+validation for the provider-facing tool process:
 
 - `CodexStdioTransport` owns a local `codex app-server --listen stdio://`
   process and exchanges newline-delimited JSON;
 - `CodexAppServerAdapter` implements the provider-neutral `SessionAdapter`;
 - `GatewayClient` registers the resulting session and handles central router
   delivery;
+- `agent-tools-mcp` exposes `agent_list` and `agent_send` over stdio using an
+  outbound-only delegated router connection;
 - `bun run gateway:codex` wires those components together for a manual run.
 
 ## Verified protocol surface
@@ -41,9 +44,34 @@ Sources checked on 2026-07-30:
 - [thread protocol types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)
 - [turn protocol types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/turn.rs)
 - [item protocol types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/item.rs)
+- [Codex MCP configuration](https://developers.openai.com/codex/mcp/)
+- [MCP stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports)
 
 The adapter omits `capabilities.experimentalApi`; no experimental method or
 field is part of this baseline.
+
+## Agent tools and delegated identity
+
+Each Codex gateway creates a unique delegation token before starting App
+Server. Per-process `-c` overrides configure one required stdio MCP server with
+only `agent_list` and `agent_send` enabled. App Server receives the token,
+router URL, and agent ID through environment variables; secret values never
+appear in command arguments and user-level Codex configuration is not modified.
+
+The MCP child registers as a delegate of the already configured `agentId` only
+when its first tool is called. The router verifies the token against the live
+owning gateway. A delegate:
+
+- may list agents, send requests, and ping;
+- sends with the owning agent's authoritative `from` identity;
+- cannot receive deliveries or issue replies;
+- is not returned as a separate agent;
+- is revoked when the owning gateway disconnects.
+
+For a nested call, the router caps the delegated request timeout to the owning
+gateway's remaining inbound deadline. The MCP server returns the correlated
+result to Codex without writing request or response content to stdout or
+stderr. Stdout remains exclusively reserved for MCP protocol frames.
 
 ## Correlation and completion
 
@@ -90,6 +118,30 @@ Consequently prompts, responses, credentials, provider thread IDs, working
 directories, and command output are not copied into gateway logs. Runtime
 values are supplied only through environment configuration.
 
+The delegation token is not the router's shared registration credential. It is
+random, scoped to one live agent, limited to outbound operations, and removed
+with the owner connection. A non-loopback deployment still requires WSS and a
+per-agent central credential; the delegation token does not replace that
+transport control.
+
+## Live validation result
+
+The two-Codex gate was completed on 2026-07-30 using a loopback router,
+disposable workspaces, and neutral agent identifiers. The validation confirmed:
+
+- each primary gateway appeared once in `agent_list`, while delegated MCP
+  connections remained hidden;
+- Codex A called `agent_send`, Codex B produced the nested result, and the
+  correlated completion returned through Codex A to the original requester;
+- simultaneous direct requests to Codex A and Codex B returned only their own
+  sentinels, demonstrating response isolation at the live provider boundary;
+- a cleanly restarted provider recovered without replaying an earlier timed-out
+  request.
+
+Only generic pass/fail state was emitted by the harness. Prompt bodies, provider
+responses, credentials, thread identifiers, machine details, and runtime paths
+were not logged or added to the repository.
+
 ## Separate development-machine validation
 
 Use a disposable test workspace and neutral agent identifiers. Do not record
@@ -104,12 +156,13 @@ repository.
 4. Start the router on an available loopback port with a temporary local token.
 5. Set `ROUTER_URL`, `ROUTER_TOKEN`, `GATEWAY_AGENT_ID=local:worker-a`, and a
    disposable `CODEX_CWD`; run `bun run gateway:codex`.
-6. Register a neutral coordinator and mock worker B. Confirm the Codex gateway
-   appears in `listAgents` only after App Server initialization and thread
-   selection finish.
-7. Send one harmless, read-only request from the coordinator to
-   `local:worker-a`. Confirm exactly one matching result returns and no protocol
-   content is printed.
+6. Start two gateways with distinct neutral IDs and disposable working
+   directories. Confirm both appear exactly once in `agent_list`; delegated MCP
+   connections must not appear as additional agents.
+7. Send one harmless request from the coordinator to `local:worker-a` directing
+   it to call `agent_send` for `local:worker-b`. Confirm worker B sees
+   `from=local:worker-a` and the final nested response returns through worker A
+   to the original coordinator request.
 8. Send a second request while the first is active and confirm `session_busy`.
 9. Exercise a short timeout and confirm the caller receives `request_timeout`,
    App Server receives `turn/interrupt`, and any late completion is ignored.

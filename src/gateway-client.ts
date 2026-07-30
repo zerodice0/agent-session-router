@@ -33,6 +33,7 @@ export interface GatewayClientOptions {
   agent: AgentDescriptor;
   adapter: SessionAdapter;
   token?: string;
+  delegationToken?: string;
   connectTimeoutMs?: number;
   requestIdFactory?: () => string;
 }
@@ -54,6 +55,7 @@ export class GatewayClient implements AgentMessenger {
   readonly #agent: AgentDescriptor;
   readonly #adapter: SessionAdapter;
   readonly #token: string | undefined;
+  readonly #delegationToken: string | undefined;
   readonly #connectTimeoutMs: number;
   readonly #requestIdFactory: () => string;
 
@@ -69,6 +71,7 @@ export class GatewayClient implements AgentMessenger {
     this.#agent = options.agent;
     this.#adapter = options.adapter;
     this.#token = options.token;
+    this.#delegationToken = options.delegationToken;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.#requestIdFactory = options.requestIdFactory ?? (() => crypto.randomUUID());
   }
@@ -109,6 +112,9 @@ export class GatewayClient implements AgentMessenger {
           protocolVersion: PROTOCOL_VERSION,
           agent: this.#agent,
           ...(this.#token === undefined ? {} : { token: this.#token }),
+          ...(this.#delegationToken === undefined
+            ? {}
+            : { delegationToken: this.#delegationToken }),
         });
       });
 
@@ -117,7 +123,10 @@ export class GatewayClient implements AgentMessenger {
         if (!message) return;
 
         if (message.type === "registered") {
-          if (message.agent.agentId !== this.#agent.agentId) {
+          if (
+            message.agent.agentId !== this.#agent.agentId ||
+            (message.role !== undefined && message.role !== "agent")
+          ) {
             finish(new Error("Router registered an unexpected agent identifier"));
             socket.close();
             return;

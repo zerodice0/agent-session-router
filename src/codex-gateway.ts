@@ -1,6 +1,11 @@
 import { CodexAppServerAdapter } from "./codex-app-server-adapter";
 import { CodexStdioTransport } from "./codex-app-server-transport";
 import { GatewayClient } from "./gateway-client";
+import {
+  createAgentToolsEnvironment,
+  createCodexAppServerCommand,
+  createDelegationToken,
+} from "./agent-tools-config";
 import { isAgentId } from "./protocol";
 
 const routerUrl = process.env.ROUTER_URL ?? "ws://127.0.0.1:8787/ws";
@@ -10,8 +15,16 @@ const resumeThreadId = process.env.CODEX_THREAD_ID;
 
 if (!isAgentId(agentId)) throw new Error("Invalid GATEWAY_AGENT_ID");
 
+const delegationToken = createDelegationToken();
+
 const transport = CodexStdioTransport.spawn({
+  command: createCodexAppServerCommand(),
   ...(providerCwd === undefined ? {} : { cwd: providerCwd }),
+  env: createAgentToolsEnvironment({
+    routerUrl,
+    agentId,
+    delegationToken,
+  }),
 });
 let adapter: CodexAppServerAdapter | null = null;
 let gateway: GatewayClient | null = null;
@@ -29,6 +42,7 @@ try {
     agent: { agentId, side: "codex" },
     adapter,
     token: process.env.ROUTER_TOKEN,
+    delegationToken,
   });
   await gateway.connect();
   await waitForShutdown();

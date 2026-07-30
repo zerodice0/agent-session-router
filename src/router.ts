@@ -1,11 +1,15 @@
 import {
   normalizeTimeoutMs,
   parseClientMessage,
-  type AgentDescriptor,
   type RouterErrorCode,
   type ServerMessage,
 } from "./protocol";
-import { AgentRegistry, sendMessage, type AgentConnection } from "./registry";
+import {
+  AgentRegistry,
+  sendMessage,
+  type AgentConnection,
+  type RegisteredConnection,
+} from "./registry";
 
 interface SocketData {
   connectedAt: number;
@@ -17,6 +21,7 @@ interface PendingRequest {
   requesterId: string;
   recipient: AgentConnection;
   recipientId: string;
+  deadlineAt: number;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -54,9 +59,12 @@ export function startRouter(options: RouterOptions = {}) {
     sendMessage(connection, { type: "error", code, message, requestId });
   }
 
-  function requireRegistered(connection: AgentConnection, requestId?: string): AgentDescriptor | null {
+  function requireRegistered(
+    connection: AgentConnection,
+    requestId?: string,
+  ): RegisteredConnection | null {
     const registered = registry.getByConnection(connection);
-    if (registered) return registered.descriptor;
+    if (registered) return registered;
     sendError(connection, "not_registered", "Register before using the router", requestId);
     return null;
   }
@@ -71,15 +79,19 @@ export function startRouter(options: RouterOptions = {}) {
 
   function handleDisconnect(connection: AgentConnection): void {
     const disconnected = registry.unregister(connection);
+    const disconnectedConnections = new Set([
+      connection,
+      ...(disconnected?.delegates ?? []),
+    ]);
 
     for (const [requestId, pending] of pendingRequests) {
-      if (pending.requester === connection) {
+      if (disconnectedConnections.has(pending.requester)) {
         clearTimeout(pending.timer);
         pendingRequests.delete(requestId);
         continue;
       }
 
-      if (pending.recipient === connection) {
+      if (disconnectedConnections.has(pending.recipient)) {
         finishRequest(requestId, {
           type: "error",
           requestId,
@@ -89,7 +101,12 @@ export function startRouter(options: RouterOptions = {}) {
       }
     }
 
-    if (logEvents && disconnected) {
+    for (const delegate of disconnected?.delegates ?? []) {
+      sendError(delegate, "not_registered", "Delegated registration ended");
+      delegate.close?.();
+    }
+
+    if (logEvents && disconnected?.role === "agent") {
       console.info(`agent disconnected: ${disconnected.descriptor.agentId}`);
     }
   }
@@ -98,6 +115,28 @@ export function startRouter(options: RouterOptions = {}) {
     const message = parseClientMessage(raw);
     if (!message) {
       sendError(connection, "invalid_message", "Message does not match protocol version 1");
+      return;
+    }
+
+    if (message.type === "register_delegate") {
+      if (registry.getByConnection(connection)) {
+        sendError(connection, "agent_conflict", "This connection is already registered");
+        return;
+      }
+      if (!registry.registerDelegate(message.agentId, message.delegationToken, connection)) {
+        sendError(connection, "unauthorized", "Delegate registration rejected");
+        return;
+      }
+      const registered = registry.getByConnection(connection);
+      if (!registered) {
+        sendError(connection, "unauthorized", "Delegate registration rejected");
+        return;
+      }
+      sendMessage(connection, {
+        type: "registered",
+        agent: registered.descriptor,
+        role: "delegate",
+      });
       return;
     }
 
@@ -110,11 +149,11 @@ export function startRouter(options: RouterOptions = {}) {
         sendError(connection, "unauthorized", "Registration token is invalid");
         return;
       }
-      if (!registry.register(message.agent, connection)) {
+      if (!registry.register(message.agent, connection, message.delegationToken)) {
         sendError(connection, "agent_conflict", `Agent is already connected: ${message.agent.agentId}`);
         return;
       }
-      sendMessage(connection, { type: "registered", agent: message.agent });
+      sendMessage(connection, { type: "registered", agent: message.agent, role: "agent" });
       if (logEvents) console.info(`agent registered: ${message.agent.agentId}`);
       return;
     }
@@ -139,7 +178,16 @@ export function startRouter(options: RouterOptions = {}) {
           sendError(connection, "target_offline", `Target is not connected: ${message.to}`, message.requestId);
           return;
         }
-        const timeoutMs = normalizeTimeoutMs(message.timeoutMs);
+        const requestedTimeoutMs = normalizeTimeoutMs(message.timeoutMs);
+        const parent = registry.get(sender.descriptor.agentId);
+        let timeoutMs = requestedTimeoutMs;
+        if (parent) {
+          for (const pending of pendingRequests.values()) {
+            if (pending.recipient !== parent.connection) continue;
+            timeoutMs = Math.min(timeoutMs, Math.max(1, pending.deadlineAt - Date.now()));
+          }
+        }
+        const deadlineAt = Date.now() + timeoutMs;
         const timer = setTimeout(() => {
           finishRequest(message.requestId, {
             type: "error",
@@ -151,15 +199,16 @@ export function startRouter(options: RouterOptions = {}) {
         pendingRequests.set(message.requestId, {
           requestId: message.requestId,
           requester: connection,
-          requesterId: sender.agentId,
+          requesterId: sender.descriptor.agentId,
           recipient: target.connection,
           recipientId: target.descriptor.agentId,
+          deadlineAt,
           timer,
         });
         sendMessage(target.connection, {
           type: "deliver",
           requestId: message.requestId,
-          from: sender.agentId,
+          from: sender.descriptor.agentId,
           content: message.content,
           timeoutMs,
         });
@@ -167,6 +216,10 @@ export function startRouter(options: RouterOptions = {}) {
         return;
       }
       case "reply": {
+        if (sender.role === "delegate") {
+          sendError(connection, "reply_forbidden", "Delegates cannot reply", message.requestId);
+          return;
+        }
         const pending = pendingRequests.get(message.requestId);
         if (!pending) {
           sendError(connection, "request_not_found", "Request is no longer active", message.requestId);
@@ -179,7 +232,7 @@ export function startRouter(options: RouterOptions = {}) {
         finishRequest(message.requestId, {
           type: "result",
           requestId: message.requestId,
-          from: sender.agentId,
+          from: sender.descriptor.agentId,
           ok: message.ok,
           content: message.content,
           error: message.error,

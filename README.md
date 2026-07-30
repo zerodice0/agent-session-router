@@ -21,6 +21,8 @@ adapter foundation:
 - a duplex provider-neutral gateway with correlated `listAgents` and `send`
 - nested coordinator -> worker -> worker round-trip coverage
 - a Codex App Server adapter with an injectable JSONL transport
+- agent-scoped delegated router connections for outbound-only provider tools
+- standard MCP `agent_list` and `agent_send` tools injected into Codex
 - an in-memory mock session adapter with two-worker isolation tests
 - a reviewed provider-native integration and central connection design
 - neutral, environment-independent examples
@@ -28,9 +30,10 @@ adapter foundation:
 AgentBridge was evaluated as a reference implementation but is not a runtime
 dependency and will not be modified or forked for this project. The decision is
 recorded in [docs/agentbridge-integration.md](docs/agentbridge-integration.md).
-The Codex adapter is fake-transport testable in this repository. A live Codex
-CLI check remains a separate development-machine integration gate. Claude and
-agent-facing MCP adapters remain future work.
+The Codex adapter and MCP tool bridge have completed a live two-Codex exchange:
+agent discovery, Codex A -> `agent_send` -> Codex B -> A nested completion, and
+parallel response isolation. The Claude managed-session adapter remains future
+work; it will reuse the same MCP tool contract.
 
 ## Run locally
 

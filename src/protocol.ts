@@ -3,6 +3,7 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 export const MAX_REQUEST_TIMEOUT_MS = 10 * 60_000;
 
 export type AgentSide = "claude" | "codex" | "generic";
+export type RegistrationRole = "agent" | "delegate";
 
 export interface AgentDescriptor {
   agentId: string;
@@ -15,6 +16,13 @@ export type ClientMessage =
       protocolVersion: typeof PROTOCOL_VERSION;
       agent: AgentDescriptor;
       token?: string;
+      delegationToken?: string;
+    }
+  | {
+      type: "register_delegate";
+      protocolVersion: typeof PROTOCOL_VERSION;
+      agentId: string;
+      delegationToken: string;
     }
   | { type: "list"; requestId: string }
   | {
@@ -46,7 +54,7 @@ export type RouterErrorCode =
   | "request_timeout";
 
 export type ServerMessage =
-  | { type: "registered"; agent: AgentDescriptor }
+  | { type: "registered"; agent: AgentDescriptor; role?: RegistrationRole }
   | { type: "agents"; requestId: string; agents: AgentDescriptor[] }
   | { type: "accepted"; requestId: string; to: string }
   | {
@@ -69,6 +77,7 @@ export type ServerMessage =
 
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DELEGATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
 
 export function isAgentId(value: unknown): value is string {
   return typeof value === "string" && AGENT_ID_PATTERN.test(value);
@@ -76,6 +85,10 @@ export function isAgentId(value: unknown): value is string {
 
 export function isRequestId(value: unknown): value is string {
   return typeof value === "string" && REQUEST_ID_PATTERN.test(value);
+}
+
+export function isDelegationToken(value: unknown): value is string {
+  return typeof value === "string" && DELEGATION_TOKEN_PATTERN.test(value);
 }
 
 export function isAgentDescriptor(value: unknown): value is AgentDescriptor {
@@ -119,8 +132,15 @@ export function parseClientMessage(raw: string): ClientMessage | null {
         return null;
       }
       if (message.token !== undefined && typeof message.token !== "string") return null;
+      if (message.delegationToken !== undefined && !isDelegationToken(message.delegationToken)) {
+        return null;
+      }
       return message as ClientMessage;
     }
+    case "register_delegate":
+      if (message.protocolVersion !== PROTOCOL_VERSION) return null;
+      if (!isAgentId(message.agentId) || !isDelegationToken(message.delegationToken)) return null;
+      return message as ClientMessage;
     case "list":
     case "ping":
       return isRequestId(message.requestId) ? (message as ClientMessage) : null;
@@ -154,7 +174,10 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
 
   switch (message.type) {
     case "registered":
-      return isAgentDescriptor(message.agent) ? (message as unknown as ServerMessage) : null;
+      return isAgentDescriptor(message.agent) &&
+        (message.role === undefined || message.role === "agent" || message.role === "delegate")
+        ? (message as unknown as ServerMessage)
+        : null;
     case "agents":
       return isRequestId(message.requestId) &&
         Array.isArray(message.agents) &&

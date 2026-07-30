@@ -86,6 +86,12 @@ client waits for outbound `agents`, `result`, and `error` messages without
 mixing them with inbound deliveries. `accepted` remains informational and does
 not complete an outbound call.
 
+When a provider launches tools in a separate MCP child process, the gateway
+creates a high-entropy, agent-scoped delegation token. The child opens an
+outbound-only delegated router connection. It inherits the gateway's `agentId`
+for `list` and `send`, cannot receive `deliver`, cannot send `reply`, is not
+listed as another agent, and is revoked when the owning gateway disconnects.
+
 The gateway registers one neutral identifier such as `local:reviewer`. Provider
 session IDs, working directories, provider credentials, and local IPC details
 remain in runtime configuration outside the repository and are never forwarded
@@ -117,6 +123,8 @@ numeric `protocolVersion`, currently `1`.
 ### 5.1 Client to router
 
 - `register`: claim one `agentId` for the current connection.
+- `register_delegate`: claim outbound-only authority for one live agent using
+  its runtime delegation token.
 - `list`: request the active agent list.
 - `send`: deliver content to one active recipient.
 - `reply`: complete one request previously delivered to this connection.
@@ -153,8 +161,9 @@ it receives one valid reply, times out, or either relevant socket disconnects.
 
 An agent may send a child request while it is handling an inbound request. The
 child uses a new `requestId`; the gateway caps its timeout to the remaining
-parent budget when it can identify the parent request. The router still treats
-the two requests independently.
+parent budget when it can identify the parent request. For delegated MCP calls,
+the router enforces that cap against the owning gateway's active delivery. The
+router still treats the two requests independently.
 
 ## 6. Identity and addressing
 
@@ -201,6 +210,9 @@ delivery.
   environment-specific paths.
 - Never place real infrastructure identifiers in source, tests, or examples.
 - Reject a reply unless it comes from the connection that received the request.
+- Give delegated MCP connections only `list`, `send`, and `ping` authority;
+  revoke them with the owning gateway and never expose the central shared token
+  to the MCP child.
 - Use TLS and per-gateway credentials before enabling any non-loopback listener.
 
 A multi-system deployment uses outbound authenticated gateway connections over
@@ -225,12 +237,12 @@ with message plaintext unless a future end-to-end encryption layer is added.
 - nested agent-to-agent round-trip coverage
 - router-to-session delivery, correlated completion, and busy translation
 
-Implemented locally. Final test execution is required before release.
+Implemented and validated with the automated router and mock-session suite.
 
 ### Phase 3: provider-native adapters
 
-- Codex App Server adapter for a gateway-owned thread (implemented with an
-  injected transport; live CLI validation pending)
+- Codex App Server adapter for a gateway-owned thread (implemented; one live
+  CLI round trip, busy, timeout, and recovery validation completed)
 - Claude managed-session adapter
 - optional Claude Channel adapter for explicitly opted-in live sessions
 - provider approval and process-disconnect handling that fails closed
@@ -239,8 +251,14 @@ Implemented locally. Final test execution is required before release.
 
 - expose `agent_list` and `agent_send` through each provider's supported local
   tool boundary
-- use local IPC when a provider tool process and session host are separate
+- use an agent-scoped outbound-only delegation when the provider starts a
+  separate stdio MCP child
 - keep provider credentials and central credentials out of model-visible input
+
+Implemented for Codex with the official MCP server SDK and validated with a
+live Codex A -> Codex B nested exchange plus parallel response-isolation check.
+The same tool service is the required outbound boundary for the future Claude
+adapter.
 
 ### Phase 5: secure multi-system transport
 

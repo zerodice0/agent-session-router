@@ -4,6 +4,7 @@ import {
   MAX_REQUEST_TIMEOUT_MS,
   normalizeTimeoutMs,
   parseClientMessage,
+  parseServerMessage,
 } from "../src/protocol";
 
 describe("parseClientMessage", () => {
@@ -44,6 +45,31 @@ describe("parseClientMessage", () => {
   });
 });
 
+describe("parseServerMessage", () => {
+  test("accepts a correlated result and rejects malformed router data", () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          type: "result",
+          requestId: "request-1",
+          from: "local:worker-a",
+          ok: true,
+          content: "done",
+        }),
+      ),
+    ).toEqual({
+      type: "result",
+      requestId: "request-1",
+      from: "local:worker-a",
+      ok: true,
+      content: "done",
+    });
+    expect(parseServerMessage(JSON.stringify({ type: "result", requestId: "request-1" }))).toBeNull();
+    expect(parseServerMessage(new Uint8Array())).toBeNull();
+    expect(parseServerMessage("not-json")).toBeNull();
+  });
+});
+
 describe("normalizeTimeoutMs", () => {
   test("uses a safe default", () => {
     expect(normalizeTimeoutMs(undefined)).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
@@ -54,4 +80,3 @@ describe("normalizeTimeoutMs", () => {
     expect(normalizeTimeoutMs(Number.MAX_SAFE_INTEGER)).toBe(MAX_REQUEST_TIMEOUT_MS);
   });
 });
-

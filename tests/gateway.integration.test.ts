@@ -344,4 +344,124 @@ describe("GatewayClient with router", () => {
       server.stop(true);
     }
   });
+
+  test("supports duplex list/send calls and isolates two worker responses", async () => {
+    const { server, url } = await startTestRouter();
+    const coordinator = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:coordinator", side: "generic" },
+      adapter: new MockSessionAdapter(async () => ({ ok: false, error: "unexpected_delivery" })),
+    });
+    const workerA = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:worker-a", side: "generic" },
+      adapter: new MockSessionAdapter(async (request) => ({
+        ok: true,
+        content: `worker-a:${request.content}`,
+      })),
+    });
+    const workerB = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:worker-b", side: "generic" },
+      adapter: new MockSessionAdapter(async (request) => ({
+        ok: true,
+        content: `worker-b:${request.content}`,
+      })),
+    });
+
+    try {
+      await Promise.all([coordinator.connect(), workerA.connect(), workerB.connect()]);
+      const agents = await coordinator.listAgents("list-workers");
+      expect(agents.map(({ agentId }) => agentId).sort()).toEqual([
+        "local:coordinator",
+        "local:worker-a",
+        "local:worker-b",
+      ]);
+
+      const [resultA, resultB] = await Promise.all([
+        coordinator.send("local:worker-a", "task-a", { requestId: "outbound-a" }),
+        coordinator.send("local:worker-b", "task-b", { requestId: "outbound-b" }),
+      ]);
+      expect(resultA).toEqual({
+        requestId: "outbound-a",
+        from: "local:worker-a",
+        ok: true,
+        content: "worker-a:task-a",
+      });
+      expect(resultB).toEqual({
+        requestId: "outbound-b",
+        from: "local:worker-b",
+        ok: true,
+        content: "worker-b:task-b",
+      });
+    } finally {
+      coordinator.disconnect();
+      workerA.disconnect();
+      workerB.disconnect();
+      server.stop(true);
+    }
+  });
+
+  test("returns a nested worker result through the original coordinator request", async () => {
+    const { server, url } = await startTestRouter();
+    const coordinator = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:coordinator", side: "generic" },
+      adapter: new MockSessionAdapter(async () => ({ ok: false, error: "unexpected_delivery" })),
+    });
+    let workerA!: GatewayClient;
+    const workerAAdapter = new MockSessionAdapter(async (request) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const child = await workerA.send("local:worker-b", `nested:${request.content}`, {
+        requestId: "nested-child",
+        timeoutMs: 5_000,
+      });
+      return child.ok
+        ? { ok: true, content: `worker-a:${child.content}` }
+        : { ok: false, error: child.error };
+    });
+    workerA = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:worker-a", side: "generic" },
+      adapter: workerAAdapter,
+    });
+    const workerBAdapter = new MockSessionAdapter(async (request) => ({
+      ok: true,
+      content: `worker-b:${request.content}`,
+    }));
+    const workerB = new GatewayClient({
+      routerUrl: url,
+      agent: { agentId: "local:worker-b", side: "generic" },
+      adapter: workerBAdapter,
+    });
+
+    try {
+      await Promise.all([coordinator.connect(), workerA.connect(), workerB.connect()]);
+      const result = await coordinator.send("local:worker-a", "parent-task", {
+        requestId: "nested-parent",
+        timeoutMs: 1_000,
+      });
+
+      expect(result).toEqual({
+        requestId: "nested-parent",
+        from: "local:worker-a",
+        ok: true,
+        content: "worker-a:worker-b:nested:parent-task",
+      });
+      expect(workerAAdapter.requests.map(({ requestId }) => requestId)).toEqual(["nested-parent"]);
+      expect(workerBAdapter.requests).toEqual([
+        expect.objectContaining({
+          requestId: "nested-child",
+          from: "local:worker-a",
+          content: "nested:parent-task",
+        }),
+      ]);
+      expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThan(1_000);
+    } finally {
+      coordinator.disconnect();
+      workerA.disconnect();
+      workerB.disconnect();
+      server.stop(true);
+    }
+  });
 });

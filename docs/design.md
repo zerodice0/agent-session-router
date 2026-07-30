@@ -81,10 +81,10 @@ directions:
 - outbound: expose router discovery and targeted send operations as tools the
   local agent can call.
 
-The included `GatewayClient` and mock adapter currently validate the inbound
-direction. The next provider-neutral increment is a duplex client that also
-waits for outbound `agents`, `accepted`, `result`, and `error` messages without
-mixing them with inbound deliveries.
+The included `GatewayClient` and mock adapter validate both directions. The
+client waits for outbound `agents`, `result`, and `error` messages without
+mixing them with inbound deliveries. `accepted` remains informational and does
+not complete an outbound call.
 
 The gateway registers one neutral identifier such as `local:reviewer`. Provider
 session IDs, working directories, provider credentials, and local IPC details
@@ -220,14 +220,17 @@ with message plaintext unless a future end-to-end encryption layer is added.
 
 ### Phase 2: duplex agent gateway
 
-- provider-neutral gateway client and mock session adapter (inbound implemented)
-- outbound `agent_list` and `agent_send` request waiters
-- nested agent-to-agent round-trip tests
+- provider-neutral gateway client and mock session adapter
+- outbound list/send request waiters
+- nested agent-to-agent round-trip coverage
 - router-to-session delivery, correlated completion, and busy translation
+
+Implemented locally. Final test execution is required before release.
 
 ### Phase 3: provider-native adapters
 
-- Codex App Server adapter for a gateway-owned thread
+- Codex App Server adapter for a gateway-owned thread (implemented with an
+  injected transport; live CLI validation pending)
 - Claude managed-session adapter
 - optional Claude Channel adapter for explicitly opted-in live sessions
 - provider approval and process-disconnect handling that fails closed

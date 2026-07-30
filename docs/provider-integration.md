@@ -60,10 +60,10 @@ One logical connector owns one `agentId` and three boundaries:
    - generate a new opaque request ID for each outbound tool call;
    - wait for the correlated router result and return it to the calling agent.
 
-The current `GatewayClient` implements central registration and inbound
-delivery. It must become duplex before provider work is considered complete:
-an agent handling an inbound request must also be able to call another agent and
-await that child result.
+The current `GatewayClient` implements central registration, inbound delivery,
+and correlated outbound list/send calls. An agent handling an inbound request
+can call another agent and await that child result without clearing or mixing
+its inbound busy state.
 
 ## 4. Connection lifecycle
 
@@ -207,9 +207,23 @@ The connector maintains `requestId -> threadId/turnId`, accepts output only for
 that turn, and finishes on `turn/completed`. It fails closed on unresolved
 approval or user-input requests; it does not auto-approve provider actions.
 
+The repository implementation uses the stable App Server surface only. Its
+JSONL transport is injected for deterministic tests, while the runtime
+transport owns a local `codex app-server --listen stdio://` process. Completed
+`agentMessage` items are accepted only when both `threadId` and `turnId` match;
+`final_answer` output takes precedence over an unphased compatibility message.
+Timeout requests `turn/interrupt`, process exit fails the active request, and
+late or unrelated events are discarded.
+
 Official reference:
 
 - [Codex App Server](https://developers.openai.com/codex/app-server/)
+- [App Server protocol README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
+- [turn protocol types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/turn.rs)
+- [item protocol types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/item.rs)
+
+Implementation and live validation details are in
+[codex-integration.md](codex-integration.md).
 
 The baseline target is a gateway-owned thread. Resuming a stored, inactive
 thread can be tested separately. The design does not promise safe simultaneous
@@ -240,9 +254,9 @@ tokens, and company identifiers must not be committed.
 
 Implementation proceeds in this order:
 
-1. Prove the duplex gateway with mock sessions, including a nested
+1. Validate the implemented duplex gateway with mock sessions, including a
    coordinator -> worker A -> worker B -> worker A -> coordinator flow.
-2. Implement and fake-test the Codex App Server transport and correlation.
+2. Validate the implemented Codex App Server transport and correlation tests.
 3. Validate the Codex adapter against an installed CLI on a separate development
    machine.
 4. Validate a managed Claude session; add the optional Channel adapter only if

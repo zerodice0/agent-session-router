@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "gateway:codex": "bun src/codex-gateway.ts",
     "dev": "bun --watch src/router.ts",
     "smoke": "bun src/smoke.ts",
     "start": "bun src/router.ts",

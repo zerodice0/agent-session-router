@@ -78,6 +78,17 @@ export function isRequestId(value: unknown): value is string {
   return typeof value === "string" && REQUEST_ID_PATTERN.test(value);
 }
 
+export function isAgentDescriptor(value: unknown): value is AgentDescriptor {
+  if (!value || typeof value !== "object") return false;
+  const descriptor = value as Record<string, unknown>;
+  return (
+    isAgentId(descriptor.agentId) &&
+    (descriptor.side === "claude" ||
+      descriptor.side === "codex" ||
+      descriptor.side === "generic")
+  );
+}
+
 export function normalizeTimeoutMs(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return DEFAULT_REQUEST_TIMEOUT_MS;
@@ -126,4 +137,67 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     default:
       return null;
   }
+}
+
+export function parseServerMessage(raw: unknown): ServerMessage | null {
+  if (typeof raw !== "string") return null;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  if (!value || typeof value !== "object") return null;
+  const message = value as Record<string, unknown>;
+
+  switch (message.type) {
+    case "registered":
+      return isAgentDescriptor(message.agent) ? (message as unknown as ServerMessage) : null;
+    case "agents":
+      return isRequestId(message.requestId) &&
+        Array.isArray(message.agents) &&
+        message.agents.every(isAgentDescriptor)
+        ? (message as unknown as ServerMessage)
+        : null;
+    case "accepted":
+      return isRequestId(message.requestId) && isAgentId(message.to)
+        ? (message as unknown as ServerMessage)
+        : null;
+    case "deliver":
+      if (!isRequestId(message.requestId) || !isAgentId(message.from)) return null;
+      if (typeof message.content !== "string") return null;
+      if (message.timeoutMs !== undefined && typeof message.timeoutMs !== "number") return null;
+      return message as unknown as ServerMessage;
+    case "result":
+      if (!isRequestId(message.requestId) || !isAgentId(message.from)) return null;
+      if (typeof message.ok !== "boolean") return null;
+      if (message.content !== undefined && typeof message.content !== "string") return null;
+      if (message.error !== undefined && typeof message.error !== "string") return null;
+      return message as unknown as ServerMessage;
+    case "error":
+      if (message.requestId !== undefined && !isRequestId(message.requestId)) return null;
+      if (!isRouterErrorCode(message.code) || typeof message.message !== "string") return null;
+      return message as unknown as ServerMessage;
+    case "pong":
+      return isRequestId(message.requestId) ? (message as unknown as ServerMessage) : null;
+    default:
+      return null;
+  }
+}
+
+function isRouterErrorCode(value: unknown): value is RouterErrorCode {
+  return (
+    value === "invalid_message" ||
+    value === "unauthorized" ||
+    value === "not_registered" ||
+    value === "agent_conflict" ||
+    value === "target_offline" ||
+    value === "request_conflict" ||
+    value === "request_not_found" ||
+    value === "reply_forbidden" ||
+    value === "target_disconnected" ||
+    value === "request_timeout"
+  );
 }

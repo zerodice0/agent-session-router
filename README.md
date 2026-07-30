@@ -11,13 +11,16 @@ to one another.
 
 ## Status
 
-This repository currently contains the local-first routing foundation:
+This repository currently contains the local-first routing and first provider
+adapter foundation:
 
 - in-memory agent registry
 - WebSocket registration and discovery
 - targeted request delivery
 - correlated replies with timeouts
-- a provider-neutral gateway client and session adapter boundary
+- a duplex provider-neutral gateway with correlated `listAgents` and `send`
+- nested coordinator -> worker -> worker round-trip coverage
+- a Codex App Server adapter with an injectable JSONL transport
 - an in-memory mock session adapter with two-worker isolation tests
 - a reviewed provider-native integration and central connection design
 - neutral, environment-independent examples
@@ -25,7 +28,9 @@ This repository currently contains the local-first routing foundation:
 AgentBridge was evaluated as a reference implementation but is not a runtime
 dependency and will not be modified or forked for this project. The decision is
 recorded in [docs/agentbridge-integration.md](docs/agentbridge-integration.md).
-Provider adapters and the agent-facing messaging tool are the next phase.
+The Codex adapter is fake-transport testable in this repository. A live Codex
+CLI check remains a separate development-machine integration gate. Claude and
+agent-facing MCP adapters remain future work.
 
 ## Run locally
 
@@ -91,7 +96,9 @@ A coordinator can then send a request:
 
 See [docs/design.md](docs/design.md) for the architecture and implementation
 phases, [docs/provider-integration.md](docs/provider-integration.md) for the
-provider and central-routing boundary, and
+provider and central-routing boundary,
+[docs/codex-integration.md](docs/codex-integration.md) for the implemented Codex
+adapter and live validation procedure, and
 [docs/agentbridge-integration.md](docs/agentbridge-integration.md) for the
 AgentBridge evaluation decision.
 

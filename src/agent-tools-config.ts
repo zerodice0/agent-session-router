@@ -4,7 +4,7 @@ export const AGENT_ROUTER_URL_ENV = "AGENT_ROUTER_URL";
 export const AGENT_ROUTER_AGENT_ID_ENV = "AGENT_ROUTER_AGENT_ID";
 export const AGENT_ROUTER_DELEGATION_TOKEN_ENV = "AGENT_ROUTER_DELEGATION_TOKEN";
 
-const MCP_SERVER_ID = "agent_session_router";
+export const AGENT_TOOLS_MCP_SERVER_ID = "agent_session_router";
 const MCP_ENV_VARS = [
   AGENT_ROUTER_URL_ENV,
   AGENT_ROUTER_AGENT_ID_ENV,
@@ -25,7 +25,7 @@ export function createDelegationToken(): string {
 
 export function createCodexAppServerCommand(): string[] {
   const serverScript = fileURLToPath(new URL("./agent-tools-mcp.ts", import.meta.url));
-  const configPrefix = `mcp_servers.${MCP_SERVER_ID}`;
+  const configPrefix = `mcp_servers.${AGENT_TOOLS_MCP_SERVER_ID}`;
   return [
     "codex",
     "app-server",

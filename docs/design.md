@@ -243,7 +243,8 @@ Implemented and validated with the automated router and mock-session suite.
 
 - Codex App Server adapter for a gateway-owned thread (implemented; one live
   CLI round trip, busy, timeout, and recovery validation completed)
-- Claude managed-session adapter
+- Claude Agent SDK adapter for a gateway-owned resumable session (implemented;
+  fake-SDK lifecycle tests complete, authenticated live turn pending)
 - optional Claude Channel adapter for explicitly opted-in live sessions
 - provider approval and process-disconnect handling that fails closed
 
@@ -255,10 +256,12 @@ Implemented and validated with the automated router and mock-session suite.
   separate stdio MCP child
 - keep provider credentials and central credentials out of model-visible input
 
-Implemented for Codex with the official MCP server SDK and validated with a
-live Codex A -> Codex B nested exchange plus parallel response-isolation check.
-The same tool service is the required outbound boundary for the future Claude
-adapter.
+Implemented for Codex and Claude. Codex uses the official stdio MCP server SDK
+and has a live A -> B nested exchange plus parallel response-isolation
+validation. Claude reuses the tool handlers through the Agent SDK's in-process
+MCP server so the delegation token stays outside subprocess arguments; its
+fake-SDK validation is complete and its authenticated live exchange remains
+pending.
 
 ### Phase 5: secure multi-system transport
 

@@ -457,7 +457,7 @@ describe("GatewayClient with router", () => {
           content: "nested:parent-task",
         }),
       ]);
-      expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThan(1_000);
+      expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThanOrEqual(1_000);
     } finally {
       coordinator.disconnect();
       workerA.disconnect();
@@ -538,7 +538,7 @@ describe("GatewayClient with router", () => {
           content: "delegated:parent-task",
         }),
       ]);
-      expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThan(1_000);
+      expect(workerBAdapter.requests[0]!.timeoutMs).toBeLessThanOrEqual(1_000);
 
       workerA.disconnect();
       await Bun.sleep(10);

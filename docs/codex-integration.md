@@ -138,9 +138,9 @@ disposable workspaces, and neutral agent identifiers. The validation confirmed:
 - a cleanly restarted provider recovered without replaying an earlier timed-out
   request.
 
-Only generic pass/fail state was emitted by the harness. Prompt bodies, provider
-responses, credentials, thread identifiers, machine details, and runtime paths
-were not logged or added to the repository.
+The repository retains only generic pass/fail results. Router, gateway, and MCP
+application logs did not emit prompt bodies, provider responses, credentials,
+thread identifiers, machine details, or runtime paths.
 
 ## Separate development-machine validation
 

@@ -22,6 +22,7 @@ adapter foundation:
 - nested coordinator -> worker -> worker round-trip coverage
 - a Codex App Server adapter with an injectable JSONL transport
 - a Claude Agent SDK adapter with injectable query/startup boundaries
+- a Claude Code Channel adapter for explicitly opted-in interactive sessions
 - agent-scoped delegated router connections for outbound-only provider tools
 - standard MCP `agent_list` and `agent_send` tools shared by Codex and Claude
 - an in-memory mock session adapter with two-worker isolation tests
@@ -33,9 +34,10 @@ dependency and will not be modified or forked for this project. The decision is
 recorded in [docs/agentbridge-integration.md](docs/agentbridge-integration.md).
 The Codex adapter and MCP tool bridge have completed a live two-Codex exchange:
 agent discovery, Codex A -> `agent_send` -> Codex B -> A nested completion, and
-parallel response isolation. The Claude managed-session adapter now reuses the
-same MCP tool contract and has completed fake-SDK lifecycle validation; its
-authenticated live turn and mixed Claude <-> Codex exchange remain external
+parallel response isolation. The Claude managed-session adapter reuses the same
+MCP tool contract and has completed fake-SDK lifecycle validation. The Claude
+Channel adapter has completed in-memory MCP wire and loopback router validation;
+manual consent and a live interactive Claude <-> Codex exchange remain external
 integration gates.
 
 ## Run locally
@@ -106,7 +108,9 @@ provider and central-routing boundary,
 [docs/codex-integration.md](docs/codex-integration.md) for the implemented Codex
 adapter and live validation procedure,
 [docs/claude-integration.md](docs/claude-integration.md) for the Claude Agent SDK
-adapter and authenticated validation procedure, and
+adapter and authenticated validation procedure,
+[docs/claude-channel-integration.md](docs/claude-channel-integration.md) for the
+interactive Claude Code Channel adapter and manual validation procedure, and
 [docs/agentbridge-integration.md](docs/agentbridge-integration.md) for the
 AgentBridge evaluation decision.
 

@@ -176,7 +176,7 @@ contract without a Claude-specific router protocol. Built-in tools and
 filesystem settings are disabled. Implementation and live validation details
 are in [claude-integration.md](claude-integration.md).
 
-### 6.2 Explicit live-session channel: optional
+### 6.2 Explicit live-session channel: implemented optional adapter
 
 Claude Code Channels can push an event into a running session through an MCP
 server and can expose a reply tool. A channel connector maps router delivery to:
@@ -195,6 +195,14 @@ Official references:
 - [Push events with Channels](https://code.claude.com/docs/en/channels)
 - [Channel notification and reply contract](https://code.claude.com/docs/en/channels-reference)
 
+The implemented Channel process is the primary router registration for its
+interactive session. It exposes `agent_reply`, `agent_list`, and `agent_send`,
+registers only after the MCP client initializes, and removes the registration
+when the MCP connection closes. It rejects a second inbound delivery while one
+reply is pending, and a late or mismatched `request_id` cannot complete another
+request. Automated tests cover the MCP notification/tool wire, inbound reply,
+parallel outbound response isolation, busy, timeout, and disconnect behavior.
+
 Channels remain optional because they are a research preview, require explicit
 session and possibly organization opt-in, do not acknowledge model processing,
 may silently drop events when disabled, and queue events while Claude is busy.
@@ -202,8 +210,10 @@ The connector therefore treats the reply tool as the only completion ACK and
 uses timeout for non-delivery. A session not launched with the channel is
 offline rather than being discovered or attached implicitly.
 
-The official channel contract requires `@modelcontextprotocol/sdk`; that
-dependency is justified only when this optional adapter is implemented.
+The official channel contract requires `@modelcontextprotocol/sdk`; the
+adapter pins it as a direct runtime dependency. Full setup and manual consent
+validation are documented in
+[claude-channel-integration.md](claude-channel-integration.md).
 
 ## 7. Codex integration
 

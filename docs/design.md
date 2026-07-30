@@ -245,7 +245,8 @@ Implemented and validated with the automated router and mock-session suite.
   CLI round trip, busy, timeout, and recovery validation completed)
 - Claude Agent SDK adapter for a gateway-owned resumable session (implemented;
   fake-SDK lifecycle tests complete, authenticated live turn pending)
-- optional Claude Channel adapter for explicitly opted-in live sessions
+- Claude Channel adapter for explicitly opted-in live sessions (implemented;
+  MCP wire and loopback router tests complete, interactive consent test pending)
 - provider approval and process-disconnect handling that fails closed
 
 ### Phase 4: agent-facing MCP tools
@@ -256,12 +257,13 @@ Implemented and validated with the automated router and mock-session suite.
   separate stdio MCP child
 - keep provider credentials and central credentials out of model-visible input
 
-Implemented for Codex and Claude. Codex uses the official stdio MCP server SDK
-and has a live A -> B nested exchange plus parallel response-isolation
-validation. Claude reuses the tool handlers through the Agent SDK's in-process
-MCP server so the delegation token stays outside subprocess arguments; its
-fake-SDK validation is complete and its authenticated live exchange remains
-pending.
+Implemented for Codex and both Claude boundaries. Codex uses the official stdio
+MCP server SDK and has a live A -> B nested exchange plus parallel
+response-isolation validation. Claude reuses the tool handlers through the
+Agent SDK's in-process MCP server so the delegation token stays outside
+subprocess arguments; its fake-SDK validation is complete and its authenticated
+live exchange remains pending. The interactive Channel uses one primary gateway
+inside its stdio MCP process and requires no delegated child connection.
 
 ### Phase 5: secure multi-system transport
 

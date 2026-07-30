@@ -142,6 +142,7 @@ repository.
 10. If persistence is required across gateway restart, capture the session ID
     privately and restart with `CLAUDE_SESSION_ID`; never commit that value.
 
-An optional Claude Code Channel remains a separate future adapter only for an
-already-running session that explicitly opts in. It is not required for the
-managed-session baseline.
+The separate Claude Code Channel adapter is implemented for an already-running
+interactive session that explicitly opts in. It does not replace this
+managed-session baseline; see
+[claude-channel-integration.md](claude-channel-integration.md).

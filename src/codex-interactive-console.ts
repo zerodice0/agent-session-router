@@ -82,7 +82,11 @@ export class CodexInteractiveConsole {
         this.#write("No other agents are connected.\n");
         return;
       }
-      for (const agent of agents) this.#write(`${agent.agentId} (${agent.side})\n`);
+      for (const agent of agents) {
+        const status = agent.status ?? "unknown";
+        const activity = agent.activity === undefined ? "" : ` - ${agent.activity}`;
+        this.#write(`${agent.agentId} (${agent.side}, ${status})${activity}\n`);
+      }
     } catch (error) {
       this.#write(`Unable to list agents: ${readGatewayError(error)}\n`);
     }

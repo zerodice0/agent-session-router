@@ -42,13 +42,25 @@ describe("agent tools MCP", () => {
   test("lists other agents without exposing the caller as a target", async () => {
     const messenger = new RecordingMessenger([
       { agentId: "local:worker-a", side: "codex" },
-      { agentId: "local:worker-b", side: "codex" },
+      {
+        agentId: "local:worker-b",
+        side: "codex",
+        activity: "reviewing tests",
+        status: "busy",
+      },
     ]);
 
     const result = await runAgentListTool(messenger, "local:worker-a");
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toEqual({
-      agents: [{ agentId: "local:worker-b", side: "codex" }],
+      agents: [
+        {
+          agentId: "local:worker-b",
+          side: "codex",
+          activity: "reviewing tests",
+          status: "busy",
+        },
+      ],
     });
   });
 

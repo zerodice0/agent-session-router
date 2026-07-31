@@ -74,7 +74,13 @@ export function startRouter(options: RouterOptions = {}) {
     if (!pending) return;
     clearTimeout(pending.timer);
     pendingRequests.delete(requestId);
+    refreshAgentStatus(pending.recipientId);
     sendMessage(pending.requester, message);
+  }
+
+  function refreshAgentStatus(agentId: string): void {
+    const busy = [...pendingRequests.values()].some(({ recipientId }) => recipientId === agentId);
+    registry.setStatus(agentId, busy ? "busy" : "idle");
   }
 
   function handleDisconnect(connection: AgentConnection): void {
@@ -88,6 +94,7 @@ export function startRouter(options: RouterOptions = {}) {
       if (disconnectedConnections.has(pending.requester)) {
         clearTimeout(pending.timer);
         pendingRequests.delete(requestId);
+        refreshAgentStatus(pending.recipientId);
         continue;
       }
 
@@ -153,7 +160,12 @@ export function startRouter(options: RouterOptions = {}) {
         sendError(connection, "agent_conflict", `Agent is already connected: ${message.agent.agentId}`);
         return;
       }
-      sendMessage(connection, { type: "registered", agent: message.agent, role: "agent" });
+      const registered = registry.get(message.agent.agentId);
+      if (!registered) {
+        sendError(connection, "not_registered", "Registration did not complete");
+        return;
+      }
+      sendMessage(connection, { type: "registered", agent: registered.descriptor, role: "agent" });
       if (logEvents) console.info(`agent registered: ${message.agent.agentId}`);
       return;
     }
@@ -205,6 +217,7 @@ export function startRouter(options: RouterOptions = {}) {
           deadlineAt,
           timer,
         });
+        refreshAgentStatus(target.descriptor.agentId);
         sendMessage(target.connection, {
           type: "deliver",
           requestId: message.requestId,

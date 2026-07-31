@@ -13,7 +13,7 @@ describe("AgentRegistry", () => {
 
     expect(registry.register(descriptor, socket)).toBe(true);
     expect(registry.get(descriptor.agentId)?.connection).toBe(socket);
-    expect(registry.unregister(socket)?.descriptor).toEqual(descriptor);
+    expect(registry.unregister(socket)?.descriptor).toEqual({ ...descriptor, status: "idle" });
     expect(registry.list()).toEqual([]);
   });
 
@@ -28,9 +28,20 @@ describe("AgentRegistry", () => {
   test("lists agents in stable identifier order", () => {
     const registry = new AgentRegistry();
     registry.register({ agentId: "local:worker-b", side: "generic" }, connection());
-    registry.register({ agentId: "local:worker-a", side: "generic" }, connection());
+    registry.register(
+      { agentId: "local:worker-a", side: "generic", activity: "reviewing tests" },
+      connection(),
+    );
 
     expect(registry.list().map(({ agentId }) => agentId)).toEqual(["local:worker-a", "local:worker-b"]);
+    expect(registry.list()[0]).toEqual({
+      agentId: "local:worker-a",
+      side: "generic",
+      activity: "reviewing tests",
+      status: "idle",
+    });
+    registry.setStatus("local:worker-a", "busy");
+    expect(registry.list()[0]?.status).toBe("busy");
   });
 
   test("authorizes outbound-only delegates without listing them as agents", () => {
@@ -45,7 +56,7 @@ describe("AgentRegistry", () => {
     expect(registry.registerDelegate(descriptor.agentId, "x".repeat(64), rejected)).toBe(false);
     expect(registry.registerDelegate(descriptor.agentId, delegationToken, delegate)).toBe(true);
     expect(registry.getByConnection(delegate)).toMatchObject({ descriptor, role: "delegate" });
-    expect(registry.list()).toEqual([descriptor]);
+    expect(registry.list()).toEqual([{ ...descriptor, status: "idle" }]);
 
     expect(registry.unregister(delegate)).toMatchObject({ descriptor, role: "delegate", delegates: [] });
     expect(registry.get(descriptor.agentId)?.connection).toBe(primary);

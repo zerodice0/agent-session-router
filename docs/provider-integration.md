@@ -61,9 +61,11 @@ One logical connector owns one `agentId` and three boundaries:
    - wait for the correlated router result and return it to the calling agent.
 
 The current `GatewayClient` implements central registration, inbound delivery,
-and correlated outbound list/send calls. An agent handling an inbound request
-can call another agent and await that child result without clearing or mixing
-its inbound busy state.
+correlated outbound list/send calls, heartbeat, and reconnect after a previously
+healthy connection fails. An agent handling an inbound request can call another
+agent and await that child result without clearing or mixing its inbound busy
+state. Disconnect fails pending requests immediately; reconnect restores only
+the registration and never replays content.
 
 Codex runs the provider-facing MCP server as a separate stdio child. Claude uses
 the Agent SDK's in-process MCP server so scoped credentials do not enter Claude
@@ -94,13 +96,28 @@ ready. A connector must not advertise an agent while its provider process,
 thread, or channel cannot receive work.
 
 For local development the router remains on `127.0.0.1` and may use the existing
-shared test token. Before any central multi-system deployment:
+shared test token. A trusted tailnet deployment can retain that loopback bind and
+use a Tailscale Serve TCP forwarder. Tailscale Grants should allow only approved
+agent systems to reach the router port, while `ROUTER_TOKEN` remains a second
+application-layer check.
+
+Official references:
+
+- [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+- [Tailscale encryption](https://tailscale.com/docs/concepts/tailscale-encryption)
+- [Tailscale Grants](https://tailscale.com/docs/features/access-control/grants)
+
+The primary gateway sends `ping` every 15 seconds, expects `pong` within 5
+seconds, and reconnects with jittered exponential delays from 250 milliseconds
+to 10 seconds. It starts automatic reconnect only after one successful
+registration, so invalid startup configuration still fails visibly.
+
+Before any deployment outside an encrypted, access-controlled overlay:
 
 - use `wss://` with authenticated TLS;
 - replace the shared token with a credential scoped to an allowed `agentId` and
   operations;
 - keep deployment configuration and credentials outside the repository;
-- add heartbeat and reconnect with bounded exponential backoff and jitter;
 - remove the registration immediately when the connector disconnects;
 - do not retry or replay requests whose delivery state is uncertain.
 
@@ -108,6 +125,16 @@ The central router is a trust boundary: it routes message plaintext in memory.
 TLS protects transport, but it does not hide messages from the router process.
 End-to-end content encryption would be a separate protocol and is not part of
 the current plan.
+
+### Presence metadata
+
+`agent_list` returns `agentId`, provider `side`, router-derived `status`, and an
+optional operator-supplied `activity`. `status` is `busy` while at least one
+routed request remains active for that recipient and otherwise `idle`; clients
+cannot declare it. `activity` is limited to 160 printable characters and is
+provided explicitly through `GATEWAY_AGENT_ACTIVITY` or the launcher
+`--activity` option. It must be a generic public summary such as `reviewing
+tests`, never a copied prompt, response, path, customer name, or credential.
 
 ## 5. Agent-to-agent request flow
 
@@ -247,6 +274,15 @@ The non-interactive `gateway:codex` remains available for automation workers.
 The design does not share a live stock Codex TUI: current upstream behavior does
 not guarantee multi-client event fan-out in both directions for one thread.
 
+The preferred human interface is now `python3 scripts/asr.py codex-cli
+worker-a`. It starts the stock Codex TUI with a process-local standalone MCP
+gateway. That gateway owns the primary router registration and exposes
+`agent_list`, `agent_send`, `agent_wait`, and `agent_reply`. Outbound calls are
+immediate; inbound work is pull-based because MCP cannot inject an unsolicited
+turn into an idle TUI. The inbox keeps at most one request, preserves its
+router `requestId` and deadline, and rejects a second delivery as
+`session_busy`.
+
 Official reference:
 
 - [Codex App Server](https://developers.openai.com/codex/app-server/)
@@ -261,20 +297,20 @@ The baseline target is a gateway-owned thread. Resuming a stored, inactive
 thread can be tested separately. The design does not promise safe simultaneous
 control of an arbitrary thread already open in another TUI or desktop process.
 
-Codex also needs local outbound `agent_list` and `agent_send` tools. The stable
-choice is the implemented standard stdio MCP server configured for the
-gateway-owned thread. The gateway injects the server with per-process Codex
-config overrides and forwards only three runtime values: router URL, agent ID,
-and an agent-scoped delegation token. Secret values remain in process
-environment rather than command arguments. Only the connector owns the inbound
-central `agentId` registration.
+Codex App Server modes use an outbound-only delegated stdio MCP child for
+`agent_list` and `agent_send`; only the owning App Server connector accepts
+deliveries. The stock TUI instead starts a standalone stdio MCP process that
+owns the primary router registration and can therefore receive one pulled
+delivery. Both launchers use per-process Codex config overrides and forward
+only environment-variable names in command arguments. Secret values remain in
+the process environment.
 
 ## 8. Authentication and trust boundaries
 
 | Boundary | Required behavior |
 | --- | --- |
 | Agent session -> local connector | Provider-supported tool/channel/SDK boundary; local IPC only when needed |
-| Connector -> central router | Outbound WSS, per-agent credential, claimed `agentId` authorization |
+| Connector -> central router | Tailnet-restricted WebSocket plus shared token for the trusted internal profile; outbound WSS and per-agent credentials outside that boundary |
 | Router registry | One active inbound owner per `agentId`; outbound-only delegates require the owner's ephemeral token |
 | Router request | Authoritative `from`, recipient-bound reply, live duplicate rejection |
 | Provider credentials | Remain on the agent system and never enter router messages or logs |
@@ -300,8 +336,11 @@ Implementation proceeds in this order:
    Adapter implementation and fake-SDK validation are complete; authenticated
    Claude and mixed Claude <-> Codex live turns remain. Add the optional Channel
    adapter only if live-session injection is still required.
-6. Add WSS, per-agent authorization, heartbeat, and reconnect before enabling a
-   non-loopback central deployment.
+6. Add heartbeat, reconnect, and presence metadata. Completed for primary
+   gateways with no replay semantics and deterministic loopback tests.
+7. Validate the tailnet-only profile with two remote provider sessions. WSS and
+   per-agent authorization remain required only before leaving that trusted
+   overlay boundary.
 
 Provider adapters are not allowed to weaken router isolation, log content, copy
 provider credentials to the central system, or introduce automatic replay.

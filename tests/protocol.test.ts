@@ -24,6 +24,42 @@ describe("parseClientMessage", () => {
     });
   });
 
+  test("accepts public activity metadata but rejects client-supplied status", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "register",
+          protocolVersion: 1,
+          agent: {
+            agentId: "local:reviewer",
+            side: "claude",
+            activity: "reviewing tests",
+          },
+        }),
+      ),
+    ).toMatchObject({
+      agent: { activity: "reviewing tests" },
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "register",
+          protocolVersion: 1,
+          agent: { agentId: "local:reviewer", side: "claude", status: "busy" },
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "register",
+          protocolVersion: 1,
+          agent: { agentId: "local:reviewer", side: "claude", activity: "unsafe\nvalue" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   test("accepts an agent-scoped delegate registration", () => {
     const delegationToken = "d".repeat(64);
     expect(
@@ -96,6 +132,27 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage(JSON.stringify({ type: "result", requestId: "request-1" }))).toBeNull();
     expect(parseServerMessage(new Uint8Array())).toBeNull();
     expect(parseServerMessage("not-json")).toBeNull();
+  });
+
+  test("accepts router-derived agent presence", () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          type: "agents",
+          requestId: "list-1",
+          agents: [
+            {
+              agentId: "local:reviewer",
+              side: "claude",
+              activity: "reviewing tests",
+              status: "busy",
+            },
+          ],
+        }),
+      ),
+    ).toMatchObject({
+      agents: [{ activity: "reviewing tests", status: "busy" }],
+    });
   });
 });
 

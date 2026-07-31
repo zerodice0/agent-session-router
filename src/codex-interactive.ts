@@ -8,15 +8,15 @@ import {
   createCodexAppServerCommand,
   createDelegationToken,
 } from "./agent-tools-config";
-import { isAgentId, normalizeTimeoutMs } from "./protocol";
+import { normalizeTimeoutMs } from "./protocol";
+import { runtimeAgent } from "./runtime-agent";
 
 const routerUrl = process.env.ROUTER_URL ?? "ws://127.0.0.1:8787/ws";
-const agentId = process.env.GATEWAY_AGENT_ID ?? "local:codex";
+const agent = runtimeAgent("local:codex", "codex");
+const agentId = agent.agentId;
 const providerCwd = process.env.CODEX_CWD;
 const resumeThreadId = process.env.CODEX_THREAD_ID;
 const configuredTurnTimeoutMs = readOptionalNumber(process.env.CODEX_TURN_TIMEOUT_MS);
-
-if (!isAgentId(agentId)) throw new Error("Invalid GATEWAY_AGENT_ID");
 
 const delegationToken = createDelegationToken();
 const transport = CodexStdioTransport.spawn({
@@ -38,7 +38,7 @@ try {
   });
   gateway = new GatewayClient({
     routerUrl,
-    agent: { agentId, side: "codex" },
+    agent,
     adapter,
     token: process.env.ROUTER_TOKEN,
     delegationToken,

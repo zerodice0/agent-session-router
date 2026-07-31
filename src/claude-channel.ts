@@ -2,12 +2,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ClaudeChannelAdapter, type ClaudeChannelNotifier } from "./claude-channel-adapter";
 import { createClaudeChannelMcpServer } from "./claude-channel-mcp";
 import { GatewayClient } from "./gateway-client";
-import { isAgentId } from "./protocol";
+import { runtimeAgent } from "./runtime-agent";
 
 const routerUrl = process.env.ROUTER_URL ?? "ws://127.0.0.1:8787/ws";
-const agentId = process.env.GATEWAY_AGENT_ID ?? "local:claude-channel";
-
-if (!isAgentId(agentId)) throw new Error("Invalid GATEWAY_AGENT_ID");
+const agent = runtimeAgent("local:claude-channel", "claude");
+const agentId = agent.agentId;
 
 let notify: ClaudeChannelNotifier = async () => {
   throw new Error("Claude Channel is not initialized");
@@ -15,7 +14,7 @@ let notify: ClaudeChannelNotifier = async () => {
 const adapter = new ClaudeChannelAdapter((event) => notify(event));
 const gateway = new GatewayClient({
   routerUrl,
-  agent: { agentId, side: "claude" },
+  agent,
   adapter,
   token: process.env.ROUTER_TOKEN,
 });

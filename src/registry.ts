@@ -1,4 +1,4 @@
-import type { AgentDescriptor, RegistrationRole, ServerMessage } from "./protocol";
+import type { AgentDescriptor, AgentStatus, RegistrationRole, ServerMessage } from "./protocol";
 
 export interface AgentConnection {
   send(message: string): number | void;
@@ -32,9 +32,10 @@ export class AgentRegistry {
     delegationToken?: string,
   ): boolean {
     if (this.#agents.has(descriptor.agentId) || this.#connections.has(connection)) return false;
-    const registered = { descriptor, connection, delegationToken };
+    const presence: AgentDescriptor = { ...descriptor, status: "idle" };
+    const registered = { descriptor: presence, connection, delegationToken };
     this.#agents.set(descriptor.agentId, registered);
-    this.#connections.set(connection, { descriptor, connection, role: "agent" });
+    this.#connections.set(connection, { descriptor: presence, connection, role: "agent" });
     return true;
   }
 
@@ -81,9 +82,14 @@ export class AgentRegistry {
     return this.#connections.get(connection);
   }
 
+  setStatus(agentId: string, status: AgentStatus): void {
+    const registered = this.#agents.get(agentId);
+    if (registered) registered.descriptor.status = status;
+  }
+
   list(): AgentDescriptor[] {
     return [...this.#agents.values()]
-      .map(({ descriptor }) => descriptor)
+      .map(({ descriptor }) => ({ ...descriptor }))
       .sort((left, right) => left.agentId.localeCompare(right.agentId));
   }
 }

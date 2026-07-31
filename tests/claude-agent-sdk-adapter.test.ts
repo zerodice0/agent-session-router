@@ -108,6 +108,7 @@ describe("Claude Agent SDK configuration", () => {
         ROUTER_TOKEN: "central-secret",
         ROUTER_URL: "ws://127.0.0.1:18787/ws",
         GATEWAY_AGENT_ID: "local:worker-a",
+        GATEWAY_AGENT_ACTIVITY: "reviewing tests",
       },
     });
 
@@ -123,6 +124,7 @@ describe("Claude Agent SDK configuration", () => {
     expect(options.env?.ROUTER_TOKEN).toBeUndefined();
     expect(options.env?.ROUTER_URL).toBeUndefined();
     expect(options.env?.GATEWAY_AGENT_ID).toBeUndefined();
+    expect(options.env?.GATEWAY_AGENT_ACTIVITY).toBeUndefined();
 
     expect(options.mcpServers?.agent_session_router).toMatchObject({
       type: "sdk",

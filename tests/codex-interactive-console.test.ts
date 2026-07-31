@@ -46,7 +46,12 @@ function setup(
   adapter = new RecordingAdapter(),
   messenger = new RecordingMessenger([
     { agentId: "local:codex", side: "codex" },
-    { agentId: "local:worker-a", side: "codex" },
+    {
+      agentId: "local:worker-a",
+      side: "codex",
+      status: "busy",
+      activity: "reviewing tests",
+    },
   ]),
 ) {
   const output: string[] = [];
@@ -82,7 +87,10 @@ describe("CodexInteractiveConsole", () => {
     await interactive.execute("/agents");
     await interactive.execute("/send local:worker-a routed-task");
 
-    expect(output).toEqual(["local:worker-a (codex)\n", "routed-result\n"]);
+    expect(output).toEqual([
+      "local:worker-a (codex, busy) - reviewing tests\n",
+      "routed-result\n",
+    ]);
     expect(messenger.sends).toEqual([
       { target: "local:worker-a", content: "routed-task", options: undefined },
     ]);

@@ -9,6 +9,7 @@
     "gateway:claude": "bun src/claude-gateway.ts",
     "gateway:codex": "bun src/codex-gateway.ts",
     "mcp:agent-tools": "bun src/agent-tools-mcp.ts",
+    "mcp:codex-cli": "bun src/codex-cli-mcp-server.ts",
     "dev": "bun --watch src/router.ts",
     "smoke:provider": "bun src/provider-smoke.ts",
     "smoke": "bun src/smoke.ts",

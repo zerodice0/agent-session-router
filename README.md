@@ -19,9 +19,12 @@ adapter foundation:
 - targeted request delivery
 - correlated replies with timeouts
 - a duplex provider-neutral gateway with correlated `listAgents` and `send`
+- application heartbeat and bounded reconnect without request replay
+- router-derived `idle`/`busy` presence plus optional public activity metadata
 - nested coordinator -> worker -> worker round-trip coverage
 - a Codex App Server adapter with an injectable JSONL transport
 - a prompt-capable Codex console sharing the gateway-owned App Server thread
+- a stock Codex CLI MCP gateway with correlated send/wait/reply tools
 - a Claude Agent SDK adapter with injectable query/startup boundaries
 - a Claude Code Channel adapter for explicitly opted-in interactive sessions
 - agent-scoped delegated router connections for outbound-only provider tools
@@ -38,8 +41,9 @@ agent discovery, Codex A -> `agent_send` -> Codex B -> A nested completion, and
 parallel response isolation. The Claude managed-session adapter reuses the same
 MCP tool contract and has completed fake-SDK lifecycle validation. The Claude
 Channel adapter has completed in-memory MCP wire and loopback router validation;
-manual consent and a live interactive Claude <-> Codex exchange remain external
-integration gates.
+the prompt-capable Codex console has completed a live Claude exchange on a
+separate development machine. The stock Codex TUI MCP path retains one manual
+Claude <-> Codex validation gate.
 
 ## Run locally
 
@@ -56,8 +60,7 @@ repository root:
 
 ```bash
 python3 scripts/asr.py router
-python3 scripts/asr.py codex
-python3 scripts/asr.py codex worker-a
+python3 scripts/asr.py codex-cli worker-a
 ```
 
 Run each long-lived command in its own terminal. Short names such as `worker-a`
@@ -74,12 +77,36 @@ python3 scripts/asr.py shell-init >> ~/.zshrc
 
 Use `~/.bashrc` instead for Bash. Do not repeat the append command after the
 function has been installed. A configured session can then be started with
-`asr router`, `asr codex`, or `asr codex worker-a`. Run `asr doctor` to check
-the local commands without reading or printing credentials.
+`asr router` and `asr codex-cli worker-a`. Run `asr doctor` to check the local
+commands without reading or printing credentials.
+
+`codex-cli` starts the stock Codex TUI and injects one process-local MCP server;
+it does not modify user-level Codex configuration. Inside Codex, ask it to call
+`agent_list` or `agent_send`. To accept one inbound request, ask it to call
+`agent_wait`, handle the returned message, and call `agent_reply` with the same
+`requestId`. Passing Codex flags remains explicit:
+
+```bash
+asr codex-cli worker-a -- --search
+```
+
+The older `asr codex worker-a` command remains available when automatic router
+delivery is more important than using the stock TUI. It opens the repository's
+small prompt console in front of a gateway-owned App Server thread.
 
 For the optional interactive Claude Channel, run `asr setup-claude` once from
-this repository and then use `asr claude reviewer`. Claude still displays its
-required development-Channel consent; the launcher does not bypass it.
+this repository and then use `asr claude reviewer`. To use Claude Auto mode and
+publish a non-sensitive work summary in `agent_list`, run:
+
+```bash
+asr claude reviewer --activity "reviewing tests" --auto
+```
+
+`--dangerously-load-development-channels` remains necessary for a custom
+Channel during Claude's research preview. It bypasses the Channel plugin
+allowlist for this explicitly selected local server; it is not
+`bypassPermissions` and does not disable tool safety. `--auto` independently
+selects Claude's permission mode when the account supports it.
 
 With the router running, use another terminal for a real WebSocket round trip:
 
@@ -103,7 +130,7 @@ If the router uses a different port, pass the same endpoint to the smoke client:
 ROUTER_URL=ws://127.0.0.1:18787/ws bun run smoke
 ```
 
-Inside the prompt-capable Codex console, ordinary input starts a Codex turn.
+Inside the older prompt-capable Codex console, ordinary input starts a Codex turn.
 Use `/agents` to list peers, `/send local:worker-a message` for a direct router
 check that does not start a local model turn, and `/quit` to exit. The existing
 `bun run gateway:codex` command remains the non-interactive automation worker.
@@ -113,10 +140,11 @@ request to `local:worker-a` and reports only pass/fail; it intentionally does
 not print or persist the provider response. This command consumes one provider
 turn, unlike the router-only `asr smoke` command.
 
-The current implementation is local-first. A multi-system deployment must keep
-the router behind authenticated TLS and use outbound gateway connections with
-per-agent credentials before changing the loopback default. See
-[docs/provider-integration.md](docs/provider-integration.md).
+The current implementation is local-first but can keep the router on loopback
+and expose its TCP port only inside a trusted tailnet. Gate the port with
+Tailscale Grants and retain `ROUTER_TOKEN` as defense in depth. Public or
+non-overlay deployment still requires authenticated TLS and per-agent
+credentials. See [docs/provider-integration.md](docs/provider-integration.md).
 
 ## Protocol sketch
 
@@ -128,10 +156,15 @@ A worker first registers a globally unique identifier:
   "protocolVersion": 1,
   "agent": {
     "agentId": "local:reviewer",
-    "side": "claude"
+    "side": "claude",
+    "activity": "reviewing tests"
   }
 }
 ```
+
+`activity` is optional, operator-supplied, limited to 160 printable characters,
+and visible to every connected agent. `agent_list` also includes router-derived
+`status: "idle" | "busy"`; clients cannot claim their own status.
 
 A coordinator can then send a request:
 

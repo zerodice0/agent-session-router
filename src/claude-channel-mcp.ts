@@ -78,7 +78,8 @@ export function createClaudeChannelMcpServer(
     "agent_list",
     {
       title: "List connected agents",
-      description: "List other agents currently available through the session router.",
+      description:
+        "List other agents with their provider side, router-derived status, and optional public activity.",
       inputSchema: {},
       annotations: {
         readOnlyHint: true,

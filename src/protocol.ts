@@ -1,13 +1,19 @@
 export const PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 export const MAX_REQUEST_TIMEOUT_MS = 10 * 60_000;
+export const MAX_AGENT_ACTIVITY_LENGTH = 160;
 
 export type AgentSide = "claude" | "codex" | "generic";
+export type AgentStatus = "idle" | "busy";
 export type RegistrationRole = "agent" | "delegate";
 
 export interface AgentDescriptor {
   agentId: string;
   side: AgentSide;
+  /** Operator-supplied, non-sensitive summary visible to every connected agent. */
+  activity?: string;
+  /** Router-derived state. Registration clients must not set this field. */
+  status?: AgentStatus;
 }
 
 export type ClientMessage =
@@ -78,6 +84,7 @@ export type ServerMessage =
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DELEGATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
 
 export function isAgentId(value: unknown): value is string {
   return typeof value === "string" && AGENT_ID_PATTERN.test(value);
@@ -91,6 +98,16 @@ export function isDelegationToken(value: unknown): value is string {
   return typeof value === "string" && DELEGATION_TOKEN_PATTERN.test(value);
 }
 
+export function isAgentActivity(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= MAX_AGENT_ACTIVITY_LENGTH &&
+    value.trim() === value &&
+    !CONTROL_CHARACTER_PATTERN.test(value)
+  );
+}
+
 export function isAgentDescriptor(value: unknown): value is AgentDescriptor {
   if (!value || typeof value !== "object") return false;
   const descriptor = value as Record<string, unknown>;
@@ -98,7 +115,9 @@ export function isAgentDescriptor(value: unknown): value is AgentDescriptor {
     isAgentId(descriptor.agentId) &&
     (descriptor.side === "claude" ||
       descriptor.side === "codex" ||
-      descriptor.side === "generic")
+      descriptor.side === "generic") &&
+    (descriptor.activity === undefined || isAgentActivity(descriptor.activity)) &&
+    (descriptor.status === undefined || descriptor.status === "idle" || descriptor.status === "busy")
   );
 }
 
@@ -125,12 +144,9 @@ export function parseClientMessage(raw: string): ClientMessage | null {
   switch (message.type) {
     case "register": {
       if (message.protocolVersion !== PROTOCOL_VERSION) return null;
-      if (!message.agent || typeof message.agent !== "object") return null;
-      const agent = message.agent as Record<string, unknown>;
-      if (!isAgentId(agent.agentId)) return null;
-      if (agent.side !== "claude" && agent.side !== "codex" && agent.side !== "generic") {
-        return null;
-      }
+      if (!isAgentDescriptor(message.agent)) return null;
+      const agent = message.agent as AgentDescriptor;
+      if (agent.status !== undefined) return null;
       if (message.token !== undefined && typeof message.token !== "string") return null;
       if (message.delegationToken !== undefined && !isDelegationToken(message.delegationToken)) {
         return null;

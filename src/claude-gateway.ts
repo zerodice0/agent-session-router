@@ -5,15 +5,14 @@ import {
   type ClaudeAgentSdkConfiguration,
 } from "./claude-agent-sdk-config";
 import { GatewayClient } from "./gateway-client";
-import { isAgentId } from "./protocol";
+import { runtimeAgent } from "./runtime-agent";
 
 const routerUrl = process.env.ROUTER_URL ?? "ws://127.0.0.1:8787/ws";
-const agentId = process.env.GATEWAY_AGENT_ID ?? "local:claude";
+const agent = runtimeAgent("local:claude", "claude");
+const agentId = agent.agentId;
 const providerCwd = process.env.CLAUDE_CWD;
 const resumeSessionId = process.env.CLAUDE_SESSION_ID;
 const executablePath = process.env.CLAUDE_CODE_EXECUTABLE;
-
-if (!isAgentId(agentId)) throw new Error("Invalid GATEWAY_AGENT_ID");
 
 const delegationToken = createDelegationToken();
 let adapter: ClaudeAgentSdkAdapter | null = null;
@@ -34,7 +33,7 @@ try {
   });
   gateway = new GatewayClient({
     routerUrl,
-    agent: { agentId, side: "claude" },
+    agent,
     adapter,
     token: process.env.ROUTER_TOKEN,
     delegationToken,

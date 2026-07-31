@@ -20,6 +20,7 @@ const CENTRAL_ENVIRONMENT_KEYS = new Set([
   "ROUTER_TOKEN",
   "ROUTER_URL",
   "GATEWAY_AGENT_ID",
+  "GATEWAY_AGENT_ACTIVITY",
   "AGENT_ROUTER_URL",
   "AGENT_ROUTER_AGENT_ID",
   "AGENT_ROUTER_DELEGATION_TOKEN",
@@ -124,7 +125,7 @@ function createClaudeAgentTools(config: AgentToolsRuntimeConfig): {
     tools: [
       tool(
         "agent_list",
-        "List other agents currently available through the session router.",
+        "List other agents with their provider side, router-derived status, and optional public activity.",
         {},
         async () => runAgentListTool(await messenger(), config.agentId),
         {

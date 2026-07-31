@@ -118,7 +118,76 @@ function deferredResult() {
   return { promise, resolve };
 }
 
+async function waitForCondition(predicate: () => boolean, timeoutMs = WAIT_TIMEOUT_MS): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+    await Bun.sleep(5);
+  }
+}
+
 describe("GatewayClient with router", () => {
+  test("uses heartbeat failure to reconnect with bounded backoff", async () => {
+    const port = await availablePort();
+    let connectionCount = 0;
+    let pingCount = 0;
+    const server = Bun.serve<{ connectionNumber: number }>({
+      hostname: "127.0.0.1",
+      port,
+      fetch(request, bunServer) {
+        if (
+          new URL(request.url).pathname === "/ws" &&
+          bunServer.upgrade(request, { data: { connectionNumber: ++connectionCount } })
+        ) {
+          return undefined;
+        }
+        return new Response("Not found", { status: 404 });
+      },
+      websocket: {
+        message(socket, raw) {
+          const message = JSON.parse(String(raw)) as ClientMessage;
+          if (message.type === "register") {
+            socket.send(
+              JSON.stringify({
+                type: "registered",
+                agent: { ...message.agent, status: "idle" },
+                role: "agent",
+              }),
+            );
+            return;
+          }
+          if (message.type === "ping") {
+            pingCount += 1;
+            if (socket.data.connectionNumber > 1) {
+              socket.send(JSON.stringify({ type: "pong", requestId: message.requestId }));
+            }
+          }
+        },
+      },
+    });
+    const gateway = new GatewayClient({
+      routerUrl: `ws://127.0.0.1:${port}/ws`,
+      agent: { agentId: "local:worker-a", side: "generic" },
+      adapter: new MockSessionAdapter(async () => ({ ok: true, content: "unused" })),
+      heartbeatIntervalMs: 10,
+      heartbeatTimeoutMs: 10,
+      reconnectInitialDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      reconnectJitterRatio: 0,
+    });
+
+    try {
+      await gateway.connect();
+      await waitForCondition(() => connectionCount >= 2 && gateway.connected);
+      const pingsAfterReconnect = pingCount;
+      await waitForCondition(() => pingCount > pingsAfterReconnect);
+      expect(gateway.connected).toBe(true);
+    } finally {
+      gateway.disconnect();
+      server.stop(true);
+    }
+  });
+
   test("selects one of two workers and keeps responses correlated", async () => {
     const { server, url } = await startTestRouter();
     const coordinator = await RouterTestClient.register(url, "local:coordinator");
@@ -198,7 +267,11 @@ describe("GatewayClient with router", () => {
     });
     const worker = new GatewayClient({
       routerUrl: url,
-      agent: { agentId: "local:worker-a", side: "generic" },
+      agent: {
+        agentId: "local:worker-a",
+        side: "generic",
+        activity: "reviewing tests",
+      },
       adapter,
     });
 
@@ -213,6 +286,17 @@ describe("GatewayClient with router", () => {
       await coordinator.waitFor(
         (message) => message.type === "accepted" && message.requestId === "busy-first",
       );
+
+      const busyPresence = coordinator.waitFor(
+        (message) => message.type === "agents" && message.requestId === "list-busy",
+      );
+      coordinator.send({ type: "list", requestId: "list-busy" });
+      expect(await busyPresence).toMatchObject({
+        agents: [
+          { agentId: "local:coordinator", status: "idle" },
+          { agentId: "local:worker-a", activity: "reviewing tests", status: "busy" },
+        ],
+      });
 
       const busyResult = coordinator.waitFor(
         (message) => message.type === "result" && message.requestId === "busy-second",
@@ -237,6 +321,16 @@ describe("GatewayClient with router", () => {
       );
       first.resolve({ ok: true, content: "first-result" });
       expect(await firstResult).toMatchObject({ content: "first-result", ok: true });
+
+      const idlePresence = coordinator.waitFor(
+        (message) => message.type === "agents" && message.requestId === "list-idle",
+      );
+      coordinator.send({ type: "list", requestId: "list-idle" });
+      expect(await idlePresence).toMatchObject({
+        agents: expect.arrayContaining([
+          expect.objectContaining({ agentId: "local:worker-a", status: "idle" }),
+        ]),
+      });
     } finally {
       worker.disconnect();
       coordinator.close();

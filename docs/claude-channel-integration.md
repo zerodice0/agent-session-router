@@ -21,6 +21,7 @@ Official sources checked on 2026-07-31:
 - [Channels reference](https://code.claude.com/docs/en/channels-reference)
 - [Claude Code MCP configuration](https://code.claude.com/docs/en/mcp)
 - [Claude Code authentication](https://code.claude.com/docs/en/iam)
+- [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes)
 
 Channels are a research preview. Custom Channels require explicit development
 opt-in, and organization policy may disable them. This adapter remains optional
@@ -40,12 +41,22 @@ The Python launcher reduces the one-time setup and later startup commands:
 ```bash
 python3 scripts/asr.py setup-claude
 python3 scripts/asr.py claude reviewer
+python3 scripts/asr.py claude reviewer --activity "reviewing tests" --auto
 ```
 
 The first command registers the repository-local MCP entry. The second starts
 Claude with the neutral `local:reviewer` identity and the explicit development
-Channel opt-in. It does not suppress Claude's consent UI or organization
-policy.
+Channel opt-in. The third additionally publishes a non-sensitive activity and
+requests Auto permission mode when the account supports it.
+
+The launcher's `--dangerously-load-development-channels` is not
+`--dangerously-skip-permissions` and does not select `bypassPermissions`. It is
+currently required because custom Channels are outside Claude's research-
+preview plugin allowlist. It can bypass a configured Channel allowlist for this
+explicit server, so it must be used only with the trusted repository-local MCP
+entry. Auto mode is independent and does not make the development flag
+unnecessary. Removing the flag before packaging and approving this Channel as
+a plugin prevents the Channel from registering.
 
 The Channel process connects to the router only after Claude Code completes the
 MCP initialization handshake. Closing the MCP session disconnects the gateway
@@ -74,6 +85,8 @@ Claude may also call `agent_list` and `agent_send` through the same MCP process.
 Those calls use the primary gateway connection, preserve their own opaque
 request IDs, and can run while one inbound Channel request is pending. The
 router derives `from` from the registered socket rather than model input.
+List results include router-derived `idle`/`busy` status and an optional public
+activity supplied when each connector starts.
 
 ## Channel notification schema
 
@@ -167,7 +180,8 @@ Use a disposable local workspace and neutral identifiers.
    ```
 
 4. Start an interactive session with the explicit research-preview opt-in and
-   approve only this local development Channel:
+   approve only this local development Channel. Add `--permission-mode auto`
+   independently when the account supports Auto mode:
 
    ```bash
    claude --dangerously-load-development-channels server:agent-session-router-channel

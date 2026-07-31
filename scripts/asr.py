@@ -16,6 +16,13 @@ from pathlib import Path
 AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 DEFAULT_ROUTER_URL = "ws://127.0.0.1:8787/ws"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+CODEX_CLI_MCP_SERVER_ID = "agent_session_router_cli"
+CODEX_CLI_MCP_ENV_VARS = [
+    "ROUTER_URL",
+    "GATEWAY_AGENT_ID",
+    "GATEWAY_AGENT_ACTIVITY",
+    "ROUTER_TOKEN",
+]
 
 
 def agent_id(value: str) -> str:
@@ -24,6 +31,16 @@ def agent_id(value: str) -> str:
         resolved = f"local:{resolved}"
     if not AGENT_ID_PATTERN.fullmatch(resolved):
         raise argparse.ArgumentTypeError("agent name must use letters, digits, '.', '_', ':', or '-'")
+    return resolved
+
+
+def agent_activity(value: str) -> str:
+    resolved = value.strip()
+    has_control_character = any(
+        ord(character) < 32 or ord(character) == 127 for character in resolved
+    )
+    if not 1 <= len(resolved) <= 160 or has_control_character:
+        raise argparse.ArgumentTypeError("activity must be 1-160 printable characters")
     return resolved
 
 
@@ -43,9 +60,25 @@ def parser() -> argparse.ArgumentParser:
 
     codex = commands.add_parser("codex", help="start a prompt-capable Codex connector")
     codex.add_argument("agent", nargs="?", default="codex", type=agent_id)
+    codex.add_argument("--activity", type=agent_activity, help="public non-sensitive work summary")
+
+    codex_cli = commands.add_parser("codex-cli", help="start stock Codex CLI with router MCP tools")
+    codex_cli.add_argument("agent", nargs="?", default="codex-cli", type=agent_id)
+    codex_cli.add_argument("--activity", type=agent_activity, help="public non-sensitive work summary")
+    codex_cli.add_argument(
+        "codex_args",
+        nargs=argparse.REMAINDER,
+        help="arguments passed to Codex after an optional '--' separator",
+    )
 
     claude = commands.add_parser("claude", help="start interactive Claude with the configured Channel")
     claude.add_argument("agent", nargs="?", default="claude-channel", type=agent_id)
+    claude.add_argument("--activity", type=agent_activity, help="public non-sensitive work summary")
+    claude.add_argument(
+        "--auto",
+        action="store_true",
+        help="start Claude in auto permission mode when the account supports it",
+    )
 
     commands.add_parser(
         "setup-claude",
@@ -60,11 +93,13 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def resolved_environment(agent: str | None = None) -> dict[str, str]:
+def resolved_environment(agent: str | None = None, activity: str | None = None) -> dict[str, str]:
     environment = os.environ.copy()
     environment.setdefault("ROUTER_URL", DEFAULT_ROUTER_URL)
     if agent is not None:
         environment["GATEWAY_AGENT_ID"] = agent
+    if activity is not None:
+        environment["GATEWAY_AGENT_ACTIVITY"] = activity
     return environment
 
 
@@ -84,6 +119,58 @@ def execute(command: list[str], environment: dict[str, str], dry_run: bool) -> i
     return 1
 
 
+def codex_cli_command(workspace: str, extra_args: list[str]) -> list[str]:
+    server_script = str(REPO_ROOT / "src" / "codex-cli-mcp-server.ts")
+    prefix = f"mcp_servers.{CODEX_CLI_MCP_SERVER_ID}"
+    forwarded_args = extra_args[1:] if extra_args[:1] == ["--"] else extra_args
+    return [
+        "codex",
+        "-C",
+        workspace,
+        "-c",
+        f"{prefix}.command={json.dumps('bun')}",
+        "-c",
+        f"{prefix}.args={json.dumps([server_script], separators=(',', ':'))}",
+        "-c",
+        f"{prefix}.env_vars={json.dumps(CODEX_CLI_MCP_ENV_VARS, separators=(',', ':'))}",
+        "-c",
+        f"{prefix}.required=true",
+        "-c",
+        f'{prefix}.enabled_tools=["agent_list","agent_send","agent_wait","agent_reply"]',
+        "-c",
+        f'{prefix}.default_tools_approval_mode="approve"',
+        "-c",
+        f"{prefix}.startup_timeout_sec=10",
+        "-c",
+        f"{prefix}.tool_timeout_sec=600",
+        *forwarded_args,
+    ]
+
+
+def normalize_codex_cli_options(argv: list[str]) -> list[str]:
+    """Keep launcher options before argparse's passthrough remainder."""
+    try:
+        command_index = argv.index("codex-cli")
+    except ValueError:
+        return argv
+
+    separator_index = (
+        argv.index("--", command_index + 1)
+        if "--" in argv[command_index + 1 :]
+        else len(argv)
+    )
+    for index in range(command_index + 1, separator_index):
+        value = argv[index]
+        if value == "--activity" and index + 1 < separator_index:
+            option = argv[index : index + 2]
+            remaining = argv[:index] + argv[index + 2 :]
+            return remaining[: command_index + 1] + option + remaining[command_index + 1 :]
+        if value.startswith("--activity="):
+            remaining = argv[:index] + argv[index + 1 :]
+            return remaining[: command_index + 1] + [value] + remaining[command_index + 1 :]
+    return argv
+
+
 def doctor() -> int:
     missing = [name for name in ("bun", "codex", "python3") if shutil.which(name) is None]
     if missing:
@@ -94,7 +181,8 @@ def doctor() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser().parse_args(normalize_codex_cli_options(raw_argv))
 
     if args.command == "doctor":
         return doctor()
@@ -105,17 +193,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "router":
         return execute(["bun", "run", "start"], resolved_environment(), args.dry_run)
     if args.command == "codex":
-        environment = resolved_environment(args.agent)
+        environment = resolved_environment(args.agent, args.activity)
         environment.setdefault("CODEX_CWD", os.getcwd())
         return execute(["bun", "run", "codex:interactive"], environment, args.dry_run)
+    if args.command == "codex-cli":
+        workspace = os.getcwd()
+        return execute(
+            codex_cli_command(workspace, args.codex_args),
+            resolved_environment(args.agent, args.activity),
+            args.dry_run,
+        )
     if args.command == "claude":
+        permission_mode = ["--permission-mode", "auto"] if args.auto else []
         return execute(
             [
                 "claude",
+                *permission_mode,
                 "--dangerously-load-development-channels",
                 "server:agent-session-router-channel",
             ],
-            resolved_environment(args.agent),
+            resolved_environment(args.agent, args.activity),
             args.dry_run,
         )
     if args.command == "setup-claude":

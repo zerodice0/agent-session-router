@@ -93,13 +93,16 @@ export function createAgentToolsMcpServer(options: AgentToolsMcpOptions): McpSer
     "agent_list",
     {
       title: "List connected agents",
-      description: "List other agents currently available through the session router.",
+      description:
+        "List other agents with their provider side, router-derived status, and optional public activity.",
       inputSchema: z.object({}),
       outputSchema: z.object({
         agents: z.array(
           z.object({
             agentId: z.string(),
             side: z.enum(["claude", "codex", "generic"]),
+            activity: z.string().optional(),
+            status: z.enum(["idle", "busy"]).optional(),
           }),
         ),
       }),

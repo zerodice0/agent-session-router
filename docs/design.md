@@ -21,6 +21,10 @@ fork AgentBridge.
 - Avoid storing message content or environment-specific connection details.
 - Let any connected agent use the same targeted send/list interface, not only a
   privileged coordinator.
+- Detect an unresponsive router and restore a previously healthy connection
+  without replaying uncertain requests.
+- Let an operator publish a short, non-sensitive activity summary while the
+  router derives the agent's `idle` or `busy` state.
 
 ## 3. Non-goals for the first version
 
@@ -86,6 +90,12 @@ client waits for outbound `agents`, `result`, and `error` messages without
 mixing them with inbound deliveries. `accepted` remains informational and does
 not complete an outbound call.
 
+After its first successful registration, the gateway sends an application
+`ping` every 15 seconds and requires the correlated `pong` within 5 seconds. A
+missed heartbeat closes the stale socket and starts reconnect attempts at 250
+milliseconds, doubling to a 10-second ceiling with bounded jitter. Pending
+requests fail on disconnect and are never replayed after registration returns.
+
 When a provider launches tools in a separate MCP child process, the gateway
 creates a high-entropy, agent-scoped delegation token. The child opens an
 outbound-only delegated router connection. It inherits the gateway's `agentId`
@@ -106,6 +116,11 @@ surface:
 agent_list()
 agent_send(target, prompt, timeoutMs?)
 ```
+
+`agent_list` returns the provider side, router-derived `idle`/`busy` status, and
+an optional public `activity` string. Activity is set explicitly at connector
+startup; it is never inferred from a prompt, response, provider transcript, or
+local working directory.
 
 `agent_send` waits for the correlated final result. Asynchronous status polling
 is not added unless a real provider workflow proves that a single bounded tool
@@ -189,6 +204,12 @@ Examples:
 Duplicate live registrations are rejected. This avoids silent replacement and
 makes session ownership visible.
 
+Registration may include an optional `activity` of at most 160 printable
+characters. It is public presence metadata, not a private task payload. The
+router adds `status` to list results and rejects client registrations that try
+to provide their own status. An agent is busy while at least one routed request
+to its primary connection remains active.
+
 ## 7. Busy and failure behavior
 
 - Unknown recipient: return `target_offline` immediately.
@@ -213,13 +234,17 @@ delivery.
 - Give delegated MCP connections only `list`, `send`, and `ping` authority;
   revoke them with the owning gateway and never expose the central shared token
   to the MCP child.
-- Use TLS and per-gateway credentials before enabling any non-loopback listener.
+- Keep a tailnet deployment on loopback and expose it through a Tailscale-only
+  TCP forwarder with a least-privilege Grant for the router port.
+- Use TLS and per-gateway credentials before enabling any non-loopback listener
+  outside an encrypted, access-controlled overlay.
 
-A multi-system deployment uses outbound authenticated gateway connections over
-WSS. A credential must be scoped to the `agentId` and allowed operations it may
-register; the current shared test token is not sufficient for that deployment.
-Provider credentials stay on the agent system. The central router is trusted
-with message plaintext unless a future end-to-end encryption layer is added.
+A trusted tailnet deployment uses its encrypted data plane and least-privilege
+port policy while retaining the shared token as defense in depth. Deployment
+outside that boundary uses outbound WSS connections and credentials scoped to
+the `agentId` and allowed operations. Provider credentials stay on the agent
+system. The central router is trusted with message plaintext unless a future
+end-to-end encryption layer is added.
 
 ## 9. Implementation phases
 
@@ -245,6 +270,8 @@ Implemented and validated with the automated router and mock-session suite.
   CLI round trip, busy, timeout, and recovery validation completed)
 - prompt-capable Codex console for a human-operated gateway-owned thread
   (implemented; stock TUI peer co-control remains unsupported)
+- stock Codex TUI MCP gateway with explicit `agent_wait`/`agent_reply` inbound
+  polling (implemented; no peer thread co-control or unsolicited turn injection)
 - Claude Agent SDK adapter for a gateway-owned resumable session (implemented;
   fake-SDK lifecycle tests complete, authenticated live turn pending)
 - Claude Channel adapter for explicitly opted-in live sessions (implemented;
@@ -254,7 +281,8 @@ Implemented and validated with the automated router and mock-session suite.
 ### Phase 4: agent-facing MCP tools
 
 - expose `agent_list` and `agent_send` through each provider's supported local
-  tool boundary
+  tool boundary; add `agent_wait` and `agent_reply` where the provider requires
+  pull-based inbound delivery
 - use an agent-scoped outbound-only delegation when the provider starts a
   separate stdio MCP child
 - keep provider credentials and central credentials out of model-visible input
@@ -267,11 +295,18 @@ subprocess arguments; its fake-SDK validation is complete and its authenticated
 live exchange remains pending. The interactive Channel uses one primary gateway
 inside its stdio MCP process and requires no delegated child connection.
 
+The stock Codex TUI uses a separate primary MCP gateway rather than a delegated
+child. It retains one inbound request until `agent_wait` claims it and accepts
+only one exact-ID `agent_reply`; this keeps the official CLI UI without claiming
+Claude Channel-style push semantics.
+
 ### Phase 5: secure multi-system transport
 
 - authenticated outbound gateway connections
 - WSS and per-agent authorization
-- heartbeat, readiness, and reconnect without automatic replay
+- heartbeat and reconnect without automatic replay (implemented for primary
+  gateways)
+- operator-supplied activity and router-derived presence (implemented)
 - deployment configuration stored outside the repository
 
 ## 10. Validation plan

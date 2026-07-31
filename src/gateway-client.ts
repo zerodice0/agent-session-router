@@ -13,7 +13,12 @@ import {
 } from "./protocol";
 import type { SessionAdapter, SessionResult } from "./session-adapter";
 
-const DEFAULT_CONNECT_TIMEOUT_MS = 3_000;
+export const DEFAULT_CONNECT_TIMEOUT_MS = 3_000;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
+export const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
+export const DEFAULT_RECONNECT_MAX_DELAY_MS = 10_000;
+export const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
 const LOCAL_TIMEOUT_GRACE_MS = 250;
 const REQUEST_ID_ATTEMPTS = 16;
 
@@ -28,6 +33,11 @@ interface PendingSend {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface PendingHeartbeat {
+  requestId: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export interface GatewayClientOptions {
   routerUrl: string;
   agent: AgentDescriptor;
@@ -35,6 +45,12 @@ export interface GatewayClientOptions {
   token?: string;
   delegationToken?: string;
   connectTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  reconnectInitialDelayMs?: number;
+  reconnectMaxDelayMs?: number;
+  reconnectJitterRatio?: number;
+  random?: () => number;
   requestIdFactory?: () => string;
 }
 
@@ -42,6 +58,13 @@ export class GatewayRequestError extends Error {
   constructor(readonly code: RouterErrorCode | "gateway_disconnected" | "gateway_not_connected") {
     super(code);
     this.name = "GatewayRequestError";
+  }
+}
+
+class GatewayRegistrationError extends Error {
+  constructor(readonly code: RouterErrorCode) {
+    super(`Gateway registration failed: ${code}`);
+    this.name = "GatewayRegistrationError";
   }
 }
 
@@ -57,12 +80,25 @@ export class GatewayClient implements AgentMessenger {
   readonly #token: string | undefined;
   readonly #delegationToken: string | undefined;
   readonly #connectTimeoutMs: number;
+  readonly #heartbeatIntervalMs: number;
+  readonly #heartbeatTimeoutMs: number;
+  readonly #reconnectInitialDelayMs: number;
+  readonly #reconnectMaxDelayMs: number;
+  readonly #reconnectJitterRatio: number;
+  readonly #random: () => number;
   readonly #requestIdFactory: () => string;
 
   readonly #pendingLists = new Map<string, PendingList>();
   readonly #pendingSends = new Map<string, PendingSend>();
   #socket: WebSocket | null = null;
   #registered = false;
+  #connectPromise: Promise<void> | null = null;
+  #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  #pendingHeartbeat: PendingHeartbeat | null = null;
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  #reconnectAttempt = 0;
+  #reconnectEnabled = false;
+  #hasConnected = false;
   #activeInboundRequestId: string | null = null;
   #activeInboundDeadline: number | null = null;
 
@@ -72,7 +108,28 @@ export class GatewayClient implements AgentMessenger {
     this.#adapter = options.adapter;
     this.#token = options.token;
     this.#delegationToken = options.delegationToken;
-    this.#connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    this.#connectTimeoutMs = positiveInteger(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
+    this.#heartbeatIntervalMs = positiveInteger(
+      options.heartbeatIntervalMs,
+      DEFAULT_HEARTBEAT_INTERVAL_MS,
+    );
+    this.#heartbeatTimeoutMs = positiveInteger(
+      options.heartbeatTimeoutMs,
+      DEFAULT_HEARTBEAT_TIMEOUT_MS,
+    );
+    this.#reconnectInitialDelayMs = positiveInteger(
+      options.reconnectInitialDelayMs,
+      DEFAULT_RECONNECT_INITIAL_DELAY_MS,
+    );
+    this.#reconnectMaxDelayMs = Math.max(
+      this.#reconnectInitialDelayMs,
+      positiveInteger(options.reconnectMaxDelayMs, DEFAULT_RECONNECT_MAX_DELAY_MS),
+    );
+    const configuredJitter = options.reconnectJitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO;
+    this.#reconnectJitterRatio = Number.isFinite(configuredJitter)
+      ? Math.max(0, Math.min(configuredJitter, 1))
+      : DEFAULT_RECONNECT_JITTER_RATIO;
+    this.#random = options.random ?? Math.random;
     this.#requestIdFactory = options.requestIdFactory ?? (() => crypto.randomUUID());
   }
 
@@ -80,7 +137,25 @@ export class GatewayClient implements AgentMessenger {
     return this.#registered && this.#socket?.readyState === WebSocket.OPEN;
   }
 
-  async connect(): Promise<void> {
+  connect(): Promise<void> {
+    this.#reconnectEnabled = true;
+    if (this.connected) return Promise.resolve();
+    return this.#beginConnectAttempt();
+  }
+
+  #beginConnectAttempt(): Promise<void> {
+    if (this.#connectPromise) return this.#connectPromise;
+    const attempt = this.#connectOnce();
+    let tracked: Promise<void>;
+    tracked = attempt.finally(() => {
+      if (this.#connectPromise === tracked) this.#connectPromise = null;
+      if (!this.connected) this.#scheduleReconnect();
+    });
+    this.#connectPromise = tracked;
+    return tracked;
+  }
+
+  async #connectOnce(): Promise<void> {
     if (this.connected) return;
     if (this.#socket) throw new Error("Gateway connection is already in progress");
 
@@ -132,12 +207,15 @@ export class GatewayClient implements AgentMessenger {
             return;
           }
           this.#registered = true;
+          this.#hasConnected = true;
+          this.#reconnectAttempt = 0;
+          this.#scheduleHeartbeat(socket);
           finish();
           return;
         }
 
         if (!settled && message.type === "error") {
-          finish(new Error(`Gateway registration failed: ${message.code}`));
+          finish(new GatewayRegistrationError(message.code));
           socket.close();
           return;
         }
@@ -150,13 +228,18 @@ export class GatewayClient implements AgentMessenger {
       });
 
       socket.addEventListener("close", () => {
-        if (this.#socket === socket) this.#markDisconnected();
+        if (this.#socket === socket) {
+          this.#markDisconnected();
+          if (settled) this.#scheduleReconnect();
+        }
         if (!settled) finish(new Error("Router closed before gateway registration completed"));
       });
     });
   }
 
   disconnect(): void {
+    this.#reconnectEnabled = false;
+    this.#clearReconnectTimer();
     const socket = this.#socket;
     this.#markDisconnected();
     socket?.close();
@@ -246,6 +329,9 @@ export class GatewayClient implements AgentMessenger {
         return;
       case "deliver":
         void this.#handleDelivery(socket, message);
+        return;
+      case "pong":
+        this.#handlePong(socket, message.requestId);
         return;
       default:
         return;
@@ -350,7 +436,91 @@ export class GatewayClient implements AgentMessenger {
     socket.send(JSON.stringify(message));
   }
 
+  #scheduleHeartbeat(socket: WebSocket): void {
+    this.#clearHeartbeat();
+    this.#heartbeatTimer = setTimeout(() => {
+      this.#heartbeatTimer = null;
+      if (socket !== this.#socket || !this.connected) return;
+
+      const requestId = `heartbeat:${crypto.randomUUID()}`;
+      const timer = setTimeout(() => {
+        if (this.#pendingHeartbeat?.requestId !== requestId) return;
+        this.#pendingHeartbeat = null;
+        if (socket !== this.#socket) return;
+        this.#markDisconnected();
+        socket.close();
+        this.#scheduleReconnect();
+      }, this.#heartbeatTimeoutMs);
+      this.#pendingHeartbeat = { requestId, timer };
+      this.#sendMessage(socket, { type: "ping", requestId });
+    }, this.#heartbeatIntervalMs);
+  }
+
+  #handlePong(socket: WebSocket, requestId: string): void {
+    const pending = this.#pendingHeartbeat;
+    if (socket !== this.#socket || !pending || pending.requestId !== requestId) return;
+    clearTimeout(pending.timer);
+    this.#pendingHeartbeat = null;
+    this.#scheduleHeartbeat(socket);
+  }
+
+  #clearHeartbeat(): void {
+    if (this.#heartbeatTimer) clearTimeout(this.#heartbeatTimer);
+    this.#heartbeatTimer = null;
+    if (this.#pendingHeartbeat) clearTimeout(this.#pendingHeartbeat.timer);
+    this.#pendingHeartbeat = null;
+  }
+
+  #scheduleReconnect(): void {
+    if (
+      !this.#reconnectEnabled ||
+      !this.#hasConnected ||
+      this.connected ||
+      this.#socket ||
+      this.#connectPromise ||
+      this.#reconnectTimer
+    ) {
+      return;
+    }
+
+    const exponentialDelay = Math.min(
+      this.#reconnectInitialDelayMs * 2 ** this.#reconnectAttempt,
+      this.#reconnectMaxDelayMs,
+    );
+    this.#reconnectAttempt += 1;
+    const randomSample = this.#random();
+    const random = Number.isFinite(randomSample)
+      ? Math.max(0, Math.min(randomSample, 1))
+      : 0.5;
+    const jitter = (random * 2 - 1) * this.#reconnectJitterRatio;
+    const delay = Math.max(1, Math.floor(exponentialDelay * (1 + jitter)));
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      void this.#reconnect().catch(() => {});
+    }, delay);
+  }
+
+  async #reconnect(): Promise<void> {
+    if (!this.#reconnectEnabled || this.connected) return;
+    try {
+      await this.#beginConnectAttempt();
+    } catch (error) {
+      if (error instanceof GatewayRegistrationError && error.code === "unauthorized") {
+        this.#reconnectEnabled = false;
+        this.#clearReconnectTimer();
+        return;
+      }
+      this.#scheduleReconnect();
+    }
+  }
+
+  #clearReconnectTimer(): void {
+    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = null;
+  }
+
   #markDisconnected(): void {
+    this.#clearHeartbeat();
     this.#socket = null;
     this.#registered = false;
     this.#activeInboundRequestId = null;
@@ -367,4 +537,9 @@ export class GatewayClient implements AgentMessenger {
       this.#pendingSends.delete(requestId);
     }
   }
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.floor(value));
 }

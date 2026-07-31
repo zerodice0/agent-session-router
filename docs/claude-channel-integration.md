@@ -35,6 +35,18 @@ and does not change the managed Agent SDK gateway.
 - `claude-channel` connects the MCP lifecycle to one primary `GatewayClient`.
 - `bun run channel:claude` is the stdio entrypoint spawned by Claude Code.
 
+The Python launcher reduces the one-time setup and later startup commands:
+
+```bash
+python3 scripts/asr.py setup-claude
+python3 scripts/asr.py claude reviewer
+```
+
+The first command registers the repository-local MCP entry. The second starts
+Claude with the neutral `local:reviewer` identity and the explicit development
+Channel opt-in. It does not suppress Claude's consent UI or organization
+policy.
+
 The Channel process connects to the router only after Claude Code completes the
 MCP initialization handshake. Closing the MCP session disconnects the gateway
 and removes the agent registration. MCP initialization does not prove that

@@ -21,6 +21,7 @@ adapter foundation:
 - a duplex provider-neutral gateway with correlated `listAgents` and `send`
 - nested coordinator -> worker -> worker round-trip coverage
 - a Codex App Server adapter with an injectable JSONL transport
+- a prompt-capable Codex console sharing the gateway-owned App Server thread
 - a Claude Agent SDK adapter with injectable query/startup boundaries
 - a Claude Code Channel adapter for explicitly opted-in interactive sessions
 - agent-scoped delegated router connections for outbound-only provider tools
@@ -42,17 +43,48 @@ integration gates.
 
 ## Run locally
 
-Requirements: Bun 1.3 or newer.
+Requirements: Bun 1.3 or newer, Python 3, and an authenticated Codex CLI for
+interactive provider runs.
 
 ```bash
 bun test
 bun run start
 ```
 
+For the shortest interactive workflow, use the Python launcher from the
+repository root:
+
+```bash
+python3 scripts/asr.py router
+python3 scripts/asr.py codex
+python3 scripts/asr.py codex worker-a
+```
+
+Run each long-lived command in its own terminal. Short names such as `worker-a`
+are normalized to neutral IDs such as `local:worker-a`; router URLs, working
+directories, and defaults are supplied by the launcher.
+
+To make `asr` available in future shells, print and review the generated shell
+function once, then append it to the appropriate shell startup file:
+
+```bash
+python3 scripts/asr.py shell-init
+python3 scripts/asr.py shell-init >> ~/.zshrc
+```
+
+Use `~/.bashrc` instead for Bash. Do not repeat the append command after the
+function has been installed. A configured session can then be started with
+`asr router`, `asr codex`, or `asr codex worker-a`. Run `asr doctor` to check
+the local commands without reading or printing credentials.
+
+For the optional interactive Claude Channel, run `asr setup-claude` once from
+this repository and then use `asr claude reviewer`. Claude still displays its
+required development-Channel consent; the launcher does not bypass it.
+
 With the router running, use another terminal for a real WebSocket round trip:
 
 ```bash
-bun run smoke
+python3 scripts/asr.py smoke
 ```
 
 The router listens on `127.0.0.1:8787` by default. Override it only in a trusted
@@ -70,6 +102,16 @@ If the router uses a different port, pass the same endpoint to the smoke client:
 ```bash
 ROUTER_URL=ws://127.0.0.1:18787/ws bun run smoke
 ```
+
+Inside the prompt-capable Codex console, ordinary input starts a Codex turn.
+Use `/agents` to list peers, `/send local:worker-a message` for a direct router
+check that does not start a local model turn, and `/quit` to exit. The existing
+`bun run gateway:codex` command remains the non-interactive automation worker.
+
+With an interactive provider connected, `asr smoke worker-a` sends one neutral
+request to `local:worker-a` and reports only pass/fail; it intentionally does
+not print or persist the provider response. This command consumes one provider
+turn, unlike the router-only `asr smoke` command.
 
 The current implementation is local-first. A multi-system deployment must keep
 the router behind authenticated TLS and use outbound gateway connections with

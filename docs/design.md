@@ -243,6 +243,8 @@ Implemented and validated with the automated router and mock-session suite.
 
 - Codex App Server adapter for a gateway-owned thread (implemented; one live
   CLI round trip, busy, timeout, and recovery validation completed)
+- prompt-capable Codex console for a human-operated gateway-owned thread
+  (implemented; stock TUI peer co-control remains unsupported)
 - Claude Agent SDK adapter for a gateway-owned resumable session (implemented;
   fake-SDK lifecycle tests complete, authenticated live turn pending)
 - Claude Channel adapter for explicitly opted-in live sessions (implemented;

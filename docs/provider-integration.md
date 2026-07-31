@@ -240,6 +240,13 @@ transport owns a local `codex app-server --listen stdio://` process. Completed
 Timeout requests `turn/interrupt`, process exit fails the active request, and
 late or unrelated events are discarded.
 
+For a human-operated Codex connector, `codex:interactive` places a small
+terminal console in front of that same single App Server client. Ordinary input
+starts a local turn, while `/agents` and `/send` provide direct router checks.
+The non-interactive `gateway:codex` remains available for automation workers.
+The design does not share a live stock Codex TUI: current upstream behavior does
+not guarantee multi-client event fan-out in both directions for one thread.
+
 Official reference:
 
 - [Codex App Server](https://developers.openai.com/codex/app-server/)

@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "channel:claude": "bun src/claude-channel.ts",
+    "codex:interactive": "bun src/codex-interactive.ts",
     "gateway:claude": "bun src/claude-gateway.ts",
     "gateway:codex": "bun src/codex-gateway.ts",
     "mcp:agent-tools": "bun src/agent-tools-mcp.ts",
     "dev": "bun --watch src/router.ts",
+    "smoke:provider": "bun src/provider-smoke.ts",
     "smoke": "bun src/smoke.ts",
     "start": "bun src/router.ts",
     "test": "bun test"

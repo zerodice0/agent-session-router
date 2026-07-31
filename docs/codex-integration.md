@@ -7,6 +7,12 @@ gateway-owned thread. It does not attach to or take over an arbitrary thread
 already controlled by another Codex UI. The adapter can start a new thread or
 resume one explicitly selected by runtime configuration.
 
+Two runtime modes use that same ownership boundary:
+
+- `bun run codex:interactive` adds a terminal prompt to the gateway-owned
+  thread, so a person can use Codex and the router from one process;
+- `bun run gateway:codex` keeps the original non-interactive automation worker.
+
 The implementation uses Bun plus the official MCP server SDK and Zod schema
 validation for the provider-facing tool process:
 
@@ -17,11 +23,35 @@ validation for the provider-facing tool process:
   delivery;
 - `agent-tools-mcp` exposes `agent_list` and `agent_send` over stdio using an
   outbound-only delegated router connection;
-- `bun run gateway:codex` wires those components together for a manual run.
+- `CodexInteractiveConsole` accepts local prompts and the `/agents`, `/send`,
+  `/help`, and `/quit` terminal commands without persisting a transcript;
+- `scripts/asr.py` supplies loopback defaults and neutral agent IDs for short
+  local commands.
+
+## Why the stock Codex TUI is not shared
+
+The Codex CLI documents `codex --remote` and App Server supports multiple
+connections and per-connection thread subscriptions. Those pieces do not yet
+establish reliable peer-client co-presence for one live TUI thread. A current
+upstream reproduction found that a second client could resume and start turns,
+but TUI-origin turns were not reliably fanned out to the peer and peer-origin
+turns were not live-rendered by the TUI without a Codex-side patch.
+
+This repository therefore does not claim that a stock TUI and the gateway can
+co-control one live thread. The interactive connector keeps one App Server
+client and places a small terminal prompt in front of it. This preserves the
+existing request/turn correlation and approval behavior instead of depending
+on an unverified event fan-out path.
+
+Current references checked on 2026-07-31:
+
+- [Codex CLI remote TUI reference](https://developers.openai.com/codex/cli/reference)
+- [Codex App Server transports and subscriptions](https://developers.openai.com/codex/app-server/)
+- [upstream peer-client co-presence reproduction](https://github.com/openai/codex/issues/21551)
 
 ## Verified protocol surface
 
-The implementation follows the stable public lifecycle:
+The implementation stays on the non-gated public lifecycle:
 
 ```text
 initialize -> initialized
@@ -37,7 +67,7 @@ initialization handshake, and defines `thread/start`, `thread/resume`,
 current public source defines `TurnCompletedNotification` with `threadId` and a
 `turn`, and `ItemCompletedNotification` with `threadId`, `turnId`, and an item.
 
-Sources checked on 2026-07-30:
+Sources checked on 2026-07-31:
 
 - [Codex App Server documentation](https://developers.openai.com/codex/app-server/)
 - [official App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
@@ -49,6 +79,45 @@ Sources checked on 2026-07-30:
 
 The adapter omits `capabilities.experimentalApi`; no experimental method or
 field is part of this baseline.
+
+## Interactive operation
+
+With the router running, the complete default startup is:
+
+```bash
+python3 scripts/asr.py codex
+```
+
+An optional short name selects a distinct neutral identity:
+
+```bash
+python3 scripts/asr.py codex worker-a
+```
+
+The launcher converts `worker-a` to `local:worker-a`, preserves the directory
+from which it was invoked as the Codex working directory, and uses the default
+loopback router. It never accepts a token on the command line; an authenticated
+router token must remain in `ROUTER_TOKEN` so it does not appear in process
+arguments.
+
+At the `codex(local:codex)>` prompt:
+
+- ordinary text starts a local Codex turn on the same thread used for routed
+  deliveries and gives that turn access to the MCP `agent_list` and
+  `agent_send` tools;
+- `/agents` lists other registered agents without starting a model turn;
+- `/send <agent> <message>` performs a direct correlated router request and is
+  useful for connectivity tests;
+- `/quit` closes the gateway and App Server process.
+
+`python3 scripts/asr.py smoke worker-a` performs one live provider round trip
+against `local:worker-a` and emits only a generic pass/fail result. It is useful
+for automated verification but consumes one Codex turn.
+
+Local terminal input and Codex output are displayed only on the attached
+terminal. The connector does not create a transcript or write them to its
+application logs. The provider may still persist its normal local thread state
+under Codex's own configuration and retention behavior.
 
 ## Agent tools and delegated identity
 
@@ -103,9 +172,9 @@ events and replays them after it learns `turnId`.
 
 Command and file-change approval requests receive `decision: decline`.
 Permission requests receive an empty grant, and MCP elicitation is declined.
-Unsupported server requests, including interactive user input in this
-non-interactive baseline, receive a JSON-RPC method-not-supported error. The
-adapter never sends an automatic accept response.
+Provider-initiated interactive-input requests and other unsupported server
+requests receive a JSON-RPC method-not-supported error. The adapter never sends
+an automatic accept response.
 
 ## Authentication and privacy
 
@@ -154,12 +223,13 @@ repository.
    `codex app-server generate-ts`; do not commit it.
 3. Run `bun test` in this repository before the live check.
 4. Start the router on an available loopback port with a temporary local token.
-5. Set `ROUTER_URL`, `ROUTER_TOKEN`, `GATEWAY_AGENT_ID=local:worker-a`, and a
-   disposable `CODEX_CWD`; run `bun run gateway:codex`.
-6. Start two gateways with distinct neutral IDs and disposable working
-   directories. Confirm both appear exactly once in `agent_list`; delegated MCP
-   connections must not appear as additional agents.
-7. Send one harmless request from the coordinator to `local:worker-a` directing
+5. Start `python3 scripts/asr.py codex worker-a`. Use environment overrides only
+   when testing a non-default loopback port or authenticated router.
+6. Start another connector with `python3 scripts/asr.py codex worker-b`. Confirm
+   both accept terminal prompts and appear exactly once in `/agents`. Delegated
+   MCP connections must not appear as additional agents.
+7. Use `/send local:worker-b <neutral test message>` for a direct round trip,
+   then send one harmless prompt through Codex A directing
    it to call `agent_send` for `local:worker-b`. Confirm worker B sees
    `from=local:worker-a` and the final nested response returns through worker A
    to the original coordinator request.

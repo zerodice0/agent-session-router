@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import ipaddress
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -21,6 +24,14 @@ PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_ROUTER_URL = "ws://127.0.0.1:8787/ws"
 DEFAULT_ROUTER_PROFILE = "local"
 CONFIG_VERSION = 1
+DEFAULT_ROUTER_PORT = 8787
+MIN_HOST_ROUTER_TOKEN_LENGTH = 16
+TAILSCALE_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_IPV6_NETWORK = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+PRIVATE_LAN_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+PRIVATE_LAN_IPV6_NETWORK = ipaddress.ip_network("fc00::/7")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CODEX_CLI_MCP_SERVER_ID = "agent_session_router_cli"
 CODEX_CLI_MCP_ENV_VARS = [
@@ -33,6 +44,14 @@ CODEX_CLI_MCP_ENV_VARS = [
 
 class RouterProfileError(ValueError):
     """Raised when local router profile configuration is invalid."""
+
+
+class RouterBindError(ValueError):
+    """Raised when a router bind configuration is unsafe or invalid."""
+
+
+class TailscaleUnavailableError(RuntimeError):
+    """Raised when optional Tailscale discovery cannot provide a local IP."""
 
 
 def agent_id(value: str) -> str:
@@ -52,6 +71,120 @@ def agent_activity(value: str) -> str:
     if not 1 <= len(resolved) <= 160 or has_control_character:
         raise argparse.ArgumentTypeError("activity must be 1-160 printable characters")
     return resolved
+
+
+def router_bind_host(value: str) -> str:
+    resolved = value.strip()
+    try:
+        address = ipaddress.ip_address(resolved)
+    except ValueError as error:
+        raise RouterBindError("router bind host must be an IP address") from error
+
+    if address.is_unspecified:
+        raise RouterBindError("wildcard router bind addresses are not allowed")
+    if address.is_multicast:
+        raise RouterBindError("multicast router bind addresses are not allowed")
+    if not (address.is_loopback or is_private_lan_address(address) or is_tailscale_address(address)):
+        raise RouterBindError("router bind host must be a loopback, private LAN, or tailnet IP")
+    return address.compressed
+
+
+def is_private_lan_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if address.version == 4:
+        return any(address in network for network in PRIVATE_LAN_IPV4_NETWORKS)
+    return address in PRIVATE_LAN_IPV6_NETWORK and address not in TAILSCALE_IPV6_NETWORK
+
+
+def is_tailscale_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return address in (TAILSCALE_IPV4_NETWORK if address.version == 4 else TAILSCALE_IPV6_NETWORK)
+
+
+def lan_router_bind_host(value: str) -> str:
+    resolved = router_bind_host(value)
+    if not is_private_lan_address(ipaddress.ip_address(resolved)):
+        raise RouterBindError("LAN mode requires an RFC1918 IPv4 or private IPv6 address")
+    return resolved
+
+
+def verify_local_bind_address(value: str) -> None:
+    address = ipaddress.ip_address(value)
+    family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        probe.bind((address.compressed, 0))
+    except OSError as error:
+        raise RouterBindError("router bind IP is not assigned to this machine") from error
+    finally:
+        probe.close()
+
+
+def tailscale_ip_addresses() -> list[str]:
+    executable = shutil.which("tailscale")
+    if executable is None:
+        raise TailscaleUnavailableError(
+            "Tailscale mode requires the tailscale CLI; install and connect Tailscale first"
+        )
+    try:
+        result = subprocess.run(
+            [executable, "ip"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise TailscaleUnavailableError("Tailscale IP discovery failed") from error
+    if result.returncode != 0:
+        raise TailscaleUnavailableError(
+            "Tailscale is installed but no connected tailnet IP is available"
+        )
+
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for line in result.stdout.splitlines():
+        try:
+            address = ipaddress.ip_address(line.strip())
+        except ValueError:
+            continue
+        if is_tailscale_address(address):
+            addresses.append(address)
+    if not addresses:
+        raise TailscaleUnavailableError(
+            "Tailscale is installed but no connected tailnet IP is available"
+        )
+    return [address.compressed for address in sorted(addresses, key=lambda item: item.version)]
+
+
+def router_bind_host_argument(value: str) -> str:
+    try:
+        return router_bind_host(value)
+    except RouterBindError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def router_port(value: str | int) -> int:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as error:
+        raise RouterBindError("router port must be an integer between 1 and 65535") from error
+    if not 1 <= resolved <= 65_535:
+        raise RouterBindError("router port must be an integer between 1 and 65535")
+    return resolved
+
+
+def router_port_argument(value: str) -> int:
+    try:
+        return router_port(value)
+    except RouterBindError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def valid_host_router_token(value: str | None) -> bool:
+    return (
+        value is not None
+        and len(value) >= MIN_HOST_ROUTER_TOKEN_LENGTH
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
 
 
 def profile_name(value: str) -> str:
@@ -223,7 +356,15 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = result.add_subparsers(dest="command")
 
-    commands.add_parser("router", help="start the loopback router")
+    router = commands.add_parser("router", help="start a loopback, LAN, or tailnet router")
+    router_bind = router.add_mutually_exclusive_group()
+    router_bind.add_argument("--host", type=router_bind_host_argument, help="specific bind IP address")
+    router_bind.add_argument(
+        "--tailscale",
+        action="store_true",
+        help="discover and bind the preferred local Tailscale IP",
+    )
+    router.add_argument("--port", type=router_port_argument, help="router listen port")
 
     codex = commands.add_parser("codex", help="start a prompt-capable Codex connector")
     codex.add_argument("agent", nargs="?", default="codex", type=agent_id)
@@ -286,6 +427,60 @@ def resolved_environment(
     return environment
 
 
+def prompt_host_router_token() -> str | None:
+    try:
+        token = getpass.getpass(
+            f"Router token (at least {MIN_HOST_ROUTER_TOKEN_LENGTH} characters): "
+        )
+        confirmation = getpass.getpass("Confirm router token: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if token != confirmation:
+        print("Router token confirmation does not match.", file=sys.stderr)
+        return None
+    if not valid_host_router_token(token):
+        print(
+            f"Router token must be at least {MIN_HOST_ROUTER_TOKEN_LENGTH} printable characters.",
+            file=sys.stderr,
+        )
+        return None
+    return token
+
+
+def router_server_environment(
+    host: str | None = None,
+    port: int | None = None,
+    *,
+    prompt_for_token: bool = False,
+    verify_assigned: bool = False,
+) -> dict[str, str] | None:
+    environment = resolved_environment()
+    configured_host = host or environment.get("ROUTER_HOST", "127.0.0.1")
+    configured_port = port if port is not None else environment.get("ROUTER_PORT", DEFAULT_ROUTER_PORT)
+    resolved_host = router_bind_host(configured_host)
+    resolved_port = router_port(configured_port)
+
+    environment["ROUTER_HOST"] = resolved_host
+    environment["ROUTER_PORT"] = str(resolved_port)
+    if verify_assigned:
+        verify_local_bind_address(resolved_host)
+    if ipaddress.ip_address(resolved_host).is_loopback:
+        return environment
+
+    token = environment.get("ROUTER_TOKEN")
+    if not valid_host_router_token(token) and prompt_for_token:
+        token = prompt_host_router_token()
+        if token is not None:
+            environment["ROUTER_TOKEN"] = token
+    if not valid_host_router_token(token):
+        raise RouterBindError(
+            f"non-loopback router mode requires ROUTER_TOKEN with at least "
+            f"{MIN_HOST_ROUTER_TOKEN_LENGTH} printable characters"
+        )
+    return environment
+
+
 def execute(command: list[str], environment: dict[str, str], dry_run: bool) -> int:
     if dry_run:
         output: dict[str, object] = {
@@ -294,6 +489,13 @@ def execute(command: list[str], environment: dict[str, str], dry_run: bool) -> i
         }
         if "GATEWAY_AGENT_ID" in environment:
             output["agentId"] = environment["GATEWAY_AGENT_ID"]
+        if command == ["bun", "run", "start"]:
+            host = environment.get("ROUTER_HOST", "127.0.0.1")
+            output["routerBind"] = {
+                "host": host,
+                "port": int(environment.get("ROUTER_PORT", DEFAULT_ROUTER_PORT)),
+                "authenticationRequired": not ipaddress.ip_address(host).is_loopback,
+            }
         print(json.dumps(output, separators=(",", ":")))
         return 0
 
@@ -501,6 +703,72 @@ def prompt_activity() -> str | None:
             print(str(error), file=sys.stderr)
 
 
+def prompt_lan_router_bind_host() -> str | None:
+    while True:
+        value = prompt_value("LAN bind IP")
+        if value is None:
+            return None
+        try:
+            return lan_router_bind_host(value)
+        except RouterBindError as error:
+            print(str(error), file=sys.stderr)
+
+
+def prompt_router_port() -> int | None:
+    while True:
+        value = prompt_value("Router port", str(DEFAULT_ROUTER_PORT))
+        if value is None:
+            return None
+        try:
+            return router_port(value)
+        except RouterBindError as error:
+            print(str(error), file=sys.stderr)
+
+
+def select_tailscale_bind_host() -> str | None:
+    try:
+        addresses = tailscale_ip_addresses()
+    except TailscaleUnavailableError as error:
+        print(f"Tailscale unavailable: {error}", file=sys.stderr)
+        return None
+    options = [(address, address) for address in addresses]
+    return select_option("Tailscale bind IP", options)
+
+
+def interactive_router_environment(dry_run: bool) -> dict[str, str] | None:
+    mode = select_option(
+        "Router mode",
+        [
+            ("loopback", "Loopback — this machine only"),
+            ("lan", "LAN — enter one private IP"),
+            ("tailscale", "Tailscale — select this machine's tailnet IP"),
+        ],
+    )
+    if mode is None:
+        return None
+    if mode == "loopback":
+        host = "127.0.0.1"
+    elif mode == "lan":
+        host = prompt_lan_router_bind_host()
+    else:
+        host = select_tailscale_bind_host()
+    if host is None:
+        return None
+    port = prompt_router_port()
+    if port is None:
+        return None
+    try:
+        return router_server_environment(
+            host,
+            port,
+            prompt_for_token=not dry_run,
+            verify_assigned=not dry_run,
+        )
+    except RouterBindError as error:
+        print(f"Router configuration error: {error}", file=sys.stderr)
+        return None
+
+
 def interactive_launcher(dry_run: bool) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print(
@@ -515,7 +783,7 @@ def interactive_launcher(dry_run: bool) -> int:
             ("claude", "Claude Code"),
             ("codex-cli", "Codex CLI"),
             ("codex", "Codex interactive connector"),
-            ("router", "Start local router"),
+            ("router", "Start router"),
             ("smoke", "Test router connection"),
             ("add-profile", "Add router address"),
             ("exit", "Exit"),
@@ -524,7 +792,10 @@ def interactive_launcher(dry_run: bool) -> int:
     if action is None or action == "exit":
         return 0
     if action == "router":
-        return execute(["bun", "run", "start"], resolved_environment(), dry_run)
+        environment = interactive_router_environment(dry_run)
+        if environment is None:
+            return 1
+        return execute(["bun", "run", "start"], environment, dry_run)
     if action == "add-profile":
         return 0 if add_router_profile_interactive(dry_run) else 1
 
@@ -617,6 +888,10 @@ def doctor() -> int:
         print("Optional: fzf is unavailable; interactive asr will use numbered menus.")
     else:
         print("Optional: fzf is available for interactive asr menus.")
+    if shutil.which("tailscale") is None:
+        print("Optional: tailscale is unavailable; LAN and loopback router modes still work.")
+    else:
+        print("Optional: tailscale CLI is available; connection is checked only when selected.")
     return 0
 
 
@@ -635,7 +910,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "router":
-        return execute(["bun", "run", "start"], resolved_environment(), args.dry_run)
+        try:
+            host = tailscale_ip_addresses()[0] if args.tailscale else args.host
+            environment = router_server_environment(
+                host,
+                args.port,
+                verify_assigned=not args.dry_run,
+            )
+        except (RouterBindError, TailscaleUnavailableError) as error:
+            print(f"Router configuration error: {error}", file=sys.stderr)
+            return 2
+        if environment is None:
+            return 2
+        return execute(["bun", "run", "start"], environment, args.dry_run)
     if args.command == "codex":
         environment = resolved_environment(args.agent, args.activity)
         environment.setdefault("CODEX_CWD", os.getcwd())

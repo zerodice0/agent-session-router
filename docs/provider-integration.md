@@ -96,13 +96,18 @@ ready. A connector must not advertise an agent while its provider process,
 thread, or channel cannot receive work.
 
 For local development the router remains on `127.0.0.1` and may use the existing
-shared test token. A trusted tailnet deployment can retain that loopback bind and
-use a Tailscale Serve TCP forwarder. Tailscale Grants should allow only approved
-agent systems to reach the router port, while `ROUTER_TOKEN` remains a second
-application-layer check.
+shared test token. A trusted tailnet deployment can bind one specific tailnet IP
+or retain loopback and use a Tailscale Serve TCP forwarder. The launcher rejects
+wildcard host bindings and requires `ROUTER_TOKEN` for non-loopback mode. Its
+Tailscale mode treats the installed CLI and connected daemon as optional
+operational prerequisites, discovers only local addresses with `tailscale ip`,
+and never installs or configures Tailscale. Tailscale Grants should allow only
+approved agent systems to reach the router port, while the token remains a
+second application-layer check.
 
 Official references:
 
+- [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli)
 - [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 - [Tailscale encryption](https://tailscale.com/docs/concepts/tailscale-encryption)
 - [Tailscale Grants](https://tailscale.com/docs/features/access-control/grants)

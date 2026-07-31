@@ -1,12 +1,24 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 function runWithEnvironment(environment: Record<string, string>, ...args: string[]) {
+  const inheritedEnvironment = { ...process.env };
+  delete inheritedEnvironment.ROUTER_HOST;
+  delete inheritedEnvironment.ROUTER_PORT;
+  delete inheritedEnvironment.ROUTER_TOKEN;
   return Bun.spawnSync({
     cmd: ["python3", "scripts/asr.py", ...args],
-    env: { ...process.env, ...environment },
+    env: { ...inheritedEnvironment, ...environment },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -107,6 +119,99 @@ describe("asr launcher", () => {
     expect(JSON.parse(run("--dry-run", "smoke", "worker-a").stdout.toString())).toMatchObject({
       command: ["bun", "run", "smoke:provider"],
     });
+  });
+
+  test("binds a router to one LAN or tailnet IP without exposing its token", () => {
+    const result = runWithEnvironment(
+      { ROUTER_TOKEN: "neutral-test-token-value" },
+      "--dry-run",
+      "router",
+      "--host",
+      "100.64.0.10",
+      "--port",
+      "9876",
+    );
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.toString())).toMatchObject({
+      command: ["bun", "run", "start"],
+      routerBind: {
+        host: "100.64.0.10",
+        port: 9876,
+        authenticationRequired: true,
+      },
+    });
+    expect(result.stdout.toString()).not.toContain("neutral-test-token-value");
+  });
+
+  test("discovers the local Tailscale IP only when Tailscale mode is selected", () => {
+    const directory = mkdtempSync(join(tmpdir(), "asr-tailscale-test-"));
+    const executable = join(directory, "tailscale");
+    writeFileSync(
+      executable,
+      "#!/bin/sh\n[ \"$1\" = \"ip\" ] || exit 2\nprintf '%s\\n' '100.64.0.20' 'fd7a:115c:a1e0::20'\n",
+    );
+    chmodSync(executable, 0o755);
+
+    try {
+      const result = runWithEnvironment(
+        {
+          PATH: `${directory}:${process.env.PATH ?? ""}`,
+          ROUTER_TOKEN: "neutral-test-token-value",
+        },
+        "--dry-run",
+        "router",
+        "--tailscale",
+        "--port",
+        "9876",
+      );
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString()).routerBind).toEqual({
+        host: "100.64.0.20",
+        port: 9876,
+        authenticationRequired: true,
+      });
+      expect(result.stdout.toString()).not.toContain("neutral-test-token-value");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("reports a disconnected Tailscale CLI without exposing its output", () => {
+    const directory = mkdtempSync(join(tmpdir(), "asr-tailscale-test-"));
+    const executable = join(directory, "tailscale");
+    writeFileSync(executable, "#!/bin/sh\nprintf 'private diagnostic' >&2\nexit 1\n");
+    chmodSync(executable, 0o755);
+
+    try {
+      const result = runWithEnvironment(
+        {
+          PATH: `${directory}:${process.env.PATH ?? ""}`,
+          ROUTER_TOKEN: "neutral-test-token-value",
+        },
+        "--dry-run",
+        "router",
+        "--tailscale",
+      );
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr.toString()).toContain("no connected tailnet IP is available");
+      expect(result.stderr.toString()).not.toContain("private diagnostic");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects wildcard host binding, invalid ports, and unauthenticated host mode", () => {
+    const wildcard = run("--dry-run", "router", "--host", "0.0.0.0");
+    expect(wildcard.exitCode).not.toBe(0);
+    expect(wildcard.stderr.toString()).toContain("wildcard router bind addresses are not allowed");
+
+    const port = run("--dry-run", "router", "--port", "70000");
+    expect(port.exitCode).not.toBe(0);
+    expect(port.stderr.toString()).toContain("router port must be an integer");
+
+    const unauthenticated = run("--dry-run", "router", "--host", "100.64.0.10");
+    expect(unauthenticated.exitCode).toBe(2);
+    expect(unauthenticated.stderr.toString()).toContain("requires ROUTER_TOKEN");
   });
 
   test("rejects invalid agent names before launching a provider", () => {

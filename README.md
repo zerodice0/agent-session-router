@@ -10,7 +10,7 @@ The current implementation includes:
 - heartbeat, reconnect, busy state, and response isolation;
 - interactive Claude Code Channel and Codex CLI integrations;
 - provider-neutral gateway and mock adapter tests;
-- a local launcher with router profiles and unique agent IDs.
+- a launcher with loopback/LAN/tailnet router modes, profiles, and unique agent IDs.
 
 ## Quick start
 
@@ -19,7 +19,8 @@ Requirements:
 - Bun 1.3 or newer;
 - Python 3;
 - an authenticated Claude Code or Codex CLI for provider runs;
-- optional `fzf` for the interactive selector.
+- optional `fzf` for the interactive selector;
+- optional Tailscale CLI only for Tailscale router mode.
 
 ```bash
 bun install --frozen-lockfile
@@ -49,7 +50,7 @@ asr
 
 The launcher lets you:
 
-1. start a local router, Claude Code, or Codex;
+1. start a loopback, LAN/tailnet router, Claude Code, or Codex;
 2. select a saved router profile or add a router address;
 3. enter a unique agent ID such as `reviewer` or `worker-a`;
 4. publish an optional activity summary;
@@ -59,9 +60,12 @@ The launcher lets you:
 Short agent names are normalized automatically, for example `reviewer` becomes
 `local:reviewer`. Two live sessions on the same router must use different IDs.
 
-`Start local router` starts a server process on the current machine. A router
-profile is instead the address used by Claude or Codex to connect to an already
-running router.
+`Start router` asks for a mode and port. Loopback mode binds to `127.0.0.1`.
+LAN mode accepts one private IP assigned to the machine. Tailscale mode checks
+the optional `tailscale` CLI, obtains this machine's connected tailnet IPs, and
+lets you select one. It does not install or configure Tailscale. Wildcard
+bindings such as `0.0.0.0` are rejected. A router profile is instead the address
+used by Claude or Codex to connect to an already running router.
 
 ## Router profiles
 
@@ -99,6 +103,8 @@ ROUTER_URL=ws://host-a:8787/ws asr codex-cli worker-a
 | --- | --- |
 | `asr` | Open the interactive launcher |
 | `asr router` | Start the loopback router |
+| `asr router --host <private-ip> --port 8787` | Start a LAN/tailnet router |
+| `asr router --tailscale --port 8787` | Discover and bind the preferred Tailscale IP |
 | `asr claude reviewer` | Start Claude Code as `local:reviewer` |
 | `asr codex-cli worker-a` | Start stock Codex CLI with router tools |
 | `asr codex worker-a` | Start the prompt-capable Codex connector |
@@ -112,12 +118,16 @@ Claude Code receives router deliveries through its Channel and can use
 
 ## Network and security
 
-The router binds to `127.0.0.1` by default. For connections from other machines,
-keep that loopback bind and expose it through an access-controlled tailnet TCP
-forwarder, then save the forwarder's address as a router profile.
+The router binds to `127.0.0.1` by default. To accept connections from other
+machines, choose LAN mode and enter one assigned private IP, choose Tailscale
+mode on a machine with a connected Tailscale client, or keep loopback mode and
+use an access-controlled tailnet TCP forwarder. Agent machines save the
+reachable address as a router profile.
 
 Set the same `ROUTER_TOKEN` on the router and provider connector processes when
-registration authentication is required. Do not place tokens, real hostnames,
+using LAN/Tailnet mode. The launcher requires at least 16 printable characters
+and prompts without echo when the variable is absent. Scripted host mode
+requires `ROUTER_TOKEN` in the environment. Do not place tokens, real hostnames,
 IP addresses, usernames, or environment-specific paths in this repository.
 
 The router currently routes message text in memory and does not persist a

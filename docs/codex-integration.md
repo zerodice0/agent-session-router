@@ -94,10 +94,17 @@ field is part of this baseline.
 With the router running, start a normal Codex TUI under a neutral identity:
 
 ```bash
+python3 scripts/asr.py
 python3 scripts/asr.py codex-cli worker-a
 ```
 
-The launcher executes the installed `codex` binary, preserves the caller's
+Running `asr` without a command opens the interactive selector. Choose or add a
+router address, select Codex CLI, and enter the agent ID and optional activity.
+The launcher passes the selected profile URL to the MCP child as `ROUTER_URL`.
+Saved profiles contain no router token and remain in user-local configuration
+outside this repository.
+
+The explicit form executes the installed `codex` binary, preserves the caller's
 working directory with `-C`, and supplies per-process MCP config overrides. It
 does not write `~/.codex/config.toml`. Only the environment variable names
 `ROUTER_URL`, `GATEWAY_AGENT_ID`, `GATEWAY_AGENT_ACTIVITY`, and `ROUTER_TOKEN`

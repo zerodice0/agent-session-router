@@ -107,6 +107,12 @@ session IDs, working directories, provider credentials, and local IPC details
 remain in runtime configuration outside the repository and are never forwarded
 to the router.
 
+The local launcher can store named router WebSocket profiles in user-local
+configuration outside the repository. Interactive provider startup selects a
+profile before choosing an agent ID and injects its URL through `ROUTER_URL`.
+Profiles never contain registration or delegation tokens; those remain in the
+process environment. The built-in profile always targets the loopback router.
+
 ### 4.3 Agent-facing tool adapter
 
 Every agent that needs to contact another agent receives the same minimal tool

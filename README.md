@@ -47,16 +47,66 @@ Claude <-> Codex validation gate.
 
 ## Run locally
 
-Requirements: Bun 1.3 or newer, Python 3, and an authenticated Codex CLI for
-interactive provider runs.
+Requirements: Bun 1.3 or newer, Python 3, and the authenticated provider CLI
+used for an interactive run. `fzf` is optional; the launcher falls back to a
+numbered terminal menu when it is unavailable.
 
 ```bash
+bun install --frozen-lockfile
 bun test
-bun run start
 ```
 
 For the shortest interactive workflow, use the Python launcher from the
-repository root:
+repository root with no command:
+
+```bash
+python3 scripts/asr.py
+```
+
+The interactive flow is:
+
+```text
+Run action (Claude Code, Codex, local router, or connection test)
+  -> router profile or Add router address (provider/test actions)
+  -> agent ID (provider actions)
+  -> optional activity
+  -> provider-specific mode
+```
+
+`Start local router` starts a router process on this machine; it is not a
+router address. Claude Code, Codex CLI, and connection tests instead select a
+client-side router profile. The selected WebSocket URL is injected into the
+provider process and its MCP child through `ROUTER_URL`, so it is not entered
+again inside Claude or Codex.
+
+The router selector accepts a host, `host:port`, `ws://` URL, or `wss://` URL.
+Bare hosts receive port `8787` and path `/ws`. For example, `host-a` becomes
+`ws://host-a:8787/ws`.
+
+The built-in `local` profile is `ws://127.0.0.1:8787/ws`. Custom profiles and
+the last selection are stored only in the local user configuration at
+`~/.config/agent-session-router/config.json`, or below `XDG_CONFIG_HOME` when
+set. The file is created with user-only permissions and is outside this
+repository. It stores router URLs only; `ROUTER_TOKEN` remains an inherited
+environment variable and is never written to the profile. Profiles may also be
+managed explicitly with neutral values:
+
+```bash
+python3 scripts/asr.py profile add tailnet host-a:8787
+python3 scripts/asr.py profile list
+python3 scripts/asr.py profile use tailnet
+```
+
+`profile use` controls which profile is highlighted first in the interactive
+selector. Explicit scripted commands continue to use `ROUTER_URL`, falling back
+to the loopback URL when it is unset:
+
+```bash
+ROUTER_URL=ws://host-a:8787/ws python3 scripts/asr.py claude reviewer
+ROUTER_URL=ws://host-a:8787/ws python3 scripts/asr.py codex-cli worker-a
+```
+
+Existing non-interactive commands remain available for scripts:
 
 ```bash
 python3 scripts/asr.py router
@@ -65,7 +115,8 @@ python3 scripts/asr.py codex-cli worker-a
 
 Run each long-lived command in its own terminal. Short names such as `worker-a`
 are normalized to neutral IDs such as `local:worker-a`; router URLs, working
-directories, and defaults are supplied by the launcher.
+directories, and defaults are supplied by the launcher. Two sessions connected
+to the same router must use different IDs; a duplicate live ID is rejected.
 
 To make `asr` available in future shells, print and review the generated shell
 function once, then append it to the appropriate shell startup file:
@@ -76,9 +127,10 @@ python3 scripts/asr.py shell-init >> ~/.zshrc
 ```
 
 Use `~/.bashrc` instead for Bash. Do not repeat the append command after the
-function has been installed. A configured session can then be started with
-`asr router` and `asr codex-cli worker-a`. Run `asr doctor` to check the local
-commands without reading or printing credentials.
+function has been installed. Running `asr` opens the selector; explicit forms
+such as `asr router` and `asr codex-cli worker-a` remain available. Run
+`asr doctor` to check the local commands and optional `fzf` without reading or
+printing credentials.
 
 `codex-cli` starts the stock Codex TUI and injects one process-local MCP server;
 it does not modify user-level Codex configuration. Inside Codex, ask it to call
@@ -107,6 +159,22 @@ Channel during Claude's research preview. It bypasses the Channel plugin
 allowlist for this explicitly selected local server; it is not
 `bypassPermissions` and does not disable tool safety. `--auto` independently
 selects Claude's permission mode when the account supports it.
+
+### Local and tailnet layouts
+
+For an all-local run, start the router in one terminal and choose the built-in
+`local` profile for each provider session:
+
+```bash
+asr router
+asr
+```
+
+For sessions on other machines, keep the central router on loopback and expose
+it through a tailnet-only TCP forwarder. On each agent machine, run `asr`, choose
+`Add router address`, save the forwarder's neutral host or WebSocket URL, and
+then launch the provider. The router profile is only a connection target; it
+does not change the central router's bind address or start a remote process.
 
 With the router running, use another terminal for a real WebSocket round trip:
 

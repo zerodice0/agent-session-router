@@ -40,14 +40,23 @@ The Python launcher reduces the one-time setup and later startup commands:
 
 ```bash
 python3 scripts/asr.py setup-claude
+python3 scripts/asr.py
 python3 scripts/asr.py claude reviewer
 python3 scripts/asr.py claude reviewer --activity "reviewing tests" --auto
 ```
 
-The first command registers the repository-local MCP entry. The second starts
-Claude with the neutral `local:reviewer` identity and the explicit development
-Channel opt-in. The third additionally publishes a non-sensitive activity and
-requests Auto permission mode when the account supports it.
+The first command registers the repository-local MCP entry. Running `asr`
+without a command opens the interactive selector: choose a saved router or add
+a router address, then enter the agent ID, activity, and permission mode. The
+explicit forms remain available for automation. They start Claude with the
+neutral `local:reviewer` identity and the development Channel opt-in; the last
+form additionally publishes a non-sensitive activity and requests Auto
+permission mode when the account supports it.
+
+Router profiles live in the user's local configuration outside this repository
+and contain only the WebSocket URL. The launcher injects the selected URL as
+`ROUTER_URL` into Claude Code, whose Channel child inherits it. Router tokens
+remain in the process environment and are not saved in the profile.
 
 The launcher's `--dangerously-load-development-channels` is not
 `--dangerously-skip-permissions` and does not select `bypassPermissions`. It is

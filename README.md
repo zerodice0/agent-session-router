@@ -1,265 +1,131 @@
 # agent-session-router
 
-`agent-session-router` routes messages between named, explicitly connected AI
-agent sessions and returns each result to the requesting session.
+`agent-session-router` connects named Claude Code, Codex, and provider-neutral
+agent sessions through one central WebSocket router. Each agent connects
+outbound, selects a specific peer, and receives only the correlated reply.
 
-Each system runs a provider connector for its local agent. The connector opens
-an outbound WebSocket to the router, registers a neutral `agentId`, translates
-inbound deliveries through a provider-specific session adapter, and exposes
-router messaging tools back to the local agent. Agents never connect directly
-to one another.
+The current implementation includes:
 
-## Status
+- targeted agent discovery, request/reply, timeout, and disconnect handling;
+- heartbeat, reconnect, busy state, and response isolation;
+- interactive Claude Code Channel and Codex CLI integrations;
+- provider-neutral gateway and mock adapter tests;
+- a local launcher with router profiles and unique agent IDs.
 
-This repository currently contains the local-first routing and first provider
-adapter foundation:
+## Quick start
 
-- in-memory agent registry
-- WebSocket registration and discovery
-- targeted request delivery
-- correlated replies with timeouts
-- a duplex provider-neutral gateway with correlated `listAgents` and `send`
-- application heartbeat and bounded reconnect without request replay
-- router-derived `idle`/`busy` presence plus optional public activity metadata
-- nested coordinator -> worker -> worker round-trip coverage
-- a Codex App Server adapter with an injectable JSONL transport
-- a prompt-capable Codex console sharing the gateway-owned App Server thread
-- a stock Codex CLI MCP gateway with correlated send/wait/reply tools
-- a Claude Agent SDK adapter with injectable query/startup boundaries
-- a Claude Code Channel adapter for explicitly opted-in interactive sessions
-- agent-scoped delegated router connections for outbound-only provider tools
-- standard MCP `agent_list` and `agent_send` tools shared by Codex and Claude
-- an in-memory mock session adapter with two-worker isolation tests
-- a reviewed provider-native integration and central connection design
-- neutral, environment-independent examples
+Requirements:
 
-AgentBridge was evaluated as a reference implementation but is not a runtime
-dependency and will not be modified or forked for this project. The decision is
-recorded in [docs/agentbridge-integration.md](docs/agentbridge-integration.md).
-The Codex adapter and MCP tool bridge have completed a live two-Codex exchange:
-agent discovery, Codex A -> `agent_send` -> Codex B -> A nested completion, and
-parallel response isolation. The Claude managed-session adapter reuses the same
-MCP tool contract and has completed fake-SDK lifecycle validation. The Claude
-Channel adapter has completed in-memory MCP wire and loopback router validation;
-the prompt-capable Codex console has completed a live Claude exchange on a
-separate development machine. The stock Codex TUI MCP path retains one manual
-Claude <-> Codex validation gate.
-
-## Run locally
-
-Requirements: Bun 1.3 or newer, Python 3, and the authenticated provider CLI
-used for an interactive run. `fzf` is optional; the launcher falls back to a
-numbered terminal menu when it is unavailable.
+- Bun 1.3 or newer;
+- Python 3;
+- an authenticated Claude Code or Codex CLI for provider runs;
+- optional `fzf` for the interactive selector.
 
 ```bash
 bun install --frozen-lockfile
 bun test
 ```
 
-For the shortest interactive workflow, use the Python launcher from the
-repository root with no command:
+Load the short `asr` command into the current shell:
 
 ```bash
-python3 scripts/asr.py
+eval "$(python3 scripts/asr.py shell-init)"
+asr doctor
 ```
 
-The interactive flow is:
-
-```text
-Run action (Claude Code, Codex, local router, or connection test)
-  -> router profile or Add router address (provider/test actions)
-  -> agent ID (provider actions)
-  -> optional activity
-  -> provider-specific mode
-```
-
-`Start local router` starts a router process on this machine; it is not a
-router address. Claude Code, Codex CLI, and connection tests instead select a
-client-side router profile. The selected WebSocket URL is injected into the
-provider process and its MCP child through `ROUTER_URL`, so it is not entered
-again inside Claude or Codex.
-
-The router selector accepts a host, `host:port`, `ws://` URL, or `wss://` URL.
-Bare hosts receive port `8787` and path `/ws`. For example, `host-a` becomes
-`ws://host-a:8787/ws`.
-
-The built-in `local` profile is `ws://127.0.0.1:8787/ws`. Custom profiles and
-the last selection are stored only in the local user configuration at
-`~/.config/agent-session-router/config.json`, or below `XDG_CONFIG_HOME` when
-set. The file is created with user-only permissions and is outside this
-repository. It stores router URLs only; `ROUTER_TOKEN` remains an inherited
-environment variable and is never written to the profile. Profiles may also be
-managed explicitly with neutral values:
+Claude Code needs one repository-local Channel setup before its first run:
 
 ```bash
-python3 scripts/asr.py profile add tailnet host-a:8787
-python3 scripts/asr.py profile list
-python3 scripts/asr.py profile use tailnet
+asr setup-claude
 ```
 
-`profile use` controls which profile is highlighted first in the interactive
-selector. Explicit scripted commands continue to use `ROUTER_URL`, falling back
-to the loopback URL when it is unset:
+## Interactive `asr` launcher
+
+Run `asr` without arguments:
 
 ```bash
-ROUTER_URL=ws://host-a:8787/ws python3 scripts/asr.py claude reviewer
-ROUTER_URL=ws://host-a:8787/ws python3 scripts/asr.py codex-cli worker-a
-```
-
-Existing non-interactive commands remain available for scripts:
-
-```bash
-python3 scripts/asr.py router
-python3 scripts/asr.py codex-cli worker-a
-```
-
-Run each long-lived command in its own terminal. Short names such as `worker-a`
-are normalized to neutral IDs such as `local:worker-a`; router URLs, working
-directories, and defaults are supplied by the launcher. Two sessions connected
-to the same router must use different IDs; a duplicate live ID is rejected.
-
-To make `asr` available in future shells, print and review the generated shell
-function once, then append it to the appropriate shell startup file:
-
-```bash
-python3 scripts/asr.py shell-init
-python3 scripts/asr.py shell-init >> ~/.zshrc
-```
-
-Use `~/.bashrc` instead for Bash. Do not repeat the append command after the
-function has been installed. Running `asr` opens the selector; explicit forms
-such as `asr router` and `asr codex-cli worker-a` remain available. Run
-`asr doctor` to check the local commands and optional `fzf` without reading or
-printing credentials.
-
-`codex-cli` starts the stock Codex TUI and injects one process-local MCP server;
-it does not modify user-level Codex configuration. Inside Codex, ask it to call
-`agent_list` or `agent_send`. To accept one inbound request, ask it to call
-`agent_wait`, handle the returned message, and call `agent_reply` with the same
-`requestId`. Passing Codex flags remains explicit:
-
-```bash
-asr codex-cli worker-a -- --search
-```
-
-The older `asr codex worker-a` command remains available when automatic router
-delivery is more important than using the stock TUI. It opens the repository's
-small prompt console in front of a gateway-owned App Server thread.
-
-For the optional interactive Claude Channel, run `asr setup-claude` once from
-this repository and then use `asr claude reviewer`. To use Claude Auto mode and
-publish a non-sensitive work summary in `agent_list`, run:
-
-```bash
-asr claude reviewer --activity "reviewing tests" --auto
-```
-
-`--dangerously-load-development-channels` remains necessary for a custom
-Channel during Claude's research preview. It bypasses the Channel plugin
-allowlist for this explicitly selected local server; it is not
-`bypassPermissions` and does not disable tool safety. `--auto` independently
-selects Claude's permission mode when the account supports it.
-
-### Local and tailnet layouts
-
-For an all-local run, start the router in one terminal and choose the built-in
-`local` profile for each provider session:
-
-```bash
-asr router
 asr
 ```
 
-For sessions on other machines, keep the central router on loopback and expose
-it through a tailnet-only TCP forwarder. On each agent machine, run `asr`, choose
-`Add router address`, save the forwarder's neutral host or WebSocket URL, and
-then launch the provider. The router profile is only a connection target; it
-does not change the central router's bind address or start a remote process.
+The launcher lets you:
 
-With the router running, use another terminal for a real WebSocket round trip:
+1. start a local router, Claude Code, or Codex;
+2. select a saved router profile or add a router address;
+3. enter a unique agent ID such as `reviewer` or `worker-a`;
+4. publish an optional activity summary;
+5. choose provider-specific options such as Claude Auto mode.
+
+`fzf` is used when installed. Otherwise the launcher displays a numbered menu.
+Short agent names are normalized automatically, for example `reviewer` becomes
+`local:reviewer`. Two live sessions on the same router must use different IDs.
+
+`Start local router` starts a server process on the current machine. A router
+profile is instead the address used by Claude or Codex to connect to an already
+running router.
+
+## Router profiles
+
+The built-in `local` profile points to `ws://127.0.0.1:8787/ws`. Selecting
+`Add router address` accepts a host, `host:port`, `ws://` URL, or `wss://` URL.
+A bare `host-a` value becomes `ws://host-a:8787/ws`.
+
+Custom profiles are stored outside the repository at:
+
+```text
+~/.config/agent-session-router/config.json
+```
+
+Only router URLs and the last selected profile are stored. Authentication
+tokens remain in `ROUTER_TOKEN` and are never written to the profile.
+
+Profiles can also be managed explicitly:
 
 ```bash
-python3 scripts/asr.py smoke
+asr profile add tailnet host-a:8787
+asr profile list
+asr profile use tailnet
 ```
 
-The router listens on `127.0.0.1:8787` by default. Override it only in a trusted
-environment:
+For scripted provider runs, set `ROUTER_URL` directly:
 
 ```bash
-ROUTER_HOST=127.0.0.1 ROUTER_PORT=8787 bun run start
+ROUTER_URL=ws://host-a:8787/ws asr claude reviewer
+ROUTER_URL=ws://host-a:8787/ws asr codex-cli worker-a
 ```
 
-Set `ROUTER_TOKEN` to require clients to provide a matching token when they
-register. Message content and tokens are never written to router logs.
+## Common commands
 
-If the router uses a different port, pass the same endpoint to the smoke client:
+| Command | Purpose |
+| --- | --- |
+| `asr` | Open the interactive launcher |
+| `asr router` | Start the loopback router |
+| `asr claude reviewer` | Start Claude Code as `local:reviewer` |
+| `asr codex-cli worker-a` | Start stock Codex CLI with router tools |
+| `asr codex worker-a` | Start the prompt-capable Codex connector |
+| `asr smoke` | Run a local router round trip |
+| `asr test` | Run the automated test suite |
 
-```bash
-ROUTER_URL=ws://127.0.0.1:18787/ws bun run smoke
-```
+Claude Code receives router deliveries through its Channel and can use
+`agent_list`, `agent_send`, and `agent_reply`. Stock Codex CLI exposes
+`agent_list`, `agent_send`, `agent_wait`, and `agent_reply`; ask Codex to call
+`agent_wait` when it should accept an inbound request.
 
-Inside the older prompt-capable Codex console, ordinary input starts a Codex turn.
-Use `/agents` to list peers, `/send local:worker-a message` for a direct router
-check that does not start a local model turn, and `/quit` to exit. The existing
-`bun run gateway:codex` command remains the non-interactive automation worker.
+## Network and security
 
-With an interactive provider connected, `asr smoke worker-a` sends one neutral
-request to `local:worker-a` and reports only pass/fail; it intentionally does
-not print or persist the provider response. This command consumes one provider
-turn, unlike the router-only `asr smoke` command.
+The router binds to `127.0.0.1` by default. For connections from other machines,
+keep that loopback bind and expose it through an access-controlled tailnet TCP
+forwarder, then save the forwarder's address as a router profile.
 
-The current implementation is local-first but can keep the router on loopback
-and expose its TCP port only inside a trusted tailnet. Gate the port with
-Tailscale Grants and retain `ROUTER_TOKEN` as defense in depth. Public or
-non-overlay deployment still requires authenticated TLS and per-agent
-credentials. See [docs/provider-integration.md](docs/provider-integration.md).
+Set the same `ROUTER_TOKEN` on the router and provider connector processes when
+registration authentication is required. Do not place tokens, real hostnames,
+IP addresses, usernames, or environment-specific paths in this repository.
 
-## Protocol sketch
+The router currently routes message text in memory and does not persist a
+conversation transcript.
 
-A worker first registers a globally unique identifier:
+## Documentation
 
-```json
-{
-  "type": "register",
-  "protocolVersion": 1,
-  "agent": {
-    "agentId": "local:reviewer",
-    "side": "claude",
-    "activity": "reviewing tests"
-  }
-}
-```
-
-`activity` is optional, operator-supplied, limited to 160 printable characters,
-and visible to every connected agent. `agent_list` also includes router-derived
-`status: "idle" | "busy"`; clients cannot claim their own status.
-
-A coordinator can then send a request:
-
-```json
-{
-  "type": "send",
-  "requestId": "request-001",
-  "to": "local:reviewer",
-  "content": "Review the current change and summarize actionable findings."
-}
-```
-
-See [docs/design.md](docs/design.md) for the architecture and implementation
-phases, [docs/provider-integration.md](docs/provider-integration.md) for the
-provider and central-routing boundary,
-[docs/codex-integration.md](docs/codex-integration.md) for the implemented Codex
-adapter and live validation procedure,
-[docs/claude-integration.md](docs/claude-integration.md) for the Claude Agent SDK
-adapter and authenticated validation procedure,
-[docs/claude-channel-integration.md](docs/claude-channel-integration.md) for the
-interactive Claude Code Channel adapter and manual validation procedure, and
-[docs/agentbridge-integration.md](docs/agentbridge-integration.md) for the
-AgentBridge evaluation decision.
-
-## Privacy rule
-
-Do not commit real hostnames, IP addresses, usernames, SSH aliases, credentials,
-company project identifiers, or environment-specific paths. Keep deployment
-configuration outside the repository and use neutral examples in documentation
-and tests.
+- [Architecture and protocol](docs/design.md)
+- [Provider integration boundary](docs/provider-integration.md)
+- [Claude Code Channel integration](docs/claude-channel-integration.md)
+- [Codex integration](docs/codex-integration.md)

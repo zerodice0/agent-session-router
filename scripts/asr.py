@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import argparse
-import getpass
+import http.client
 import ipaddress
 import json
 import os
 import re
-import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -23,15 +24,10 @@ AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_ROUTER_URL = "ws://127.0.0.1:8787/ws"
 DEFAULT_ROUTER_PROFILE = "local"
-CONFIG_VERSION = 1
+SHARED_ROUTER_PROFILE = "this-device"
 DEFAULT_ROUTER_PORT = 8787
-MIN_HOST_ROUTER_TOKEN_LENGTH = 16
-TAILSCALE_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
-TAILSCALE_IPV6_NETWORK = ipaddress.ip_network("fd7a:115c:a1e0::/48")
-PRIVATE_LAN_IPV4_NETWORKS = tuple(
-    ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
-)
-PRIVATE_LAN_IPV6_NETWORK = ipaddress.ip_network("fc00::/7")
+COMMAND_NAME = "agent-session-router"
+CONFIG_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CODEX_CLI_MCP_SERVER_ID = "agent_session_router_cli"
 CODEX_CLI_MCP_ENV_VARS = [
@@ -46,12 +42,12 @@ class RouterProfileError(ValueError):
     """Raised when local router profile configuration is invalid."""
 
 
-class RouterBindError(ValueError):
-    """Raised when a router bind configuration is unsafe or invalid."""
+class LauncherInstallError(ValueError):
+    """Raised when the launcher executable cannot be installed safely."""
 
 
-class TailscaleUnavailableError(RuntimeError):
-    """Raised when optional Tailscale discovery cannot provide a local IP."""
+class RouterShareError(ValueError):
+    """Raised when this device cannot expose a usable shared router address."""
 
 
 def agent_id(value: str) -> str:
@@ -71,120 +67,6 @@ def agent_activity(value: str) -> str:
     if not 1 <= len(resolved) <= 160 or has_control_character:
         raise argparse.ArgumentTypeError("activity must be 1-160 printable characters")
     return resolved
-
-
-def router_bind_host(value: str) -> str:
-    resolved = value.strip()
-    try:
-        address = ipaddress.ip_address(resolved)
-    except ValueError as error:
-        raise RouterBindError("router bind host must be an IP address") from error
-
-    if address.is_unspecified:
-        raise RouterBindError("wildcard router bind addresses are not allowed")
-    if address.is_multicast:
-        raise RouterBindError("multicast router bind addresses are not allowed")
-    if not (address.is_loopback or is_private_lan_address(address) or is_tailscale_address(address)):
-        raise RouterBindError("router bind host must be a loopback, private LAN, or tailnet IP")
-    return address.compressed
-
-
-def is_private_lan_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if address.version == 4:
-        return any(address in network for network in PRIVATE_LAN_IPV4_NETWORKS)
-    return address in PRIVATE_LAN_IPV6_NETWORK and address not in TAILSCALE_IPV6_NETWORK
-
-
-def is_tailscale_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return address in (TAILSCALE_IPV4_NETWORK if address.version == 4 else TAILSCALE_IPV6_NETWORK)
-
-
-def lan_router_bind_host(value: str) -> str:
-    resolved = router_bind_host(value)
-    if not is_private_lan_address(ipaddress.ip_address(resolved)):
-        raise RouterBindError("LAN mode requires an RFC1918 IPv4 or private IPv6 address")
-    return resolved
-
-
-def verify_local_bind_address(value: str) -> None:
-    address = ipaddress.ip_address(value)
-    family = socket.AF_INET if address.version == 4 else socket.AF_INET6
-    probe = socket.socket(family, socket.SOCK_STREAM)
-    try:
-        probe.bind((address.compressed, 0))
-    except OSError as error:
-        raise RouterBindError("router bind IP is not assigned to this machine") from error
-    finally:
-        probe.close()
-
-
-def tailscale_ip_addresses() -> list[str]:
-    executable = shutil.which("tailscale")
-    if executable is None:
-        raise TailscaleUnavailableError(
-            "Tailscale mode requires the tailscale CLI; install and connect Tailscale first"
-        )
-    try:
-        result = subprocess.run(
-            [executable, "ip"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise TailscaleUnavailableError("Tailscale IP discovery failed") from error
-    if result.returncode != 0:
-        raise TailscaleUnavailableError(
-            "Tailscale is installed but no connected tailnet IP is available"
-        )
-
-    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
-    for line in result.stdout.splitlines():
-        try:
-            address = ipaddress.ip_address(line.strip())
-        except ValueError:
-            continue
-        if is_tailscale_address(address):
-            addresses.append(address)
-    if not addresses:
-        raise TailscaleUnavailableError(
-            "Tailscale is installed but no connected tailnet IP is available"
-        )
-    return [address.compressed for address in sorted(addresses, key=lambda item: item.version)]
-
-
-def router_bind_host_argument(value: str) -> str:
-    try:
-        return router_bind_host(value)
-    except RouterBindError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
-
-
-def router_port(value: str | int) -> int:
-    try:
-        resolved = int(value)
-    except (TypeError, ValueError) as error:
-        raise RouterBindError("router port must be an integer between 1 and 65535") from error
-    if not 1 <= resolved <= 65_535:
-        raise RouterBindError("router port must be an integer between 1 and 65535")
-    return resolved
-
-
-def router_port_argument(value: str) -> int:
-    try:
-        return router_port(value)
-    except RouterBindError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
-
-
-def valid_host_router_token(value: str | None) -> bool:
-    return (
-        value is not None
-        and len(value) >= MIN_HOST_ROUTER_TOKEN_LENGTH
-        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
-    )
 
 
 def profile_name(value: str) -> str:
@@ -226,6 +108,73 @@ def router_url(value: str) -> str:
         netloc = f"{host}:8787"
     path = parsed.path if parsed.path not in {"", "/"} else "/ws"
     return urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
+def router_port(environment: dict[str, str] | None = None) -> int:
+    values = os.environ if environment is None else environment
+    raw_port = values.get("ROUTER_PORT", str(DEFAULT_ROUTER_PORT))
+    try:
+        port = int(raw_port)
+    except ValueError as error:
+        raise RouterShareError("ROUTER_PORT must be an integer between 1 and 65535") from error
+    if not 1 <= port <= 65535:
+        raise RouterShareError("ROUTER_PORT must be an integer between 1 and 65535")
+    return port
+
+
+def usable_ipv4(value: str) -> str:
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError as error:
+        raise RouterShareError(f"not a usable IPv4 address: {value}") from error
+    if (
+        not isinstance(address, ipaddress.IPv4Address)
+        or address.is_loopback
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_link_local
+    ):
+        raise RouterShareError(f"not a usable IPv4 address: {value}")
+    return str(address)
+
+
+def tailscale_ipv4() -> tuple[str | None, bool]:
+    executable = shutil.which("tailscale")
+    if executable is None:
+        return None, False
+    try:
+        result = subprocess.run(
+            [executable, "ip", "-4"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, True
+    if result.returncode != 0:
+        return None, True
+    try:
+        return usable_ipv4(result.stdout.splitlines()[0]), True
+    except (IndexError, RouterShareError):
+        return None, True
+
+
+def primary_lan_ipv4(environment: dict[str, str] | None = None) -> str:
+    values = os.environ if environment is None else environment
+    configured = values.get("ROUTER_HOST", "").strip()
+    if configured and configured not in {"0.0.0.0", "127.0.0.1"}:
+        return usable_ipv4(configured)
+
+    connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        connection.connect(("192.0.2.1", 9))
+        return usable_ipv4(connection.getsockname()[0])
+    except OSError as error:
+        raise RouterShareError("cannot detect a LAN IPv4 address") from error
+    finally:
+        connection.close()
 
 
 def router_config_path(
@@ -322,17 +271,18 @@ def save_router_profile(
     address: str,
     *,
     overwrite: bool = False,
+    select: bool = True,
     path: Path | None = None,
 ) -> str:
     resolved_name = profile_name(name)
     if resolved_name == DEFAULT_ROUTER_PROFILE:
         raise RouterProfileError("the built-in local profile cannot be changed")
     resolved_url = router_url(address)
-    profiles, _ = read_router_profiles(path)
+    profiles, default_profile = read_router_profiles(path)
     if resolved_name in profiles and not overwrite:
         raise RouterProfileError(f"router profile already exists: {resolved_name}")
     profiles[resolved_name] = resolved_url
-    write_router_profiles(profiles, resolved_name, path)
+    write_router_profiles(profiles, resolved_name if select else default_profile, path)
     return resolved_url
 
 
@@ -346,7 +296,7 @@ def set_default_router_profile(name: str, path: Path | None = None) -> None:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        prog="asr",
+        prog=COMMAND_NAME,
         description="Run the local agent session router and interactive provider connectors.",
     )
     result.add_argument(
@@ -356,15 +306,21 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = result.add_subparsers(dest="command")
 
-    router = commands.add_parser("router", help="start a loopback, LAN, or tailnet router")
-    router_bind = router.add_mutually_exclusive_group()
-    router_bind.add_argument("--host", type=router_bind_host_argument, help="specific bind IP address")
-    router_bind.add_argument(
-        "--tailscale",
-        action="store_true",
-        help="discover and bind the preferred local Tailscale IP",
+    router = commands.add_parser("router", help="start the router on this device")
+    router.add_argument(
+        "router_action",
+        nargs="?",
+        choices=("start", "stop"),
+        default="start",
+        help="start or stop the router (default: start)",
     )
-    router.add_argument("--port", type=router_port_argument, help="router listen port")
+    router.add_argument(
+        "--share",
+        nargs="?",
+        const="auto",
+        choices=("auto", "tailscale", "lan"),
+        help="share through Tailscale when available, or explicitly through the LAN",
+    )
 
     codex = commands.add_parser("codex", help="start a prompt-capable Codex connector")
     codex.add_argument("agent", nargs="?", default="codex", type=agent_id)
@@ -397,7 +353,16 @@ def parser() -> argparse.ArgumentParser:
     smoke.add_argument("target", nargs="?", type=agent_id)
     smoke.add_argument("--timeout-ms", type=int, help=argparse.SUPPRESS)
     commands.add_parser("doctor", help="check required local commands")
-    commands.add_parser("shell-init", help="print a shell function for the short 'asr' command")
+    install = commands.add_parser(
+        "install",
+        help=f"install the '{COMMAND_NAME}' executable in the user PATH",
+    )
+    install.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=Path.home() / ".local" / "bin",
+        help="installation directory (default: ~/.local/bin)",
+    )
     profiles = commands.add_parser("profile", help="manage local router address profiles")
     profile_commands = profiles.add_subparsers(dest="profile_command", required=True)
     profile_commands.add_parser("list", help="list saved router profiles")
@@ -427,60 +392,6 @@ def resolved_environment(
     return environment
 
 
-def prompt_host_router_token() -> str | None:
-    try:
-        token = getpass.getpass(
-            f"Router token (at least {MIN_HOST_ROUTER_TOKEN_LENGTH} characters): "
-        )
-        confirmation = getpass.getpass("Confirm router token: ")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if token != confirmation:
-        print("Router token confirmation does not match.", file=sys.stderr)
-        return None
-    if not valid_host_router_token(token):
-        print(
-            f"Router token must be at least {MIN_HOST_ROUTER_TOKEN_LENGTH} printable characters.",
-            file=sys.stderr,
-        )
-        return None
-    return token
-
-
-def router_server_environment(
-    host: str | None = None,
-    port: int | None = None,
-    *,
-    prompt_for_token: bool = False,
-    verify_assigned: bool = False,
-) -> dict[str, str] | None:
-    environment = resolved_environment()
-    configured_host = host or environment.get("ROUTER_HOST", "127.0.0.1")
-    configured_port = port if port is not None else environment.get("ROUTER_PORT", DEFAULT_ROUTER_PORT)
-    resolved_host = router_bind_host(configured_host)
-    resolved_port = router_port(configured_port)
-
-    environment["ROUTER_HOST"] = resolved_host
-    environment["ROUTER_PORT"] = str(resolved_port)
-    if verify_assigned:
-        verify_local_bind_address(resolved_host)
-    if ipaddress.ip_address(resolved_host).is_loopback:
-        return environment
-
-    token = environment.get("ROUTER_TOKEN")
-    if not valid_host_router_token(token) and prompt_for_token:
-        token = prompt_host_router_token()
-        if token is not None:
-            environment["ROUTER_TOKEN"] = token
-    if not valid_host_router_token(token):
-        raise RouterBindError(
-            f"non-loopback router mode requires ROUTER_TOKEN with at least "
-            f"{MIN_HOST_ROUTER_TOKEN_LENGTH} printable characters"
-        )
-    return environment
-
-
 def execute(command: list[str], environment: dict[str, str], dry_run: bool) -> int:
     if dry_run:
         output: dict[str, object] = {
@@ -489,19 +400,280 @@ def execute(command: list[str], environment: dict[str, str], dry_run: bool) -> i
         }
         if "GATEWAY_AGENT_ID" in environment:
             output["agentId"] = environment["GATEWAY_AGENT_ID"]
-        if command == ["bun", "run", "start"]:
-            host = environment.get("ROUTER_HOST", "127.0.0.1")
-            output["routerBind"] = {
-                "host": host,
-                "port": int(environment.get("ROUTER_PORT", DEFAULT_ROUTER_PORT)),
-                "authenticationRequired": not ipaddress.ip_address(host).is_loopback,
-            }
         print(json.dumps(output, separators=(",", ":")))
         return 0
 
     os.chdir(REPO_ROOT)
     os.execvpe(command[0], command, environment)
     return 1
+
+
+def local_router_state(port: int, host: str = "127.0.0.1") -> str:
+    connection = http.client.HTTPConnection(host, port, timeout=1)
+    try:
+        connection.request("GET", "/healthz", headers={"Connection": "close"})
+        response = connection.getresponse()
+        payload = json.loads(response.read(4096))
+    except ConnectionRefusedError:
+        return "available"
+    except PermissionError:
+        return "unknown"
+    except (OSError, http.client.HTTPException, json.JSONDecodeError):
+        return "occupied"
+    finally:
+        connection.close()
+
+    if (
+        response.status == 200
+        and isinstance(payload, dict)
+        and payload.get("status") == "ok"
+        and isinstance(payload.get("connectedAgents"), int)
+    ):
+        return "router"
+    return "occupied"
+
+
+def print_router_header(
+    *,
+    access: str,
+    advertised_url: str,
+    token_configured: bool | None,
+    reused: bool = False,
+) -> None:
+    print("", flush=True)
+    print("Router server", flush=True)
+    if reused:
+        print("  Status: already running; reused existing router", flush=True)
+    print(f"  Access: {access}", flush=True)
+    print(f"  Profile name: {SHARED_ROUTER_PROFILE}", flush=True)
+    print(f"  Router address: {advertised_url}", flush=True)
+    print("  Add on another device:", flush=True)
+    print(
+        f"    {COMMAND_NAME} profile add {SHARED_ROUTER_PROFILE} "
+        f"{advertised_url} --force",
+        flush=True,
+    )
+    if token_configured is None:
+        print(
+            "  Authentication: match the running router's ROUTER_TOKEN "
+            "(value not detectable)",
+            flush=True,
+        )
+    elif token_configured:
+        print(
+            "  Authentication: use the same ROUTER_TOKEN on the other device "
+            "(value hidden)",
+            flush=True,
+        )
+    else:
+        print("  Authentication: ROUTER_TOKEN is not configured", flush=True)
+    print("", flush=True)
+
+
+def start_router(share: str | None, dry_run: bool) -> int:
+    command = ["bun", "run", "start"]
+    environment = os.environ.copy()
+    try:
+        port = router_port(environment)
+    except RouterShareError as error:
+        print(f"Router start error: {error}", file=sys.stderr)
+        return 2
+
+    state = "available" if dry_run else local_router_state(port)
+    if state == "occupied":
+        print(
+            f"Router start error: port {port} is already in use by another process",
+            file=sys.stderr,
+        )
+        return 2
+    reused = state == "router"
+
+    if share is None:
+        environment = resolved_environment(selected_router_url=DEFAULT_ROUTER_URL)
+        environment["ROUTER_HOST"] = "127.0.0.1"
+        if reused:
+            print(
+                f"Router already running at {router_url(f'127.0.0.1:{port}')}",
+                flush=True,
+            )
+            return 0
+        return execute(command, environment, dry_run)
+
+    setup_command: list[str] | None = None
+    try:
+        mode = share
+        tailscale_address: str | None = None
+        tailscale_installed = shutil.which("tailscale") is not None
+        if mode in {"auto", "tailscale"}:
+            tailscale_address, tailscale_installed = tailscale_ipv4()
+        if mode == "auto":
+            if tailscale_address is not None:
+                mode = "tailscale"
+            else:
+                state = "installed but unavailable" if tailscale_installed else "not installed"
+                raise RouterShareError(
+                    f"Tailscale is {state}; use --share=lan to explicitly accept LAN exposure"
+                )
+
+        if mode == "tailscale":
+            if tailscale_address is None:
+                state = "installed but unavailable" if tailscale_installed else "not installed"
+                raise RouterShareError(f"Tailscale is {state}")
+            tailscale = shutil.which("tailscale")
+            if tailscale is None:
+                raise RouterShareError("Tailscale is not installed")
+            advertised_url = router_url(f"{tailscale_address}:{port}")
+            environment["ROUTER_HOST"] = "127.0.0.1"
+            setup_command = [
+                tailscale,
+                "serve",
+                "--bg",
+                f"--tcp={port}",
+                f"tcp://127.0.0.1:{port}",
+            ]
+            print(
+                "Tailscale sharing selected; verify that tailnet Grants allow only intended clients.",
+                file=sys.stderr,
+            )
+        elif mode == "lan":
+            advertised_address = primary_lan_ipv4(environment)
+            advertised_url = router_url(f"{advertised_address}:{port}")
+            if reused and local_router_state(port, advertised_address) != "router":
+                raise RouterShareError(
+                    "a router is already running on loopback; stop it before switching to LAN sharing"
+                )
+            environment["ROUTER_HOST"] = "0.0.0.0"
+            print(
+                "Warning: direct LAN sharing exposes an unencrypted ws:// service on every "
+                "network interface. Prefer Tailscale and use only a trusted LAN.",
+                file=sys.stderr,
+            )
+        else:
+            raise AssertionError(f"unhandled router share mode: {mode}")
+
+        if not reused and not environment.get("ROUTER_TOKEN"):
+            print(
+                "Warning: ROUTER_TOKEN is not set; rely on restricted network access or set a "
+                "shared token before accepting remote clients.",
+                file=sys.stderr,
+            )
+    except RouterShareError as error:
+        print(f"Router share error: {error}", file=sys.stderr)
+        return 2
+
+    environment["ROUTER_URL"] = advertised_url
+    if dry_run:
+        output: dict[str, object] = {
+            "command": command,
+            "routerUrl": advertised_url,
+            "routerHost": environment["ROUTER_HOST"],
+            "profile": SHARED_ROUTER_PROFILE,
+        }
+        if setup_command is not None:
+            output["setupCommand"] = setup_command
+        print(json.dumps(output, separators=(",", ":")))
+        return 0
+
+    if setup_command is not None:
+        setup = subprocess.run(setup_command, check=False)
+        if setup.returncode != 0:
+            print("Router share error: Tailscale Serve setup failed", file=sys.stderr)
+            return 2
+    try:
+        save_router_profile(
+            SHARED_ROUTER_PROFILE,
+            advertised_url,
+            overwrite=True,
+            select=False,
+        )
+    except (OSError, RouterProfileError) as error:
+        print(f"Router profile error: {error}", file=sys.stderr)
+        return 2
+
+    print_router_header(
+        access="Tailscale" if mode == "tailscale" else "LAN",
+        advertised_url=advertised_url,
+        token_configured=None if reused else bool(environment.get("ROUTER_TOKEN")),
+        reused=reused,
+    )
+    if reused:
+        return 0
+    return execute(command, environment, False)
+
+
+def stop_router(dry_run: bool) -> int:
+    try:
+        port = router_port()
+    except RouterShareError as error:
+        print(f"Router stop error: {error}", file=sys.stderr)
+        return 2
+
+    if dry_run:
+        print(json.dumps({"action": "stop-router", "port": port}, separators=(",", ":")))
+        return 0
+
+    state = local_router_state(port)
+    if state == "available":
+        print(f"Router is not running on port {port}.")
+        return 0
+    if state != "router":
+        print(
+            f"Router stop error: port {port} is owned by another process",
+            file=sys.stderr,
+        )
+        return 2
+
+    lsof = shutil.which("lsof")
+    if lsof is None:
+        print("Router stop error: lsof is required to identify the router process", file=sys.stderr)
+        return 2
+    listeners = subprocess.run(
+        [lsof, "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    try:
+        pids = sorted({int(value) for value in listeners.stdout.splitlines()})
+    except ValueError:
+        pids = []
+    if listeners.returncode != 0 or not pids:
+        print("Router stop error: could not identify the router process", file=sys.stderr)
+        return 2
+
+    try:
+        for pid in pids:
+            os.kill(pid, signal.SIGTERM)
+    except (PermissionError, ProcessLookupError) as error:
+        print(f"Router stop error: {error}", file=sys.stderr)
+        return 2
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and local_router_state(port) != "available":
+        time.sleep(0.05)
+    if local_router_state(port) != "available":
+        print(f"Router stop error: port {port} did not close after SIGTERM", file=sys.stderr)
+        return 2
+
+    print(f"Stopped router on port {port} (PID {', '.join(map(str, pids))}).")
+    tailscale = shutil.which("tailscale")
+    if tailscale is not None:
+        disabled = subprocess.run(
+            [tailscale, "serve", f"--tcp={port}", "off"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if disabled.returncode == 0:
+            print(f"Disabled Tailscale Serve for port {port}.")
+        else:
+            print(
+                f"Warning: router stopped, but Tailscale Serve for port {port} "
+                "could not be disabled.",
+                file=sys.stderr,
+            )
+    return 0
 
 
 def codex_cli_command(workspace: str, extra_args: list[str]) -> list[str]:
@@ -703,76 +875,52 @@ def prompt_activity() -> str | None:
             print(str(error), file=sys.stderr)
 
 
-def prompt_lan_router_bind_host() -> str | None:
-    while True:
-        value = prompt_value("LAN bind IP")
-        if value is None:
-            return None
-        try:
-            return lan_router_bind_host(value)
-        except RouterBindError as error:
-            print(str(error), file=sys.stderr)
-
-
-def prompt_router_port() -> int | None:
-    while True:
-        value = prompt_value("Router port", str(DEFAULT_ROUTER_PORT))
-        if value is None:
-            return None
-        try:
-            return router_port(value)
-        except RouterBindError as error:
-            print(str(error), file=sys.stderr)
-
-
-def select_tailscale_bind_host() -> str | None:
-    try:
-        addresses = tailscale_ip_addresses()
-    except TailscaleUnavailableError as error:
-        print(f"Tailscale unavailable: {error}", file=sys.stderr)
-        return None
-    options = [(address, address) for address in addresses]
-    return select_option("Tailscale bind IP", options)
-
-
-def interactive_router_environment(dry_run: bool) -> dict[str, str] | None:
-    mode = select_option(
-        "Router mode",
+def select_router_access() -> str | None:
+    tailscale_address, tailscale_installed = tailscale_ipv4()
+    options: list[tuple[str, str]] = []
+    if tailscale_address is not None:
+        options.append(("tailscale", f"Share through Tailscale (recommended: {tailscale_address})"))
+    options.extend(
         [
-            ("loopback", "Loopback — this machine only"),
-            ("lan", "LAN — enter one private IP"),
-            ("tailscale", "Tailscale — select this machine's tailnet IP"),
-        ],
+            ("local", "This device only"),
+            ("lan", "Share directly on the same LAN (security warning)"),
+            ("cancel", "Cancel"),
+        ]
     )
-    if mode is None:
-        return None
-    if mode == "loopback":
-        host = "127.0.0.1"
-    elif mode == "lan":
-        host = prompt_lan_router_bind_host()
-    else:
-        host = select_tailscale_bind_host()
-    if host is None:
-        return None
-    port = prompt_router_port()
-    if port is None:
-        return None
-    try:
-        return router_server_environment(
-            host,
-            port,
-            prompt_for_token=not dry_run,
-            verify_assigned=not dry_run,
+    if tailscale_address is None and tailscale_installed:
+        print(
+            "Tailscale is installed but not currently available. Sign in or repair it before "
+            "using the recommended sharing mode.",
+            file=sys.stderr,
         )
-    except RouterBindError as error:
-        print(f"Router configuration error: {error}", file=sys.stderr)
+    elif not tailscale_installed:
+        print(
+            "Tailscale is not installed. It is recommended for remote router access.",
+            file=sys.stderr,
+        )
+
+    selected = select_option("Router access", options)
+    if selected == "cancel":
         return None
+    if selected == "lan":
+        print(
+            "Warning: LAN mode exposes unencrypted router traffic to reachable network peers.",
+            file=sys.stderr,
+        )
+        confirmation = select_option(
+            "Continue with LAN sharing?",
+            [("continue", "Continue"), ("cancel", "Cancel")],
+        )
+        if confirmation != "continue":
+            return None
+    return selected
 
 
 def interactive_launcher(dry_run: bool) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print(
-            "Interactive asr requires a terminal; use 'asr --help' for explicit commands.",
+            f"Interactive {COMMAND_NAME} requires a terminal; "
+            f"use '{COMMAND_NAME} --help' for explicit commands.",
             file=sys.stderr,
         )
         return 2
@@ -783,7 +931,8 @@ def interactive_launcher(dry_run: bool) -> int:
             ("claude", "Claude Code"),
             ("codex-cli", "Codex CLI"),
             ("codex", "Codex interactive connector"),
-            ("router", "Start router"),
+            ("router", "Start router on this device"),
+            ("router-stop", "Stop router on this device"),
             ("smoke", "Test router connection"),
             ("add-profile", "Add router address"),
             ("exit", "Exit"),
@@ -792,10 +941,12 @@ def interactive_launcher(dry_run: bool) -> int:
     if action is None or action == "exit":
         return 0
     if action == "router":
-        environment = interactive_router_environment(dry_run)
-        if environment is None:
-            return 1
-        return execute(["bun", "run", "start"], environment, dry_run)
+        access = select_router_access()
+        if access is None:
+            return 0
+        return start_router(None if access == "local" else access, dry_run)
+    if action == "router-stop":
+        return stop_router(dry_run)
     if action == "add-profile":
         return 0 if add_router_profile_interactive(dry_run) else 1
 
@@ -878,6 +1029,41 @@ def handle_profile_command(args: argparse.Namespace) -> int:
     raise AssertionError(f"unhandled profile command: {args.profile_command}")
 
 
+def install_launcher(bin_dir: Path, dry_run: bool) -> int:
+    source = Path(__file__).resolve()
+    install_dir = bin_dir.expanduser().resolve()
+    target = install_dir / COMMAND_NAME
+
+    if dry_run:
+        print(
+            json.dumps(
+                {"command": COMMAND_NAME, "source": str(source), "target": str(target)},
+                separators=(",", ":"),
+            )
+        )
+        return 0
+
+    try:
+        if target.is_symlink():
+            if target.resolve() == source:
+                print(f"Already installed: {target}")
+                return 0
+            raise LauncherInstallError(f"installation target already exists: {target}")
+        if target.exists():
+            raise LauncherInstallError(f"installation target already exists: {target}")
+        if not os.access(source, os.X_OK):
+            raise LauncherInstallError(f"launcher is not executable: {source}")
+
+        install_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        target.symlink_to(source)
+    except (OSError, LauncherInstallError) as error:
+        print(f"Launcher install error: {error}", file=sys.stderr)
+        return 2
+
+    print(f"Installed {COMMAND_NAME}: {target}")
+    return 0
+
+
 def doctor() -> int:
     missing = [name for name in ("bun", "codex", "python3") if shutil.which(name) is None]
     if missing:
@@ -885,13 +1071,9 @@ def doctor() -> int:
         return 1
     print("Ready: bun, codex, and python3 are available.")
     if shutil.which("fzf") is None:
-        print("Optional: fzf is unavailable; interactive asr will use numbered menus.")
+        print(f"Optional: fzf is unavailable; interactive {COMMAND_NAME} will use numbered menus.")
     else:
-        print("Optional: fzf is available for interactive asr menus.")
-    if shutil.which("tailscale") is None:
-        print("Optional: tailscale is unavailable; LAN and loopback router modes still work.")
-    else:
-        print("Optional: tailscale CLI is available; connection is checked only when selected.")
+        print(f"Optional: fzf is available for interactive {COMMAND_NAME} menus.")
     return 0
 
 
@@ -903,26 +1085,24 @@ def main(argv: list[str] | None = None) -> int:
         return interactive_launcher(args.dry_run)
     if args.command == "profile":
         return handle_profile_command(args)
+    if args.command == "install":
+        return install_launcher(args.bin_dir, args.dry_run)
     if args.command == "doctor":
         return doctor()
-    if args.command == "shell-init":
-        print(f'asr() {{ python3 {shlex.quote(str(Path(__file__).resolve()))} "$@"; }}')
-        return 0
 
     if args.command == "router":
-        try:
-            host = tailscale_ip_addresses()[0] if args.tailscale else args.host
-            environment = router_server_environment(
-                host,
-                args.port,
-                verify_assigned=not args.dry_run,
-            )
-        except (RouterBindError, TailscaleUnavailableError) as error:
-            print(f"Router configuration error: {error}", file=sys.stderr)
-            return 2
-        if environment is None:
-            return 2
-        return execute(["bun", "run", "start"], environment, args.dry_run)
+        if args.router_action == "stop":
+            if args.share is not None:
+                print("Router stop error: --share cannot be used with router stop", file=sys.stderr)
+                return 2
+            return stop_router(args.dry_run)
+        share = args.share
+        if share is None and sys.stdin.isatty() and sys.stdout.isatty():
+            access = select_router_access()
+            if access is None:
+                return 0
+            share = None if access == "local" else access
+        return start_router(share, args.dry_run)
     if args.command == "codex":
         environment = resolved_environment(args.agent, args.activity)
         environment.setdefault("CODEX_CWD", os.getcwd())

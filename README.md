@@ -10,7 +10,7 @@ The current implementation includes:
 - heartbeat, reconnect, busy state, and response isolation;
 - interactive Claude Code Channel and Codex CLI integrations;
 - provider-neutral gateway and mock adapter tests;
-- a launcher with loopback/LAN/tailnet router modes, profiles, and unique agent IDs.
+- a local launcher with router profiles and unique agent IDs.
 
 ## Quick start
 
@@ -20,37 +20,40 @@ Requirements:
 - Python 3;
 - an authenticated Claude Code or Codex CLI for provider runs;
 - optional `fzf` for the interactive selector;
-- optional Tailscale CLI only for Tailscale router mode.
+- optional Tailscale for access-controlled remote router sharing.
 
 ```bash
 bun install --frozen-lockfile
 bun test
 ```
 
-Load the short `asr` command into the current shell:
+Install the `agent-session-router` executable in `~/.local/bin`:
 
 ```bash
-eval "$(python3 scripts/asr.py shell-init)"
-asr doctor
+python3 scripts/asr.py install
+agent-session-router doctor
 ```
+
+The installer creates a symbolic link to the repository launcher and never
+replaces an unrelated file. `~/.local/bin` must be present in `PATH`.
 
 Claude Code needs one repository-local Channel setup before its first run:
 
 ```bash
-asr setup-claude
+agent-session-router setup-claude
 ```
 
-## Interactive `asr` launcher
+## Interactive launcher
 
-Run `asr` without arguments:
+Run `agent-session-router` without arguments:
 
 ```bash
-asr
+agent-session-router
 ```
 
 The launcher lets you:
 
-1. start a loopback, LAN/tailnet router, Claude Code, or Codex;
+1. start a local or shared router, Claude Code, or Codex;
 2. select a saved router profile or add a router address;
 3. enter a unique agent ID such as `reviewer` or `worker-a`;
 4. publish an optional activity summary;
@@ -60,18 +63,24 @@ The launcher lets you:
 Short agent names are normalized automatically, for example `reviewer` becomes
 `local:reviewer`. Two live sessions on the same router must use different IDs.
 
-`Start router` asks for a mode and port. Loopback mode binds to `127.0.0.1`.
-LAN mode accepts one private IP assigned to the machine. Tailscale mode checks
-the optional `tailscale` CLI, obtains this machine's connected tailnet IPs, and
-lets you select one. It does not install or configure Tailscale. Wildcard
-bindings such as `0.0.0.0` are rejected. A router profile is instead the address
-used by Claude or Codex to connect to an already running router.
+`Start router on this device` asks whether the router should remain local, use
+Tailscale, or be exposed directly to the LAN. Tailscale is preferred when its
+CLI is installed and connected. The shorter `agent-session-router router`
+command opens the same fzf access selector when run in a terminal. In scripts
+and other non-interactive environments it keeps the existing loopback default.
+`Stop router on this device` verifies and terminates the local router and
+disables its matching Tailscale Serve TCP forward.
 
 ## Router profiles
 
 The built-in `local` profile points to `ws://127.0.0.1:8787/ws`. Selecting
 `Add router address` accepts a host, `host:port`, `ws://` URL, or `wss://` URL.
 A bare `host-a` value becomes `ws://host-a:8787/ws`.
+
+Starting a shared router creates or updates a separate `this-device` profile.
+The built-in `local` profile is never replaced, and shared startup preserves
+the server's current default profile. Profiles remain local to each machine and
+can be added later on a remote machine through its CLI or SSH.
 
 Custom profiles are stored outside the repository at:
 
@@ -85,31 +94,32 @@ tokens remain in `ROUTER_TOKEN` and are never written to the profile.
 Profiles can also be managed explicitly:
 
 ```bash
-asr profile add tailnet host-a:8787
-asr profile list
-asr profile use tailnet
+agent-session-router profile add tailnet host-a:8787
+agent-session-router profile list
+agent-session-router profile use tailnet
 ```
 
 For scripted provider runs, set `ROUTER_URL` directly:
 
 ```bash
-ROUTER_URL=ws://host-a:8787/ws asr claude reviewer
-ROUTER_URL=ws://host-a:8787/ws asr codex-cli worker-a
+ROUTER_URL=ws://host-a:8787/ws agent-session-router claude reviewer
+ROUTER_URL=ws://host-a:8787/ws agent-session-router codex-cli worker-a
 ```
 
 ## Common commands
 
 | Command | Purpose |
 | --- | --- |
-| `asr` | Open the interactive launcher |
-| `asr router` | Start the loopback router |
-| `asr router --host <private-ip> --port 8787` | Start a LAN/tailnet router |
-| `asr router --tailscale --port 8787` | Discover and bind the preferred Tailscale IP |
-| `asr claude reviewer` | Start Claude Code as `local:reviewer` |
-| `asr codex-cli worker-a` | Start stock Codex CLI with router tools |
-| `asr codex worker-a` | Start the prompt-capable Codex connector |
-| `asr smoke` | Run a local router round trip |
-| `asr test` | Run the automated test suite |
+| `agent-session-router` | Open the interactive launcher |
+| `agent-session-router router` | Choose local, Tailscale, or LAN access interactively |
+| `agent-session-router router stop` | Stop the verified local router and Tailscale forward |
+| `agent-session-router router --share` | Share through Tailscale when available |
+| `agent-session-router router --share=lan` | Explicitly share on the current LAN |
+| `agent-session-router claude reviewer` | Start Claude Code as `local:reviewer` |
+| `agent-session-router codex-cli worker-a` | Start stock Codex CLI with router tools |
+| `agent-session-router codex worker-a` | Start the prompt-capable Codex connector |
+| `agent-session-router smoke` | Run a local router round trip |
+| `agent-session-router test` | Run the automated test suite |
 
 Claude Code receives router deliveries through its Channel and can use
 `agent_list`, `agent_send`, and `agent_reply`. Stock Codex CLI exposes
@@ -118,16 +128,38 @@ Claude Code receives router deliveries through its Channel and can use
 
 ## Network and security
 
-The router binds to `127.0.0.1` by default. To accept connections from other
-machines, choose LAN mode and enter one assigned private IP, choose Tailscale
-mode on a machine with a connected Tailscale client, or keep loopback mode and
-use an access-controlled tailnet TCP forwarder. Agent machines save the
-reachable address as a router profile.
+The router binds to `127.0.0.1` by default. `router --share` checks for a working
+Tailscale CLI first. When available, it configures a background Tailscale Serve
+TCP forwarder to the loopback router, updates the `this-device` profile, and
+prints a header before the router logs with the exact profile name, router
+address, and command to run on another machine. It also reports whether the
+same `ROUTER_TOKEN` is required without printing the token value. Review the
+tailnet Grants for the exposed port.
+
+Before starting another Bun server, the launcher checks the local `/healthz`.
+It reuses an already-running agent-session-router and reports that status. If a
+different service owns the port, startup stops before changing Tailscale Serve
+or printing a usable profile.
+
+If Tailscale is unavailable, automatic sharing stops instead of exposing the
+LAN unexpectedly. LAN mode requires an explicit interactive confirmation or
+`--share=lan`. It binds to all interfaces so both `local` and `this-device`
+remain usable. It prints a warning because `ws://` traffic is not
+transport-encrypted and any reachable peer can attempt a connection. Use it
+only on a trusted LAN.
+
+An LLM operating another machine over an existing SSH connection should run
+the printed `agent-session-router profile add ... --force` command there. This
+is safer than replacing the complete configuration file because it preserves
+the remote machine's other profiles. SSH can provision the profile and token,
+but it does not authenticate or encrypt the router connection itself.
+
+If this workflow later becomes a skill, give it an explicit name such as
+`agent-session-router-remote-setup` and require an explicit invocation. Generic
+keywords such as `router`, `SSH`, `Codex`, or `Claude` should not trigger it.
 
 Set the same `ROUTER_TOKEN` on the router and provider connector processes when
-using LAN/Tailnet mode. The launcher requires at least 16 printable characters
-and prompts without echo when the variable is absent. Scripted host mode
-requires `ROUTER_TOKEN` in the environment. Do not place tokens, real hostnames,
+registration authentication is required. Do not place tokens, real hostnames,
 IP addresses, usernames, or environment-specific paths in this repository.
 
 The router currently routes message text in memory and does not persist a

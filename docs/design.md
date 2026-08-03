@@ -112,11 +112,12 @@ configuration outside the repository. Interactive provider startup selects a
 profile before choosing an agent ID and injects its URL through `ROUTER_URL`.
 Profiles never contain registration or delegation tokens; those remain in the
 process environment. The built-in profile always targets the loopback router.
-Router startup separates loopback, LAN, and Tailscale modes. Tailscale is an
-optional operational dependency queried only in that mode: the launcher calls
-`tailscale ip`, filters the current machine's tailnet addresses, and never logs
-CLI diagnostics. LAN and Tailscale startup verify that the selected address is
-assigned locally before launching the router.
+Shared startup creates or updates a separate `this-device` profile with the
+advertised Tailscale or LAN URL and leaves `local` unchanged. Startup probes
+the local health endpoint before binding: it reuses an existing router and
+rejects a port owned by another service before applying sharing changes.
+Interactive shutdown performs the same health check before sending `SIGTERM`
+to the listener and disabling the matching Tailscale Serve TCP forward.
 
 ### 4.3 Agent-facing tool adapter
 
@@ -237,8 +238,7 @@ delivery.
 ## 8. Security and privacy
 
 - Default listener: `127.0.0.1` only.
-- Optional shared token for local integration tests; the launcher requires one
-  for every non-loopback bind.
+- Optional shared token for local integration tests.
 - Never log prompts, responses, tokens, credentials, provider session IDs, or
   environment-specific paths.
 - Never place real infrastructure identifiers in source, tests, or examples.
@@ -246,9 +246,10 @@ delivery.
 - Give delegated MCP connections only `list`, `send`, and `ping` authority;
   revoke them with the owning gateway and never expose the central shared token
   to the MCP child.
-- Bind a trusted tailnet deployment either to one specific tailnet IP or keep
-  loopback and use a Tailscale-only TCP forwarder. The launcher rejects wildcard
-  bind addresses; a least-privilege Grant must protect the router port.
+- Keep a tailnet deployment on loopback and expose it through a Tailscale-only
+  TCP forwarder with a least-privilege Grant for the router port.
+- Treat direct LAN sharing as an explicit development fallback: warn before
+  binding all interfaces, keep tokens out of profiles, and recommend Tailscale.
 - Use TLS and per-gateway credentials before enabling any non-loopback listener
   outside an encrypted, access-controlled overlay.
 

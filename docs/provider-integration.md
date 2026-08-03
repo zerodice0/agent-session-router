@@ -96,18 +96,13 @@ ready. A connector must not advertise an agent while its provider process,
 thread, or channel cannot receive work.
 
 For local development the router remains on `127.0.0.1` and may use the existing
-shared test token. A trusted tailnet deployment can bind one specific tailnet IP
-or retain loopback and use a Tailscale Serve TCP forwarder. The launcher rejects
-wildcard host bindings and requires `ROUTER_TOKEN` for non-loopback mode. Its
-Tailscale mode treats the installed CLI and connected daemon as optional
-operational prerequisites, discovers only local addresses with `tailscale ip`,
-and never installs or configures Tailscale. Tailscale Grants should allow only
-approved agent systems to reach the router port, while the token remains a
-second application-layer check.
+shared test token. A trusted tailnet deployment can retain that loopback bind and
+use a Tailscale Serve TCP forwarder. Tailscale Grants should allow only approved
+agent systems to reach the router port, while `ROUTER_TOKEN` remains a second
+application-layer check.
 
 Official references:
 
-- [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli)
 - [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 - [Tailscale encryption](https://tailscale.com/docs/concepts/tailscale-encryption)
 - [Tailscale Grants](https://tailscale.com/docs/features/access-control/grants)
@@ -279,8 +274,8 @@ The non-interactive `gateway:codex` remains available for automation workers.
 The design does not share a live stock Codex TUI: current upstream behavior does
 not guarantee multi-client event fan-out in both directions for one thread.
 
-The preferred human interface is now `python3 scripts/asr.py codex-cli
-worker-a`. It starts the stock Codex TUI with a process-local standalone MCP
+The preferred human interface is now `agent-session-router codex-cli worker-a`.
+It starts the stock Codex TUI with a process-local standalone MCP
 gateway. That gateway owns the primary router registration and exposes
 `agent_list`, `agent_send`, `agent_wait`, and `agent_reply`. Outbound calls are
 immediate; inbound work is pull-based because MCP cannot inject an unsolicited

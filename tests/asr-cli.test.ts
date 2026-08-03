@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,7 +25,7 @@ function run(...args: string[]) {
   return runWithEnvironment({}, ...args);
 }
 
-describe("asr launcher", () => {
+describe("agent-session-router launcher", () => {
   test("normalizes a short Codex name and keeps loopback defaults", () => {
     const result = run("--dry-run", "codex", "worker-a");
     expect(result.exitCode).toBe(0);
@@ -209,9 +218,53 @@ describe("asr launcher", () => {
     }
   });
 
-  test("requires a terminal when asr is launched without a command", () => {
+  test("installs one idempotent executable link without replacing other files", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-install-test-"));
+    const target = join(directory, "agent-session-router");
+
+    try {
+      const installed = run("install", "--bin-dir", directory);
+      expect(installed.exitCode).toBe(0);
+      expect(installed.stdout.toString()).toContain("Installed agent-session-router");
+      expect(lstatSync(target).isSymbolicLink()).toBeTrue();
+      expect(realpathSync(target)).toBe(realpathSync("scripts/asr.py"));
+
+      const repeated = run("install", "--bin-dir", directory);
+      expect(repeated.exitCode).toBe(0);
+      expect(repeated.stdout.toString()).toContain("Already installed");
+
+      rmSync(target);
+      writeFileSync(target, "keep me", "utf8");
+      const conflict = run("install", "--bin-dir", directory);
+      expect(conflict.exitCode).toBe(2);
+      expect(conflict.stderr.toString()).toContain("installation target already exists");
+      expect(readFileSync(target, "utf8")).toBe("keep me");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps install dry runs side-effect free", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-install-test-"));
+
+    try {
+      const result = run("--dry-run", "install", "--bin-dir", directory);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString())).toMatchObject({
+        command: "agent-session-router",
+        target: join(realpathSync(directory), "agent-session-router"),
+      });
+      expect(existsSync(join(directory, "agent-session-router"))).toBeFalse();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("requires a terminal when agent-session-router is launched without a command", () => {
     const result = run();
     expect(result.exitCode).toBe(2);
-    expect(result.stderr.toString()).toContain("Interactive asr requires a terminal");
+    expect(result.stderr.toString()).toContain(
+      "Interactive agent-session-router requires a terminal",
+    );
   });
 });

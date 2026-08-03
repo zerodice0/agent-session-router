@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -20,6 +19,7 @@ AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_ROUTER_URL = "ws://127.0.0.1:8787/ws"
 DEFAULT_ROUTER_PROFILE = "local"
+COMMAND_NAME = "agent-session-router"
 CONFIG_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CODEX_CLI_MCP_SERVER_ID = "agent_session_router_cli"
@@ -33,6 +33,10 @@ CODEX_CLI_MCP_ENV_VARS = [
 
 class RouterProfileError(ValueError):
     """Raised when local router profile configuration is invalid."""
+
+
+class LauncherInstallError(ValueError):
+    """Raised when the launcher executable cannot be installed safely."""
 
 
 def agent_id(value: str) -> str:
@@ -213,7 +217,7 @@ def set_default_router_profile(name: str, path: Path | None = None) -> None:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        prog="asr",
+        prog=COMMAND_NAME,
         description="Run the local agent session router and interactive provider connectors.",
     )
     result.add_argument(
@@ -256,7 +260,16 @@ def parser() -> argparse.ArgumentParser:
     smoke.add_argument("target", nargs="?", type=agent_id)
     smoke.add_argument("--timeout-ms", type=int, help=argparse.SUPPRESS)
     commands.add_parser("doctor", help="check required local commands")
-    commands.add_parser("shell-init", help="print a shell function for the short 'asr' command")
+    install = commands.add_parser(
+        "install",
+        help=f"install the '{COMMAND_NAME}' executable in the user PATH",
+    )
+    install.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=Path.home() / ".local" / "bin",
+        help="installation directory (default: ~/.local/bin)",
+    )
     profiles = commands.add_parser("profile", help="manage local router address profiles")
     profile_commands = profiles.add_subparsers(dest="profile_command", required=True)
     profile_commands.add_parser("list", help="list saved router profiles")
@@ -504,7 +517,8 @@ def prompt_activity() -> str | None:
 def interactive_launcher(dry_run: bool) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print(
-            "Interactive asr requires a terminal; use 'asr --help' for explicit commands.",
+            f"Interactive {COMMAND_NAME} requires a terminal; "
+            f"use '{COMMAND_NAME} --help' for explicit commands.",
             file=sys.stderr,
         )
         return 2
@@ -607,6 +621,41 @@ def handle_profile_command(args: argparse.Namespace) -> int:
     raise AssertionError(f"unhandled profile command: {args.profile_command}")
 
 
+def install_launcher(bin_dir: Path, dry_run: bool) -> int:
+    source = Path(__file__).resolve()
+    install_dir = bin_dir.expanduser().resolve()
+    target = install_dir / COMMAND_NAME
+
+    if dry_run:
+        print(
+            json.dumps(
+                {"command": COMMAND_NAME, "source": str(source), "target": str(target)},
+                separators=(",", ":"),
+            )
+        )
+        return 0
+
+    try:
+        if target.is_symlink():
+            if target.resolve() == source:
+                print(f"Already installed: {target}")
+                return 0
+            raise LauncherInstallError(f"installation target already exists: {target}")
+        if target.exists():
+            raise LauncherInstallError(f"installation target already exists: {target}")
+        if not os.access(source, os.X_OK):
+            raise LauncherInstallError(f"launcher is not executable: {source}")
+
+        install_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        target.symlink_to(source)
+    except (OSError, LauncherInstallError) as error:
+        print(f"Launcher install error: {error}", file=sys.stderr)
+        return 2
+
+    print(f"Installed {COMMAND_NAME}: {target}")
+    return 0
+
+
 def doctor() -> int:
     missing = [name for name in ("bun", "codex", "python3") if shutil.which(name) is None]
     if missing:
@@ -614,9 +663,9 @@ def doctor() -> int:
         return 1
     print("Ready: bun, codex, and python3 are available.")
     if shutil.which("fzf") is None:
-        print("Optional: fzf is unavailable; interactive asr will use numbered menus.")
+        print(f"Optional: fzf is unavailable; interactive {COMMAND_NAME} will use numbered menus.")
     else:
-        print("Optional: fzf is available for interactive asr menus.")
+        print(f"Optional: fzf is available for interactive {COMMAND_NAME} menus.")
     return 0
 
 
@@ -628,11 +677,10 @@ def main(argv: list[str] | None = None) -> int:
         return interactive_launcher(args.dry_run)
     if args.command == "profile":
         return handle_profile_command(args)
+    if args.command == "install":
+        return install_launcher(args.bin_dir, args.dry_run)
     if args.command == "doctor":
         return doctor()
-    if args.command == "shell-init":
-        print(f'asr() {{ python3 {shlex.quote(str(Path(__file__).resolve()))} "$@"; }}')
-        return 0
 
     if args.command == "router":
         return execute(["bun", "run", "start"], resolved_environment(), args.dry_run)

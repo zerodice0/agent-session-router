@@ -274,8 +274,8 @@ The non-interactive `gateway:codex` remains available for automation workers.
 The design does not share a live stock Codex TUI: current upstream behavior does
 not guarantee multi-client event fan-out in both directions for one thread.
 
-The preferred human interface is now `python3 scripts/asr.py codex-cli
-worker-a`. It starts the stock Codex TUI with a process-local standalone MCP
+The preferred human interface is now `agent-session-router codex-cli worker-a`.
+It starts the stock Codex TUI with a process-local standalone MCP
 gateway. That gateway owns the primary router registration and exposes
 `agent_list`, `agent_send`, `agent_wait`, and `agent_reply`. Outbound calls are
 immediate; inbound work is pull-based because MCP cannot inject an unsolicited

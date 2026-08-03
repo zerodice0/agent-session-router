@@ -26,25 +26,28 @@ bun install --frozen-lockfile
 bun test
 ```
 
-Load the short `asr` command into the current shell:
+Install the `agent-session-router` executable in `~/.local/bin`:
 
 ```bash
-eval "$(python3 scripts/asr.py shell-init)"
-asr doctor
+python3 scripts/asr.py install
+agent-session-router doctor
 ```
+
+The installer creates a symbolic link to the repository launcher and never
+replaces an unrelated file. `~/.local/bin` must be present in `PATH`.
 
 Claude Code needs one repository-local Channel setup before its first run:
 
 ```bash
-asr setup-claude
+agent-session-router setup-claude
 ```
 
-## Interactive `asr` launcher
+## Interactive launcher
 
-Run `asr` without arguments:
+Run `agent-session-router` without arguments:
 
 ```bash
-asr
+agent-session-router
 ```
 
 The launcher lets you:
@@ -81,29 +84,29 @@ tokens remain in `ROUTER_TOKEN` and are never written to the profile.
 Profiles can also be managed explicitly:
 
 ```bash
-asr profile add tailnet host-a:8787
-asr profile list
-asr profile use tailnet
+agent-session-router profile add tailnet host-a:8787
+agent-session-router profile list
+agent-session-router profile use tailnet
 ```
 
 For scripted provider runs, set `ROUTER_URL` directly:
 
 ```bash
-ROUTER_URL=ws://host-a:8787/ws asr claude reviewer
-ROUTER_URL=ws://host-a:8787/ws asr codex-cli worker-a
+ROUTER_URL=ws://host-a:8787/ws agent-session-router claude reviewer
+ROUTER_URL=ws://host-a:8787/ws agent-session-router codex-cli worker-a
 ```
 
 ## Common commands
 
 | Command | Purpose |
 | --- | --- |
-| `asr` | Open the interactive launcher |
-| `asr router` | Start the loopback router |
-| `asr claude reviewer` | Start Claude Code as `local:reviewer` |
-| `asr codex-cli worker-a` | Start stock Codex CLI with router tools |
-| `asr codex worker-a` | Start the prompt-capable Codex connector |
-| `asr smoke` | Run a local router round trip |
-| `asr test` | Run the automated test suite |
+| `agent-session-router` | Open the interactive launcher |
+| `agent-session-router router` | Start the loopback router |
+| `agent-session-router claude reviewer` | Start Claude Code as `local:reviewer` |
+| `agent-session-router codex-cli worker-a` | Start stock Codex CLI with router tools |
+| `agent-session-router codex worker-a` | Start the prompt-capable Codex connector |
+| `agent-session-router smoke` | Run a local router round trip |
+| `agent-session-router test` | Run the automated test suite |
 
 Claude Code receives router deliveries through its Channel and can use
 `agent_list`, `agent_send`, and `agent_reply`. Stock Codex CLI exposes

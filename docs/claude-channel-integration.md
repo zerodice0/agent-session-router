@@ -39,13 +39,14 @@ and does not change the managed Agent SDK gateway.
 The Python launcher reduces the one-time setup and later startup commands:
 
 ```bash
-python3 scripts/asr.py setup-claude
-python3 scripts/asr.py
-python3 scripts/asr.py claude reviewer
-python3 scripts/asr.py claude reviewer --activity "reviewing tests" --auto
+agent-session-router setup-claude
+agent-session-router
+agent-session-router claude reviewer
+agent-session-router claude reviewer --activity "reviewing tests" --auto
 ```
 
-The first command registers the repository-local MCP entry. Running `asr`
+The first command registers the repository-local MCP entry. Running
+`agent-session-router`
 without a command opens the interactive selector: choose a saved router or add
 a router address, then enter the agent ID, activity, and permission mode. The
 explicit forms remain available for automation. They start Claude with the

@@ -8,7 +8,7 @@ Codex UI.
 
 Three runtime modes are available:
 
-- `python3 scripts/asr.py codex-cli worker-a` starts the stock Codex TUI with a
+- `agent-session-router codex-cli worker-a` starts the stock Codex TUI with a
   process-local stdio MCP gateway. Outbound messages are tool-driven and
   inbound messages use explicit `agent_wait`/`agent_reply` pull semantics;
 - `bun run codex:interactive` adds a terminal prompt to the gateway-owned
@@ -94,11 +94,11 @@ field is part of this baseline.
 With the router running, start a normal Codex TUI under a neutral identity:
 
 ```bash
-python3 scripts/asr.py
-python3 scripts/asr.py codex-cli worker-a
+agent-session-router
+agent-session-router codex-cli worker-a
 ```
 
-Running `asr` without a command opens the interactive selector. Choose or add a
+Running `agent-session-router` without a command opens the interactive selector. Choose or add a
 router address, select Codex CLI, and enter the agent ID and optional activity.
 The launcher passes the selected profile URL to the MCP child as `ROUTER_URL`.
 Saved profiles contain no router token and remain in user-local configuration
@@ -113,7 +113,7 @@ environment. A public activity can be supplied before the Codex passthrough
 separator, and Codex flags follow the separator:
 
 ```bash
-python3 scripts/asr.py codex-cli worker-a --activity "reviewing tests" -- --search
+agent-session-router codex-cli worker-a --activity "reviewing tests" -- --search
 ```
 
 The stock TUI receives four MCP tools:
@@ -147,13 +147,13 @@ multi-client co-control boundary while keeping the standard Codex interface.
 With the router running, the complete default startup is:
 
 ```bash
-python3 scripts/asr.py codex
+agent-session-router codex
 ```
 
 An optional short name selects a distinct neutral identity:
 
 ```bash
-python3 scripts/asr.py codex worker-a
+agent-session-router codex worker-a
 ```
 
 The launcher converts `worker-a` to `local:worker-a`, preserves the directory
@@ -172,7 +172,7 @@ At the `codex(local:codex)>` prompt:
   useful for connectivity tests;
 - `/quit` closes the gateway and App Server process.
 
-`python3 scripts/asr.py smoke worker-a` performs one live provider round trip
+`agent-session-router smoke worker-a` performs one live provider round trip
 against `local:worker-a` and emits only a generic pass/fail result. It is useful
 for automated verification but consumes one Codex turn.
 
@@ -304,10 +304,10 @@ it consumes provider usage.
 
 Run all processes on one machine while the router remains loopback-only:
 
-1. Start `python3 scripts/asr.py router`.
-2. Start `python3 scripts/asr.py claude reviewer` and approve only the expected
+1. Start `agent-session-router router`.
+2. Start `agent-session-router claude reviewer` and approve only the expected
    local development Channel.
-3. Start `python3 scripts/asr.py codex-cli worker-a`.
+3. Start `agent-session-router codex-cli worker-a`.
 4. Ask Codex to call `agent_list`; this verifies that the process-local MCP
    server is available without relying on a version-specific slash command.
 5. Confirm `local:reviewer` appears in the tool result.
@@ -337,9 +337,9 @@ repository.
    `codex app-server generate-ts`; do not commit it.
 3. Run `bun test` in this repository before the live check.
 4. Start the router on an available loopback port with a temporary local token.
-5. Start `python3 scripts/asr.py codex worker-a`. Use environment overrides only
+5. Start `agent-session-router codex worker-a`. Use environment overrides only
    when testing a non-default loopback port or authenticated router.
-6. Start another connector with `python3 scripts/asr.py codex worker-b`. Confirm
+6. Start another connector with `agent-session-router codex worker-b`. Confirm
    both accept terminal prompts and appear exactly once in `/agents`. Delegated
    MCP connections must not appear as additional agents.
 7. Use `/send local:worker-b <neutral test message>` for a direct round trip,

@@ -112,6 +112,12 @@ configuration outside the repository. Interactive provider startup selects a
 profile before choosing an agent ID and injects its URL through `ROUTER_URL`.
 Profiles never contain registration or delegation tokens; those remain in the
 process environment. The built-in profile always targets the loopback router.
+Shared startup creates or updates a separate `this-device` profile with the
+advertised Tailscale or LAN URL and leaves `local` unchanged. Startup probes
+the local health endpoint before binding: it reuses an existing router and
+rejects a port owned by another service before applying sharing changes.
+Interactive shutdown performs the same health check before sending `SIGTERM`
+to the listener and disabling the matching Tailscale Serve TCP forward.
 
 ### 4.3 Agent-facing tool adapter
 
@@ -242,6 +248,8 @@ delivery.
   to the MCP child.
 - Keep a tailnet deployment on loopback and expose it through a Tailscale-only
   TCP forwarder with a least-privilege Grant for the router port.
+- Treat direct LAN sharing as an explicit development fallback: warn before
+  binding all interfaces, keep tokens out of profiles, and recommend Tailscale.
 - Use TLS and per-gateway credentials before enabling any non-loopback listener
   outside an encrypted, access-controlled overlay.
 

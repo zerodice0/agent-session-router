@@ -3,6 +3,7 @@ import {
   existsSync,
   lstatSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -23,6 +24,33 @@ function runWithEnvironment(environment: Record<string, string>, ...args: string
 
 function run(...args: string[]) {
   return runWithEnvironment({}, ...args);
+}
+
+async function startPortOwner(body: string) {
+  const child = Bun.spawn({
+    cmd: [
+      "bun",
+      "-e",
+      `const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch() { return new Response(${JSON.stringify(body)}); },
+      });
+      console.log(server.port);
+      await new Promise(() => {});`,
+    ],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const reader = child.stdout.getReader();
+  let output = "";
+  while (!output.includes("\n")) {
+    const chunk = await reader.read();
+    if (chunk.done) throw new Error("test port owner exited before reporting its port");
+    output += new TextDecoder().decode(chunk.value);
+  }
+  reader.releaseLock();
+  return { child, port: Number(output.trim()) };
 }
 
 describe("agent-session-router launcher", () => {
@@ -116,6 +144,255 @@ describe("agent-session-router launcher", () => {
     expect(JSON.parse(run("--dry-run", "smoke", "worker-a").stdout.toString())).toMatchObject({
       command: ["bun", "run", "smoke:provider"],
     });
+  });
+
+  test("shares on the LAN and updates a separate this-device profile", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-share-test-"));
+    const binDirectory = join(directory, "bin");
+    const configPath = join(directory, "config.json");
+    mkdirSync(binDirectory);
+    writeFileSync(join(binDirectory, "bun"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const environment = {
+      ASR_CONFIG_PATH: configPath,
+      PATH: `${binDirectory}:${process.env.PATH}`,
+      ROUTER_HOST: "192.0.2.44",
+      ROUTER_PORT: "9876",
+      ROUTER_TOKEN: "test-token",
+    };
+
+    try {
+      const dryRun = runWithEnvironment(environment, "--dry-run", "router", "--share=lan");
+      expect(dryRun.exitCode).toBe(0);
+      expect(JSON.parse(dryRun.stdout.toString())).toEqual({
+        command: ["bun", "run", "start"],
+        routerUrl: "ws://192.0.2.44:9876/ws",
+        routerHost: "0.0.0.0",
+        profile: "this-device",
+      });
+      expect(dryRun.stderr.toString()).toContain("direct LAN sharing");
+      expect(existsSync(configPath)).toBeFalse();
+
+      const started = runWithEnvironment(environment, "router", "--share=lan");
+      expect(started.exitCode).toBe(0);
+      expect(started.stdout.toString()).toContain("Router server");
+      expect(started.stdout.toString()).toContain("Access: LAN");
+      expect(started.stdout.toString()).toContain("Profile name: this-device");
+      expect(started.stdout.toString()).toContain(
+        "Router address: ws://192.0.2.44:9876/ws",
+      );
+      expect(started.stdout.toString()).toContain(
+        "agent-session-router profile add this-device ws://192.0.2.44:9876/ws --force",
+      );
+      expect(started.stdout.toString()).toContain("ROUTER_TOKEN on the other device (value hidden)");
+      expect(started.stdout.toString()).not.toContain("test-token");
+      expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({
+        defaultProfile: "local",
+        profiles: { "this-device": { routerUrl: "ws://192.0.2.44:9876/ws" } },
+        version: 1,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers an available Tailscale TCP forwarder for automatic sharing", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-share-test-"));
+    const binDirectory = join(directory, "bin");
+    const configPath = join(directory, "config.json");
+    const tailscale = join(binDirectory, "tailscale");
+    mkdirSync(binDirectory);
+    writeFileSync(join(binDirectory, "bun"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(
+      tailscale,
+      '#!/bin/sh\nif [ "$1" = "ip" ]; then echo 100.64.0.10; exit 0; fi\n' +
+        'if [ "$1" = "serve" ]; then exit 0; fi\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const environment = {
+      ASR_CONFIG_PATH: configPath,
+      PATH: `${binDirectory}:${process.env.PATH}`,
+      ROUTER_PORT: "9877",
+      ROUTER_TOKEN: "test-token",
+    };
+
+    try {
+      const dryRun = runWithEnvironment(environment, "--dry-run", "router", "--share");
+      expect(dryRun.exitCode).toBe(0);
+      expect(JSON.parse(dryRun.stdout.toString())).toEqual({
+        command: ["bun", "run", "start"],
+        routerUrl: "ws://100.64.0.10:9877/ws",
+        routerHost: "127.0.0.1",
+        profile: "this-device",
+        setupCommand: [
+          tailscale,
+          "serve",
+          "--bg",
+          "--tcp=9877",
+          "tcp://127.0.0.1:9877",
+        ],
+      });
+      expect(existsSync(configPath)).toBeFalse();
+
+      const started = runWithEnvironment(environment, "router", "--share");
+      expect(started.exitCode).toBe(0);
+      expect(started.stdout.toString()).toContain("Access: Tailscale");
+      expect(started.stdout.toString()).toContain(
+        "Router address: ws://100.64.0.10:9877/ws",
+      );
+      expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
+        defaultProfile: "local",
+        profiles: { "this-device": { routerUrl: "ws://100.64.0.10:9877/ws" } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("reuses an existing router instead of starting a second Bun server", async () => {
+    const owner = await startPortOwner('{"status":"ok","connectedAgents":0}');
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-reuse-test-"));
+    const binDirectory = join(directory, "bin");
+    const configPath = join(directory, "config.json");
+    const tailscale = join(binDirectory, "tailscale");
+    mkdirSync(binDirectory);
+    writeFileSync(join(binDirectory, "bun"), "#!/bin/sh\necho unexpected Bun start\nexit 99\n", {
+      mode: 0o755,
+    });
+    writeFileSync(
+      tailscale,
+      '#!/bin/sh\nif [ "$1" = "ip" ]; then echo 100.64.0.10; exit 0; fi\n' +
+        'if [ "$1" = "serve" ]; then exit 0; fi\nexit 1\n',
+      { mode: 0o755 },
+    );
+
+    try {
+      const result = runWithEnvironment(
+        {
+          ASR_CONFIG_PATH: configPath,
+          PATH: `${binDirectory}:${process.env.PATH}`,
+          ROUTER_PORT: String(owner.port),
+        },
+        "router",
+        "--share",
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.toString()).toContain(
+        "Status: already running; reused existing router",
+      );
+      expect(result.stdout.toString()).not.toContain("unexpected Bun start");
+      expect(result.stderr.toString()).not.toContain("EADDRINUSE");
+      expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
+        profiles: {
+          "this-device": { routerUrl: `ws://100.64.0.10:${owner.port}/ws` },
+        },
+      });
+    } finally {
+      owner.child.kill();
+      await owner.child.exited;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a port owned by another service before sharing", async () => {
+    const owner = await startPortOwner('{"service":"other"}');
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-conflict-test-"));
+    const configPath = join(directory, "config.json");
+
+    try {
+      const result = runWithEnvironment(
+        {
+          ASR_CONFIG_PATH: configPath,
+          ROUTER_HOST: "192.0.2.44",
+          ROUTER_PORT: String(owner.port),
+        },
+        "router",
+        "--share=lan",
+      );
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr.toString()).toContain(
+        `port ${owner.port} is already in use by another process`,
+      );
+      expect(result.stdout.toString()).not.toContain("Router server");
+      expect(existsSync(configPath)).toBeFalse();
+    } finally {
+      owner.child.kill();
+      await owner.child.exited;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("stops a verified router and disables its Tailscale forward", async () => {
+    const owner = await startPortOwner('{"status":"ok","connectedAgents":0}');
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-stop-test-"));
+    const binDirectory = join(directory, "bin");
+    mkdirSync(binDirectory);
+    writeFileSync(join(binDirectory, "tailscale"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    try {
+      const result = runWithEnvironment(
+        {
+          PATH: `${binDirectory}:${process.env.PATH}`,
+          ROUTER_PORT: String(owner.port),
+        },
+        "router",
+        "stop",
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.toString()).toContain(`Stopped router on port ${owner.port}`);
+      expect(result.stdout.toString()).toContain(
+        `Disabled Tailscale Serve for port ${owner.port}`,
+      );
+      await owner.child.exited;
+    } finally {
+      if (owner.child.exitCode === null) owner.child.kill();
+      await owner.child.exited;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("does not stop another service that owns the router port", async () => {
+    const owner = await startPortOwner('{"service":"other"}');
+
+    try {
+      const result = runWithEnvironment(
+        { ROUTER_PORT: String(owner.port) },
+        "router",
+        "stop",
+      );
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr.toString()).toContain("is owned by another process");
+      expect(owner.child.exitCode).toBeNull();
+    } finally {
+      owner.child.kill();
+      await owner.child.exited;
+    }
+  });
+
+  test("does not fall back to LAN exposure when Tailscale is unavailable", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-session-router-share-test-"));
+    const binDirectory = join(directory, "bin");
+    const configPath = join(directory, "config.json");
+    mkdirSync(binDirectory);
+    writeFileSync(join(binDirectory, "tailscale"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+    try {
+      const result = runWithEnvironment(
+        {
+          ASR_CONFIG_PATH: configPath,
+          PATH: `${binDirectory}:${process.env.PATH}`,
+        },
+        "--dry-run",
+        "router",
+        "--share",
+      );
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr.toString()).toContain(
+        "use --share=lan to explicitly accept LAN exposure",
+      );
+      expect(existsSync(configPath)).toBeFalse();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test("rejects invalid agent names before launching a provider", () => {

@@ -19,7 +19,8 @@ Requirements:
 - Bun 1.3 or newer;
 - Python 3;
 - an authenticated Claude Code or Codex CLI for provider runs;
-- optional `fzf` for the interactive selector.
+- optional `fzf` for the interactive selector;
+- optional Tailscale for access-controlled remote router sharing.
 
 ```bash
 bun install --frozen-lockfile
@@ -52,7 +53,7 @@ agent-session-router
 
 The launcher lets you:
 
-1. start a local router, Claude Code, or Codex;
+1. start a local or shared router, Claude Code, or Codex;
 2. select a saved router profile or add a router address;
 3. enter a unique agent ID such as `reviewer` or `worker-a`;
 4. publish an optional activity summary;
@@ -62,15 +63,24 @@ The launcher lets you:
 Short agent names are normalized automatically, for example `reviewer` becomes
 `local:reviewer`. Two live sessions on the same router must use different IDs.
 
-`Start local router` starts a server process on the current machine. A router
-profile is instead the address used by Claude or Codex to connect to an already
-running router.
+`Start router on this device` asks whether the router should remain local, use
+Tailscale, or be exposed directly to the LAN. Tailscale is preferred when its
+CLI is installed and connected. The shorter `agent-session-router router`
+command opens the same fzf access selector when run in a terminal. In scripts
+and other non-interactive environments it keeps the existing loopback default.
+`Stop router on this device` verifies and terminates the local router and
+disables its matching Tailscale Serve TCP forward.
 
 ## Router profiles
 
 The built-in `local` profile points to `ws://127.0.0.1:8787/ws`. Selecting
 `Add router address` accepts a host, `host:port`, `ws://` URL, or `wss://` URL.
 A bare `host-a` value becomes `ws://host-a:8787/ws`.
+
+Starting a shared router creates or updates a separate `this-device` profile.
+The built-in `local` profile is never replaced, and shared startup preserves
+the server's current default profile. Profiles remain local to each machine and
+can be added later on a remote machine through its CLI or SSH.
 
 Custom profiles are stored outside the repository at:
 
@@ -101,7 +111,10 @@ ROUTER_URL=ws://host-a:8787/ws agent-session-router codex-cli worker-a
 | Command | Purpose |
 | --- | --- |
 | `agent-session-router` | Open the interactive launcher |
-| `agent-session-router router` | Start the loopback router |
+| `agent-session-router router` | Choose local, Tailscale, or LAN access interactively |
+| `agent-session-router router stop` | Stop the verified local router and Tailscale forward |
+| `agent-session-router router --share` | Share through Tailscale when available |
+| `agent-session-router router --share=lan` | Explicitly share on the current LAN |
 | `agent-session-router claude reviewer` | Start Claude Code as `local:reviewer` |
 | `agent-session-router codex-cli worker-a` | Start stock Codex CLI with router tools |
 | `agent-session-router codex worker-a` | Start the prompt-capable Codex connector |
@@ -115,9 +128,35 @@ Claude Code receives router deliveries through its Channel and can use
 
 ## Network and security
 
-The router binds to `127.0.0.1` by default. For connections from other machines,
-keep that loopback bind and expose it through an access-controlled tailnet TCP
-forwarder, then save the forwarder's address as a router profile.
+The router binds to `127.0.0.1` by default. `router --share` checks for a working
+Tailscale CLI first. When available, it configures a background Tailscale Serve
+TCP forwarder to the loopback router, updates the `this-device` profile, and
+prints a header before the router logs with the exact profile name, router
+address, and command to run on another machine. It also reports whether the
+same `ROUTER_TOKEN` is required without printing the token value. Review the
+tailnet Grants for the exposed port.
+
+Before starting another Bun server, the launcher checks the local `/healthz`.
+It reuses an already-running agent-session-router and reports that status. If a
+different service owns the port, startup stops before changing Tailscale Serve
+or printing a usable profile.
+
+If Tailscale is unavailable, automatic sharing stops instead of exposing the
+LAN unexpectedly. LAN mode requires an explicit interactive confirmation or
+`--share=lan`. It binds to all interfaces so both `local` and `this-device`
+remain usable. It prints a warning because `ws://` traffic is not
+transport-encrypted and any reachable peer can attempt a connection. Use it
+only on a trusted LAN.
+
+An LLM operating another machine over an existing SSH connection should run
+the printed `agent-session-router profile add ... --force` command there. This
+is safer than replacing the complete configuration file because it preserves
+the remote machine's other profiles. SSH can provision the profile and token,
+but it does not authenticate or encrypt the router connection itself.
+
+If this workflow later becomes a skill, give it an explicit name such as
+`agent-session-router-remote-setup` and require an explicit invocation. Generic
+keywords such as `router`, `SSH`, `Codex`, or `Claude` should not trigger it.
 
 Set the same `ROUTER_TOKEN` on the router and provider connector processes when
 registration authentication is required. Do not place tokens, real hostnames,

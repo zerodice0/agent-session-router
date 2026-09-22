@@ -103,6 +103,7 @@ fn tls_router_config(data_dir: PathBuf, port: u16, fixture: &CertificateFixture)
             Url::parse(&format!("wss://localhost:{port}/ws")).expect("public WSS URL"),
         ),
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     }
 }
 
@@ -245,6 +246,7 @@ fn tls_configuration_fails_closed_before_serving() {
         tls_key_file: None,
         public_url: Some(public_url.clone()),
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     });
     assert_configuration_failure(RouterConfig {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -254,6 +256,7 @@ fn tls_configuration_fails_closed_before_serving() {
         tls_key_file: None,
         public_url: None,
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     });
 
     let invalid_certificate = directory.path().join("invalid-certificate.pem");
@@ -269,6 +272,7 @@ fn tls_configuration_fails_closed_before_serving() {
         tls_key_file: Some(fixture.private_key_file.clone()),
         public_url: Some(public_url.clone()),
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     });
 
     fs::set_permissions(&fixture.private_key_file, fs::Permissions::from_mode(0o644))
@@ -281,6 +285,7 @@ fn tls_configuration_fails_closed_before_serving() {
         tls_key_file: Some(fixture.private_key_file.clone()),
         public_url: Some(public_url.clone()),
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     });
     fs::set_permissions(&fixture.private_key_file, fs::Permissions::from_mode(0o600))
         .expect("restore key permissions");
@@ -295,6 +300,7 @@ fn tls_configuration_fails_closed_before_serving() {
         tls_key_file: Some(symlink_key),
         public_url: Some(public_url),
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     });
 }
 
@@ -320,6 +326,7 @@ fn public_url_must_match_wss_endpoint() {
             tls_key_file: Some(fixture.private_key_file.clone()),
             public_url: Some(Url::parse(&public_url).expect("invalid test public URL parses")),
             exposure: RouterExposure::Direct,
+            onboarding_assets_dir: None,
         });
     }
 }

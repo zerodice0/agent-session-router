@@ -30,6 +30,7 @@ async fn history_pages_fit_the_wire_budget_with_deterministic_continuation() {
         tls_key_file: None,
         public_url: None,
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     })
     .await
     .expect("start router");

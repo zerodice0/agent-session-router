@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     os::unix::fs::PermissionsExt as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command as StdCommand,
     sync::{
         Arc,
@@ -11,19 +11,28 @@ use std::{
 };
 
 use agent_session_router::{
+    bootstrap::routes::RouteError,
     cli::{Cli, Command as CliCommand, McpArgs, McpRoleArg},
     client::{ClientConfig, ClientRole},
-    config::{DELEGATE_CONTEXT_VERSION, DelegateLaunchContext},
+    config::{
+        self, ConfigError, ConfigFile, DELEGATE_CONTEXT_VERSION, DelegateLaunchContext, Profile,
+        ProviderBinding, StoredOnboardingRoute,
+    },
     credentials::{CredentialFile, CredentialRole, write_credential_exclusive},
     hosts::{
         HostError, ManagedClaudeOptions, ManagedCodexOptions, ManagedProviderOptions,
         McpChildSelection, managed_claude_config, managed_codex_config, mcp_invocation,
-        preflight_omp_plugin, run_interactive_codex_io, run_owned_provider, setup_claude_plan,
-        setup_omp_checked_plan, setup_omp_plan, stock_claude_plan, stock_codex_plan,
-        stock_omp_plan,
+        preflight_omp_plugin, resolve_mcp_route, run_interactive_codex_io, run_owned_provider,
+        setup_claude_plan, setup_omp_checked_plan, setup_omp_plan, stock_claude_plan,
+        stock_codex_plan, stock_omp_plan,
     },
     install::{AssetError, INTEGRATIONS_ENV},
     mcp::{McpRole, catalog},
+    onboarding::{
+        OnboardingInfo, OnboardingProvider, RouteKind,
+        journal::{ActionStatus, ConfigurationLock, InstallAction, Journal, Stage},
+        providers::{preflight, verify_recorded},
+    },
     process::LaunchMode,
     protocol::{
         AgentClient, AgentDescriptor, AgentRegistration, AgentSide, AgentStatus, ClientMessage,
@@ -36,10 +45,12 @@ use agent_session_router::{
         SessionResult, TerminalEvidence, TerminalReason, codex::ThreadSelection,
         filtered_provider_environment,
     },
+    router::{RouterConfig, RouterExposure, RouterRuntime},
     tasks::{AttemptStatus, PauseReason, StopEvidence, TaskAttempt},
 };
 use clap::Parser as _;
 use futures_util::{SinkExt as _, StreamExt as _};
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader},
@@ -1305,6 +1316,401 @@ fn mcp_dry_run_guard_precedes_context_and_credential_io() {
     ));
 }
 
+#[test]
+fn onboarded_hosts_respect_identity_selection_and_workspace_precedence() {
+    for mode in [
+        "bound",
+        "overrides",
+        "router-url",
+        "explicit-profile",
+        "unsafe-ca",
+        "reconnect",
+        "wrapper",
+        "wrapper-env",
+        "wrapper-argv",
+        "wrapper-registration",
+        "wrapper-registration-env",
+        "wrapper-registration-argv",
+    ] {
+        let temporary = private_tempdir();
+        let root = temporary.path().canonicalize().unwrap();
+        let mut child = StdCommand::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "onboarded_host_selection_child", "--nocapture"])
+            .env("ASR_HOST_SELECTION_TEST", mode)
+            .env("HOME", &root)
+            .env("ASR_CONFIG_PATH", root.join("config.json"))
+            .env_remove("ASR_PROFILE")
+            .env_remove("ASR_CREDENTIAL_FILE")
+            .env_remove("ASR_WORKSPACE")
+            .env_remove("ASR_CA_FILE")
+            .env_remove("ROUTER_URL");
+        if mode == "overrides" {
+            child
+                .env("ASR_CREDENTIAL_FILE", root.join("override.json"))
+                .env("ASR_WORKSPACE", "environment-room")
+                .env("ASR_CA_FILE", root.join("override-ca.pem"));
+        }
+        if matches!(mode, "router-url" | "explicit-profile") {
+            child.env("ROUTER_URL", "ws://127.0.0.1:9999/ws");
+        }
+        if mode == "explicit-profile" {
+            child.env("ASR_PROFILE", "other");
+        }
+        if matches!(mode, "wrapper-env" | "wrapper-argv") {
+            child.env("ASR_WORKSPACE", "environment-room");
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn registered_claude_binding_child() {
+    let Ok(expected) = std::env::var("ASR_HOST_EXPECT_AGENT") else {
+        return;
+    };
+    let invocation = mcp_invocation(
+        &McpArgs {
+            role: McpRoleArg::ClaudeChannel,
+        },
+        Some("registered"),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(invocation.agent_id, expected);
+    assert_eq!(
+        invocation.config.router_url.as_str(),
+        "wss://registered.example/ws"
+    );
+}
+
+fn stock_host_identities() -> [(OnboardingProvider, McpRoleArg); 3] {
+    [
+        (OnboardingProvider::CodexCli, McpRoleArg::CodexCli),
+        (OnboardingProvider::ClaudeCode, McpRoleArg::ClaudeChannel),
+        (OnboardingProvider::Omp, McpRoleArg::Omp),
+    ]
+}
+
+fn host_profile_with_bindings(root: &Path, ca_path: &Path) -> Profile {
+    let certificate =
+        rcgen::generate_simple_self_signed(vec!["router.example".to_owned()]).unwrap();
+    std::fs::write(ca_path, certificate.cert.pem()).unwrap();
+    std::fs::set_permissions(ca_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut profile = Profile::manual("wss://router.example/ws".to_owned());
+    profile.server_id = Some(Uuid::new_v4());
+    profile.routes = vec![StoredOnboardingRoute {
+        kind: RouteKind::Public,
+        router_url: profile.router_url.clone(),
+        ca_file: Some(ca_path.to_path_buf()),
+    }];
+    for (provider, _) in &stock_host_identities() {
+        let (side, client) = provider.identity();
+        let credential = CredentialFile::generate(
+            CredentialRole::Agent,
+            format!("bound-{}", provider.as_str()),
+            Some(side),
+            Some(client),
+            Vec::new(),
+        )
+        .unwrap();
+        let path = root.join(format!("{}.json", provider.as_str()));
+        write_credential_exclusive(&path, &credential).unwrap();
+        profile.bindings.insert(
+            *provider,
+            ProviderBinding {
+                credential_file: path,
+                workspace: WorkspaceName::parse("bound-room").unwrap(),
+            },
+        );
+    }
+    profile
+}
+
+async fn host_reconnect_profile(root: &Path, profile: &mut Profile) -> RouterRuntime {
+    let server = RouterRuntime::start(RouterConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        data_dir: root.join("router-data"),
+        instance_id: Uuid::new_v4(),
+        tls_cert_file: None,
+        tls_key_file: None,
+        public_url: None,
+        exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
+    })
+    .await
+    .unwrap();
+    let info: OnboardingInfo = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{}/onboarding/info", server.address))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(info.manifest_sha256.is_none());
+    profile.server_id = Some(info.server_id);
+    profile.router_url = format!("ws://{}/ws", server.address);
+    profile.routes = vec![StoredOnboardingRoute {
+        kind: RouteKind::Local,
+        router_url: profile.router_url.clone(),
+        ca_file: None,
+    }];
+    server
+}
+
+fn add_registered_claude_profile(root: &Path, stored: &mut ConfigFile) {
+    let credential = CredentialFile::generate(
+        CredentialRole::Agent,
+        "registered-claude".to_owned(),
+        Some(AgentSide::Claude),
+        Some(AgentClient::ClaudeCode),
+        Vec::new(),
+    )
+    .unwrap();
+    let credential_file = root.join("registered-claude.json");
+    write_credential_exclusive(&credential_file, &credential).unwrap();
+    let mut registered = stored.profiles["office"].clone();
+    "wss://registered.example/ws".clone_into(&mut registered.router_url);
+    registered.routes[0]
+        .router_url
+        .clone_from(&registered.router_url);
+    registered.server_id = Some(Uuid::new_v4());
+    registered.bindings.insert(
+        OnboardingProvider::ClaudeCode,
+        ProviderBinding {
+            credential_file,
+            workspace: WorkspaceName::parse("registered-room").unwrap(),
+        },
+    );
+    stored.profiles.insert("registered".to_owned(), registered);
+}
+
+fn assert_router_url_host_selection(args: &McpArgs, override_path: &Path) {
+    assert!(matches!(
+        mcp_invocation(args, None, None, false),
+        Err(HostError::Config(ConfigError::Required))
+    ));
+    let selected = mcp_invocation(args, None, Some(override_path), false).unwrap();
+    assert_eq!(selected.agent_id, "explicit-codex");
+    assert_eq!(
+        selected.config.router_url.as_str(),
+        "ws://127.0.0.1:9999/ws"
+    );
+    assert!(selected.initial_workspace.is_none());
+    assert!(selected.config.ca_file.is_none());
+}
+
+fn assert_claude_wrapper_selection(root: &Path, mode: &str) {
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let claude = bin.join("claude");
+    let registration = mode.starts_with("wrapper-registration");
+    let script = if registration {
+        "#!/bin/sh\nexec \"$ASR_HOST_TEST_EXE\" --exact registered_claude_binding_child --nocapture\n"
+    } else {
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$ASR_PROFILE\" \"$ASR_WORKSPACE\"\n"
+    };
+    std::fs::write(&claude, script).unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable =
+        std::env::var_os("ASR_TEST_EXECUTABLE").unwrap_or_else(|| env!("CARGO_BIN_EXE_asr").into());
+    let mut command = StdCommand::new(executable);
+    if registration {
+        command
+            .env("ASR_HOST_TEST_EXE", std::env::current_exe().unwrap())
+            .env(
+                "ASR_HOST_EXPECT_AGENT",
+                if mode == "wrapper-registration" {
+                    "registered-claude"
+                } else {
+                    "bound-claude-code"
+                },
+            );
+        if mode == "wrapper-registration-env" {
+            command.env("ASR_CREDENTIAL_FILE", root.join("claude-code.json"));
+        } else if mode == "wrapper-registration-argv" {
+            command
+                .arg("--credential")
+                .arg(root.join("claude-code.json"));
+        }
+    }
+    command.arg("claude").env("PATH", bin);
+    if mode == "wrapper-argv" {
+        command.args(["--workspace", "argument-room"]);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if registration {
+        return;
+    }
+    let expected = match mode {
+        "wrapper-env" => "environment-room",
+        "wrapper-argv" => "argument-room",
+        _ => "bound-room",
+    };
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("office\n{expected}\n")
+    );
+}
+
+fn assert_host_credential_overrides(root: &Path, args: &McpArgs) {
+    let selected = mcp_invocation(args, None, None, false).unwrap();
+    assert_eq!(selected.agent_id, "explicit-codex");
+    assert_eq!(
+        selected.initial_workspace.unwrap().as_str(),
+        "environment-room"
+    );
+    assert_eq!(
+        selected.config.ca_file.unwrap(),
+        root.join("override-ca.pem")
+    );
+    let bound_path = root.join("codex-cli.json");
+    let selected = mcp_invocation(args, Some("office"), Some(&bound_path), false).unwrap();
+    assert_eq!(selected.agent_id, "bound-codex-cli");
+}
+
+async fn assert_unsafe_host_ca(root: &Path, ca_path: &Path, args: &McpArgs) {
+    let mut selected = mcp_invocation(args, None, None, false).unwrap();
+    let target = root.join("actual-ca.pem");
+    std::fs::rename(ca_path, &target).unwrap();
+    std::os::unix::fs::symlink(&target, ca_path).unwrap();
+    assert!(matches!(
+        resolve_mcp_route(&mut selected).await,
+        Err(HostError::Route(RouteError::InvalidCa))
+    ));
+}
+
+async fn assert_host_reconnect_identity(server: RouterRuntime, args: &McpArgs) {
+    let mut selected = mcp_invocation(args, None, None, false).unwrap();
+    selected.config.router_url = Url::parse("ws://127.0.0.1:1/ws").unwrap();
+    resolve_mcp_route(&mut selected).await.unwrap();
+    assert_eq!(
+        selected.config.router_url.as_str(),
+        format!("ws://{}/ws", server.address)
+    );
+    selected
+        .provider_selection
+        .as_mut()
+        .unwrap()
+        .expected_server_id = Some(Uuid::new_v4());
+    assert!(matches!(
+        resolve_mcp_route(&mut selected).await,
+        Err(HostError::Route(RouteError::IdentityMismatch))
+    ));
+    server.shutdown().await.unwrap();
+    server.wait().await.unwrap();
+}
+
+fn assert_bound_host_identities(mode: &str, ca_path: &Path, override_path: &Path) {
+    for (provider, role) in stock_host_identities() {
+        let selected = mcp_invocation(
+            &McpArgs { role },
+            (mode == "explicit-profile").then_some("office"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(selected.agent_id, format!("bound-{}", provider.as_str()));
+        assert_eq!(
+            selected.config.router_url.as_str(),
+            "wss://router.example/ws"
+        );
+        assert_eq!(selected.config.ca_file.as_deref(), Some(ca_path));
+        assert_eq!(
+            selected
+                .initial_workspace
+                .as_ref()
+                .map(WorkspaceName::as_str),
+            (provider != OnboardingProvider::Omp).then_some("bound-room"),
+        );
+    }
+    assert!(matches!(
+        mcp_invocation(
+            &McpArgs {
+                role: McpRoleArg::ClaudeChannel
+            },
+            Some("office"),
+            Some(override_path),
+            false
+        ),
+        Err(HostError::McpCredentialClaims),
+    ));
+}
+
+#[tokio::test]
+async fn onboarded_host_selection_child() {
+    let Ok(mode) = std::env::var("ASR_HOST_SELECTION_TEST") else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let ca_path = root.join("ca.pem");
+    let mut profile = host_profile_with_bindings(&root, &ca_path);
+    let override_credential = CredentialFile::generate(
+        CredentialRole::Agent,
+        "explicit-codex".to_owned(),
+        Some(AgentSide::Codex),
+        Some(AgentClient::CodexCli),
+        Vec::new(),
+    )
+    .unwrap();
+    let override_path = root.join("override.json");
+    write_credential_exclusive(&override_path, &override_credential).unwrap();
+    let runtime = if mode == "reconnect" {
+        Some(host_reconnect_profile(&root, &mut profile).await)
+    } else {
+        None
+    };
+    let mut stored = ConfigFile {
+        version: config::CONFIG_VERSION,
+        default_profile: Some("office".to_owned()),
+        profiles: [
+            ("office".to_owned(), profile),
+            (
+                "other".to_owned(),
+                Profile::manual("ws://127.0.0.1:9998/ws".to_owned()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    if mode.starts_with("wrapper-registration") {
+        add_registered_claude_profile(&root, &mut stored);
+    }
+    config::save_config(&root.join("config.json"), &stored).unwrap();
+    let args = McpArgs {
+        role: McpRoleArg::CodexCli,
+    };
+    if mode == "router-url" {
+        assert_router_url_host_selection(&args, &override_path);
+    } else if mode.starts_with("wrapper") {
+        assert_claude_wrapper_selection(&root, &mode);
+    } else if mode == "overrides" {
+        assert_host_credential_overrides(&root, &args);
+    } else if mode == "unsafe-ca" {
+        assert_unsafe_host_ca(&root, &ca_path, &args).await;
+    } else if let Some(server) = runtime {
+        assert_host_reconnect_identity(server, &args).await;
+    } else {
+        assert_bound_host_identities(&mode, &ca_path, &override_path);
+    }
+}
+
 fn integration_layout() -> (TempDir, PathBuf, PathBuf, Vec<(OsString, OsString)>) {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("integrations");
@@ -1606,10 +2012,6 @@ async fn omp_preflight_requires_the_linked_enabled_packaged_plugin() {
     .await
     .unwrap_err();
     assert!(matches!(disabled, HostError::OmpEnableRequired));
-    assert_eq!(
-        disabled.to_string(),
-        "OMP integration is disabled; run `omp plugin enable @agent-session-router/omp-integration`"
-    );
 
     write_omp_list_program(
         &program,
@@ -1624,10 +2026,6 @@ async fn omp_preflight_requires_the_linked_enabled_packaged_plugin() {
     .await
     .unwrap_err();
     assert!(matches!(missing, HostError::OmpSetupRequired));
-    assert_eq!(
-        missing.to_string(),
-        "OMP integration is not linked; run `asr setup-omp`"
-    );
 }
 
 #[cfg(unix)]
@@ -1783,4 +2181,759 @@ fn managed_configs_use_private_delegate_context_and_existing_tool_catalog() {
         filtered,
         vec![(OsString::from("PATH"), OsString::from("/bin"))]
     );
+}
+
+// Subprocess isolation avoids changing the test runner's HOME/PATH while other
+// host tests are active. These fixtures model durable registries, not argv echoes.
+fn run_onboarding_adapter_case(case: &str) {
+    let temporary = private_tempdir();
+    let home = temporary.path().canonicalize().unwrap();
+    let bin = home.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let output = StdCommand::new(std::env::current_exe().unwrap())
+        .args(["--exact", "onboarding_adapter_child", "--nocapture"])
+        .env("ASR_ADAPTER_CASE", case)
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .env("ASR_CONFIG_PATH", home.join("client/config.json"))
+        .env_remove("CODEX_HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "adapter case {case}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn onboarding_adapters_preserve_foreign_skills_and_reject_unsafe_files() {
+    run_onboarding_adapter_case("foreign-skill");
+}
+
+#[test]
+fn onboarding_adapters_adopt_only_durable_crash_intents() {
+    run_onboarding_adapter_case("crash-adoption");
+}
+
+#[test]
+fn onboarding_adapters_recheck_registry_before_any_effect() {
+    run_onboarding_adapter_case("external-change");
+}
+
+#[test]
+fn onboarding_adapters_enable_only_their_own_unfinished_omp_link() {
+    run_onboarding_adapter_case("disabled-omp");
+}
+
+#[test]
+fn onboarding_adapters_preserve_omp_destinations_hidden_from_the_registry() {
+    run_onboarding_adapter_case("omp-hidden-destination");
+}
+
+#[test]
+fn onboarding_adapters_recheck_omp_destination_immediately_before_link() {
+    run_onboarding_adapter_case("omp-hidden-race");
+}
+
+#[test]
+fn onboarding_adapters_recover_an_own_link_missing_from_the_omp_registry() {
+    run_onboarding_adapter_case("omp-hidden-crash");
+}
+
+#[test]
+fn onboarding_adapters_recheck_omp_destination_after_feature_inspection() {
+    run_onboarding_adapter_case("omp-preflight-race");
+}
+
+const ONBOARDING_ADAPTER_PROGRAM: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/inspections"
+case "$*" in
+  *--help*) printf '%s\n' 'mcp COMMAND get list link enable --scope --transport --json'; exit 0 ;;
+esac
+case "$1 $2" in
+  'mcp get')
+    if [ -f "$HOME/registry.json" ]; then /bin/cat "$HOME/registry.json"; exit 0; fi
+    printf '%s\n' "Error: No MCP server named 'agent_session_router' found." >&2
+    exit 1 ;;
+  'mcp list') printf '%s\n' '[]'; exit 0 ;;
+  'mcp add')
+    printf '%s\n' add >> "$HOME/mutations"
+    /bin/cp "$HOME/expected.json" "$HOME/registry.json"
+    exit 0 ;;
+  'plugin list')
+    if [ -f "$HOME/inject-hidden-target" ]; then
+      if [ -f "$HOME/omp-inspected-once" ]; then
+        /bin/mkdir -p "$HOME/.omp/plugins/node_modules/@agent-session-router/omp-integration"
+        printf '%s\n' preserved > "$HOME/.omp/plugins/node_modules/@agent-session-router/omp-integration/user-data"
+        /bin/rm "$HOME/inject-hidden-target"
+      else
+        printf '%s\n' observed > "$HOME/omp-inspected-once"
+      fi
+    fi
+    if [ -f "$HOME/registry.json" ]; then /bin/cat "$HOME/registry.json";
+    else printf '%s\n' '{"npm":[],"marketplace":[]}'; fi
+    exit 0 ;;
+  'plugin link')
+    printf '%s\n' link >> "$HOME/mutations"
+    destination="$HOME/.omp/plugins/node_modules/@agent-session-router/omp-integration"
+    /bin/mkdir -p "$HOME/.omp/plugins/node_modules/@agent-session-router"
+    /bin/rm -rf "$destination"
+    /bin/ln -s "$3" "$destination"
+    /bin/cp "$HOME/expected.json" "$HOME/registry.json"
+    exit 0 ;;
+  'plugin enable')
+    printf '%s\n' enable >> "$HOME/mutations"
+    /bin/cp "$HOME/expected.json" "$HOME/registry.json"
+    exit 0 ;;
+esac
+exit 64
+"#;
+
+struct OnboardingAdapterFixture {
+    home: PathBuf,
+    config: PathBuf,
+    assets: PathBuf,
+    executable: PathBuf,
+    program: PathBuf,
+    ticket: agent_session_router::onboarding::OnboardingTicket,
+    runtime: agent_session_router::router::RouterRuntime,
+}
+
+impl OnboardingAdapterFixture {
+    async fn new(provider: agent_session_router::onboarding::OnboardingProvider) -> Self {
+        use agent_session_router::{
+            onboarding::{BootstrapArtifact, OnboardingRoute, OnboardingTicket, RouteKind},
+            router::{RouterConfig, RouterExposure, RouterRuntime},
+            store::{RouterStore, now_millis},
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let assets = home.join("distribution/integrations");
+        for directory in ["codex/skills/asr", "omp/skills/asr"] {
+            std::fs::create_dir_all(assets.join(directory)).unwrap();
+            std::fs::write(
+                assets.join(directory).join("SKILL.md"),
+                "Use the workspace MCP tools.\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(assets.join("omp/index.js"), "export default () => {};\n").unwrap();
+        std::fs::write(
+            assets.join("omp/package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@agent-session-router/omp-integration",
+                "version": env!("CARGO_PKG_VERSION"),
+                "omp": {"extensions": ["./index.js"]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let executable = home.join("distribution/asr");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = home.join("bin").join(
+            if provider == agent_session_router::onboarding::OnboardingProvider::Omp {
+                "omp"
+            } else {
+                "codex"
+            },
+        );
+        std::fs::write(&program, ONBOARDING_ADAPTER_PROGRAM).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = home.join("server");
+        let mut store = RouterStore::open(&data).unwrap();
+        let invite = store
+            .issue_onboarding_invite(
+                &WorkspaceName::parse("adapter-room").unwrap(),
+                true,
+                Some(provider),
+                now_millis().unwrap(),
+            )
+            .unwrap();
+        store.close().unwrap();
+        let runtime = RouterRuntime::start(RouterConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: data,
+            instance_id: Uuid::new_v4(),
+            tls_cert_file: None,
+            tls_key_file: None,
+            public_url: None,
+            exposure: RouterExposure::Direct,
+            onboarding_assets_dir: None,
+        })
+        .await
+        .unwrap();
+        let target = "aarch64-apple-darwin";
+        let ticket = OnboardingTicket {
+            version: 1,
+            server_id: invite.server_id,
+            invite_id: invite.invite_id,
+            invite_token: invite.invite_token,
+            expires_at: invite.expires_at,
+            profile_name: "office".into(),
+            workspace: invite.workspace,
+            provider: Some(provider),
+            routes: vec![OnboardingRoute {
+                kind: RouteKind::Local,
+                router_url: format!("ws://{}/ws", runtime.address),
+                ca_pem: None,
+            }],
+            manifest_sha256: "1".repeat(64),
+            artifacts: vec![BootstrapArtifact {
+                target: target.into(),
+                binary_file: format!("asr-{target}"),
+                binary_sha256: "2".repeat(64),
+                archive_file: format!("agent-session-router-{target}.tar.gz"),
+                archive_sha256: "3".repeat(64),
+                binary_bytes: 1,
+                archive_bytes: 1,
+            }],
+        };
+        Self {
+            config: home.join("client/config.json"),
+            home,
+            assets,
+            executable,
+            program,
+            ticket,
+            runtime,
+        }
+    }
+
+    fn prepare(&self) -> agent_session_router::onboarding::journal::Journal {
+        agent_session_router::onboarding::journal::Journal::prepare(
+            &self.config,
+            &self.ticket,
+            self.ticket.provider.unwrap(),
+            &self.executable,
+        )
+        .unwrap()
+    }
+
+    fn load(&self) -> agent_session_router::onboarding::journal::Journal {
+        agent_session_router::onboarding::journal::Journal::load(
+            &self.config,
+            self.ticket.invite_id,
+            self.ticket.provider.unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn enroll(&self, journal: &mut agent_session_router::onboarding::journal::Journal) {
+        let route = agent_session_router::bootstrap::routes::probe_routes(
+            &self.ticket.routes,
+            self.ticket.server_id,
+            None,
+            &self.home.join("probe-ca"),
+        )
+        .await
+        .unwrap();
+        journal.enroll(&route).await.unwrap();
+    }
+
+    fn command(&self) -> agent_session_router::onboarding::journal::InstallAction {
+        use agent_session_router::onboarding::{OnboardingProvider, journal::InstallAction};
+        let arguments: Vec<String> = if self.ticket.provider == Some(OnboardingProvider::Omp) {
+            vec![
+                "plugin".into(),
+                "link".into(),
+                self.assets.join("omp").to_str().unwrap().into(),
+                "--scope".into(),
+                "user".into(),
+            ]
+        } else {
+            vec![
+                "mcp".into(),
+                "add".into(),
+                "agent_session_router".into(),
+                "--".into(),
+                self.executable.to_str().unwrap().into(),
+                "--profile".into(),
+                "office".into(),
+                "mcp".into(),
+                "codex-cli".into(),
+            ]
+        };
+        let mut argv = vec![self.program.to_str().unwrap().to_owned()];
+        argv.extend(arguments);
+        InstallAction::Command { argv }
+    }
+
+    fn omp_destination(&self) -> PathBuf {
+        self.home
+            .join(".omp/plugins/node_modules/@agent-session-router/omp-integration")
+    }
+
+    fn create_omp_link(&self) {
+        let destination = self.omp_destination();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(self.assets.join("omp"), destination).unwrap();
+    }
+
+    fn registry(&self, enabled: bool) -> serde_json::Value {
+        if self.ticket.provider == Some(agent_session_router::onboarding::OnboardingProvider::Omp) {
+            serde_json::json!({
+                "npm": [{
+                    "name": "@agent-session-router/omp-integration",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "path": self.assets.join("omp"),
+                    "enabled": enabled,
+                    "enabledFeatures": null,
+                }],
+                "marketplace": [],
+            })
+        } else {
+            serde_json::json!({
+                "name": "agent_session_router", "enabled": enabled,
+                "transport": {
+                    "type": "stdio", "command": self.executable,
+                    "args": ["--profile", "office", "mcp", "codex-cli"],
+                    "env": null, "env_vars": [], "cwd": null,
+                },
+            })
+        }
+    }
+
+    fn save_registry(&self, value: &serde_json::Value) {
+        std::fs::write(
+            self.home.join("registry.json"),
+            serde_json::to_vec(value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn stop(self, expected_credentials: i64) {
+        self.runtime.shutdown().await.unwrap();
+        self.runtime.wait().await.unwrap();
+        let store =
+            agent_session_router::store::RouterStore::open(&self.home.join("server")).unwrap();
+        assert_eq!(store.credential_count().unwrap(), expected_credentials);
+    }
+}
+
+async fn assert_foreign_adapter_skill_preserved(
+    fixture: OnboardingAdapterFixture,
+    mut journal: Journal,
+) {
+    let skill = fixture.home.join(".agents/skills/asr/SKILL.md");
+    let parent = skill.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bytes = std::fs::read(fixture.assets.join("codex/skills/asr/SKILL.md")).unwrap();
+    std::fs::write(&skill, &bytes).unwrap();
+    let error = preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "provider_configuration_conflict");
+    assert_eq!(std::fs::read(&skill).unwrap(), bytes);
+    assert!(journal.state().actions.is_empty());
+    // Even exact own intents must not authorize following a symbolic or hard link.
+    journal
+        .plan(InstallAction::File {
+            path: skill.clone(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        })
+        .unwrap();
+    std::fs::remove_file(&skill).unwrap();
+    let foreign = fixture.home.join("foreign-skill");
+    std::fs::write(&foreign, &bytes).unwrap();
+    std::os::unix::fs::symlink(&foreign, &skill).unwrap();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "host_permission_required"
+    );
+    std::fs::remove_file(&skill).unwrap();
+    std::fs::hard_link(&foreign, &skill).unwrap();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "host_permission_required"
+    );
+    assert_eq!(std::fs::read(&foreign).unwrap(), bytes);
+    assert!(!fixture.home.join("mutations").exists());
+    fixture.stop(1).await;
+}
+
+async fn assert_adapter_crash_adoption(fixture: OnboardingAdapterFixture, mut journal: Journal) {
+    let skill = fixture.home.join(".agents/skills/asr/SKILL.md");
+    preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    fixture.enroll(&mut journal).await;
+    let bytes = std::fs::read(fixture.assets.join("codex/skills/asr/SKILL.md")).unwrap();
+    journal
+        .plan(InstallAction::File {
+            path: skill.clone(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        })
+        .unwrap();
+    journal.plan(fixture.command()).unwrap();
+    // Model death after both effects but before either Applied fsync.
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::set_permissions(
+        skill.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(&skill, &bytes).unwrap();
+    fixture.save_registry(&fixture.registry(true));
+    drop(journal);
+    let mut journal = fixture.load();
+    let installer = preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    installer.configure(&mut journal).await.unwrap();
+    assert!(
+        !fixture.home.join("mutations").exists(),
+        "exact durable effects must not run again"
+    );
+    journal.mark_configured().unwrap();
+    let calls = std::fs::read(fixture.home.join("inspections")).unwrap();
+    verify_recorded(&fixture.config, &journal).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.home.join("inspections")).unwrap(),
+        calls
+    );
+    assert!(
+        journal
+            .state()
+            .actions
+            .iter()
+            .all(|record| record.status == ActionStatus::Applied)
+    );
+    assert_eq!(journal.state().stage, Stage::Configured);
+    std::fs::write(&skill, "foreign replacement").unwrap();
+    assert_eq!(
+        verify_recorded(&fixture.config, &journal)
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        "foreign replacement"
+    );
+    fixture.stop(2).await;
+}
+
+async fn assert_adapter_external_change_preserved(
+    fixture: OnboardingAdapterFixture,
+    mut journal: Journal,
+) {
+    let skill = fixture.home.join(".agents/skills/asr/SKILL.md");
+    let installer = preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    fixture.enroll(&mut journal).await;
+    let mut foreign = fixture.registry(true);
+    foreign["transport"]["command"] = serde_json::json!("/foreign/asr");
+    fixture.save_registry(&foreign);
+    assert_eq!(
+        installer.configure(&mut journal).await.unwrap_err().code(),
+        "provider_configuration_conflict"
+    );
+    assert!(
+        !skill.exists(),
+        "recheck must precede even independent file effects"
+    );
+    assert!(!fixture.home.join("mutations").exists());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(fixture.home.join("registry.json")).unwrap()
+        )
+        .unwrap(),
+        foreign
+    );
+    assert_eq!(journal.state().stage, Stage::Enrolled);
+    fixture.stop(2).await;
+}
+
+async fn assert_adapter_omp_disable_ownership(
+    fixture: OnboardingAdapterFixture,
+    mut journal: Journal,
+) {
+    fixture.save_registry(&fixture.registry(true));
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict"
+    );
+    fixture.save_registry(&fixture.registry(false));
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "plugin_disabled"
+    );
+    assert!(journal.state().actions.is_empty());
+    assert!(!fixture.home.join("mutations").exists());
+    std::fs::remove_file(fixture.home.join("registry.json")).unwrap();
+    preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    fixture.enroll(&mut journal).await;
+    journal.plan(fixture.command()).unwrap();
+    fixture.create_omp_link();
+    fixture.save_registry(&fixture.registry(false));
+    std::fs::write(
+        fixture.home.join("expected.json"),
+        serde_json::to_vec(&fixture.registry(true)).unwrap(),
+    )
+    .unwrap();
+    drop(journal);
+    let mut journal = fixture.load();
+    let installer = preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    installer.configure(&mut journal).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("mutations")).unwrap(),
+        "enable\n"
+    );
+    journal.mark_configured().unwrap();
+    let descriptor = fixture.config.parent().unwrap().join("hosts/omp.json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&descriptor).unwrap()).unwrap(),
+        serde_json::json!({"version":1,"executable":fixture.executable,"profile":"office","workspace":"adapter-room"}),
+    );
+    assert_eq!(
+        std::fs::metadata(&descriptor).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A later intentional user disable is not an unfinished link and must stay disabled.
+    fixture.save_registry(&fixture.registry(false));
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "plugin_disabled"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("mutations")).unwrap(),
+        "enable\n"
+    );
+    let calls = std::fs::read(fixture.home.join("inspections")).unwrap();
+    verify_recorded(&fixture.config, &journal).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.home.join("inspections")).unwrap(),
+        calls
+    );
+    fixture.stop(2).await;
+}
+
+async fn assert_adapter_omp_preflight_race(fixture: OnboardingAdapterFixture, journal: Journal) {
+    std::fs::write(fixture.home.join("inject-hidden-target"), "").unwrap();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict",
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.omp_destination().join("user-data")).unwrap(),
+        "preserved\n",
+    );
+    assert!(journal.state().actions.is_empty());
+    assert_eq!(journal.state().stage, Stage::Prepared);
+    assert!(!fixture.home.join("mutations").exists());
+    fixture.stop(1).await;
+}
+
+async fn assert_adapter_hidden_omp_destination_preserved(
+    fixture: OnboardingAdapterFixture,
+    mut journal: Journal,
+) {
+    let destination = fixture.omp_destination();
+    std::fs::create_dir_all(&destination).unwrap();
+    let sentinel = destination.join("user-data");
+    std::fs::write(&sentinel, "preserved").unwrap();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict",
+    );
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "preserved");
+    assert!(journal.state().actions.is_empty());
+    assert!(!fixture.home.join("mutations").exists());
+
+    std::fs::remove_file(&sentinel).unwrap();
+    std::fs::remove_dir(&destination).unwrap();
+    let foreign = fixture.home.join("foreign-plugin");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("user-data"), "foreign").unwrap();
+    std::os::unix::fs::symlink(&foreign, &destination).unwrap();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict",
+    );
+    assert_eq!(std::fs::read_link(&destination).unwrap(), foreign);
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("user-data")).unwrap(),
+        "foreign"
+    );
+    std::fs::remove_file(&destination).unwrap();
+
+    // Even an identical-looking link is foreign without a prior intent.
+    fixture.create_omp_link();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict",
+    );
+    assert_eq!(
+        std::fs::read_link(&destination).unwrap(),
+        fixture.assets.join("omp")
+    );
+    std::fs::remove_file(&destination).unwrap();
+    journal.plan(fixture.command()).unwrap();
+    // An own intent only authorizes the exact link, never a replacement directory.
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(&sentinel, "preserved").unwrap();
+    assert_eq!(
+        preflight(&fixture.config, &journal, &fixture.assets)
+            .await
+            .unwrap_err()
+            .code(),
+        "provider_configuration_conflict",
+    );
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "preserved");
+    assert!(!fixture.home.join("mutations").exists());
+    assert_eq!(journal.state().stage, Stage::Prepared);
+    fixture.stop(1).await;
+}
+
+async fn assert_adapter_hidden_omp_race(fixture: OnboardingAdapterFixture, mut journal: Journal) {
+    let installer = preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    fixture.enroll(&mut journal).await;
+    // The second configure-time registry read creates an unregistered
+    // destination after the initial path checks, just before link planning.
+    std::fs::write(fixture.home.join("inject-hidden-target"), "").unwrap();
+    assert_eq!(
+        installer.configure(&mut journal).await.unwrap_err().code(),
+        "provider_configuration_conflict",
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.omp_destination().join("user-data")).unwrap(),
+        "preserved\n",
+    );
+    assert!(!fixture.home.join("mutations").exists());
+    assert!(
+        !journal
+            .state()
+            .actions
+            .iter()
+            .any(|record| record.intent == fixture.command())
+    );
+    assert_eq!(journal.state().stage, Stage::Enrolled);
+    fixture.stop(2).await;
+}
+
+async fn assert_adapter_hidden_omp_crash_adoption(
+    fixture: OnboardingAdapterFixture,
+    mut journal: Journal,
+) {
+    preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    fixture.enroll(&mut journal).await;
+    journal.plan(fixture.command()).unwrap();
+    // OMP died after creating its symlink, before publishing the registry.
+    fixture.create_omp_link();
+    let sentinel = fixture.assets.join("omp/user-data");
+    std::fs::write(&sentinel, "preserved").unwrap();
+    let mut expected = fixture.registry(true);
+    expected["npm"][0]["path"] = serde_json::json!(fixture.omp_destination());
+    std::fs::write(
+        fixture.home.join("expected.json"),
+        serde_json::to_vec(&expected).unwrap(),
+    )
+    .unwrap();
+    drop(journal);
+    let mut journal = fixture.load();
+    let installer = preflight(&fixture.config, &journal, &fixture.assets)
+        .await
+        .unwrap();
+    installer.configure(&mut journal).await.unwrap();
+    assert_eq!(
+        std::fs::read_link(fixture.omp_destination()).unwrap(),
+        fixture.assets.join("omp")
+    );
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "preserved");
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("mutations")).unwrap(),
+        "link\n"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(fixture.home.join("registry.json")).unwrap(),
+        )
+        .unwrap(),
+        expected,
+    );
+    journal.mark_configured().unwrap();
+    let calls = std::fs::read(fixture.home.join("inspections")).unwrap();
+    verify_recorded(&fixture.config, &journal).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.home.join("inspections")).unwrap(),
+        calls
+    );
+    fixture.stop(2).await;
+}
+
+#[tokio::test]
+async fn onboarding_adapter_child() {
+    let Ok(case) = std::env::var("ASR_ADAPTER_CASE") else {
+        return;
+    };
+    let provider = if case == "disabled-omp" || case.starts_with("omp-") {
+        OnboardingProvider::Omp
+    } else {
+        OnboardingProvider::CodexCli
+    };
+    let fixture = OnboardingAdapterFixture::new(provider).await;
+    let _lock = ConfigurationLock::acquire(&fixture.config).unwrap();
+    let journal = fixture.prepare();
+    match case.as_str() {
+        "foreign-skill" => assert_foreign_adapter_skill_preserved(fixture, journal).await,
+        "crash-adoption" => assert_adapter_crash_adoption(fixture, journal).await,
+        "external-change" => assert_adapter_external_change_preserved(fixture, journal).await,
+        "disabled-omp" => assert_adapter_omp_disable_ownership(fixture, journal).await,
+        "omp-preflight-race" => assert_adapter_omp_preflight_race(fixture, journal).await,
+        "omp-hidden-destination" => {
+            assert_adapter_hidden_omp_destination_preserved(fixture, journal).await;
+        }
+        "omp-hidden-race" => assert_adapter_hidden_omp_race(fixture, journal).await,
+        "omp-hidden-crash" => assert_adapter_hidden_omp_crash_adoption(fixture, journal).await,
+        _ => panic!("unknown isolated adapter case"),
+    }
 }

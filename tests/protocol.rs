@@ -248,3 +248,126 @@ fn task_history_response_is_typed_and_strict() {
         RouterErrorCode::InvalidMessage
     );
 }
+
+#[test]
+fn onboarding_issue_accepts_only_server_scoped_authority() {
+    let raw = serde_json::json!({
+        "type": "onboarding_invite_issue",
+        "requestId": "invite-1",
+        "workspace": "team-room",
+        "createWorkspace": true,
+        "provider": "claude-code"
+    });
+    let parsed = parse_client_message(&raw.to_string()).expect("valid invitation request");
+    assert_eq!(parsed.request_id(), Some("invite-1"));
+    assert!(matches!(
+        parsed,
+        agent_session_router::protocol::ClientMessage::OnboardingInviteIssue {
+            create_workspace: true,
+            provider: Some(agent_session_router::onboarding::OnboardingProvider::ClaudeCode),
+            ..
+        }
+    ));
+    for (field, value) in [
+        ("role", serde_json::json!("operator")),
+        ("subject", serde_json::json!("admin")),
+        ("workspaces", serde_json::json!(["other-room"])),
+        ("provider", serde_json::json!("generic")),
+        ("workspace", serde_json::json!("../room")),
+        ("requestId", serde_json::json!("")),
+        ("createWorkspace", serde_json::json!("true")),
+    ] {
+        let mut invalid = raw.clone();
+        invalid[field] = value;
+        assert_eq!(
+            parse_error(&invalid.to_string()),
+            RouterErrorCode::InvalidMessage,
+            "{field} must not bypass the invitation contract"
+        );
+    }
+    let mut missing = raw;
+    missing.as_object_mut().unwrap().remove("createWorkspace");
+    assert_eq!(
+        parse_error(&missing.to_string()),
+        RouterErrorCode::InvalidMessage
+    );
+}
+
+#[test]
+fn onboarding_invitation_response_rejects_invalid_identity_and_secret() {
+    let raw = serde_json::json!({
+        "type": "onboarding_invite_issued",
+        "requestId": "invite-1",
+        "serverId": uuid::Uuid::new_v4(),
+        "inviteId": uuid::Uuid::new_v4(),
+        "inviteToken": TOKEN,
+        "expiresAt": 600_001,
+        "workspace": "team-room",
+        "provider": null
+    });
+    let parsed = parse_server_message(&raw.to_string()).expect("valid invitation response");
+    assert_eq!(parsed.request_id(), Some("invite-1"));
+    assert!(matches!(
+        parsed,
+        ServerMessage::OnboardingInviteIssued { provider: None, .. }
+    ));
+    for (field, value) in [
+        ("serverId", serde_json::json!(uuid::Uuid::nil())),
+        ("inviteId", serde_json::json!(uuid::Uuid::nil())),
+        ("inviteToken", serde_json::json!("malformed-secret")),
+        ("expiresAt", serde_json::json!(0)),
+        ("expiresAt", serde_json::json!(9_007_199_254_740_992_i64)),
+        ("provider", serde_json::json!("unknown")),
+        ("credentialToken", serde_json::json!(TOKEN)),
+    ] {
+        let mut invalid = raw.clone();
+        invalid[field] = value;
+        assert_eq!(
+            parse_server_message(&invalid.to_string()).err(),
+            Some(RouterErrorCode::InvalidMessage),
+            "{field} must be validated"
+        );
+    }
+}
+
+#[test]
+fn onboarding_revoke_requires_a_non_nil_invitation_identity() {
+    let invite_id = uuid::Uuid::new_v4();
+    let request = serde_json::json!({
+        "type": "onboarding_invite_revoke",
+        "requestId": "revoke-1",
+        "inviteId": invite_id
+    });
+    let response = serde_json::json!({
+        "type": "onboarding_invite_revoked",
+        "requestId": "revoke-1",
+        "inviteId": invite_id
+    });
+    assert_eq!(
+        parse_client_message(&request.to_string())
+            .unwrap()
+            .request_id(),
+        Some("revoke-1")
+    );
+    assert!(matches!(
+        parse_server_message(&response.to_string()).unwrap(),
+        ServerMessage::OnboardingInviteRevoked { invite_id: revoked, .. } if revoked == invite_id
+    ));
+    for (field, value) in [
+        ("inviteId", serde_json::json!(uuid::Uuid::nil())),
+        ("id", serde_json::json!(invite_id)),
+    ] {
+        let mut invalid_request = request.clone();
+        invalid_request[field] = value.clone();
+        assert_eq!(
+            parse_error(&invalid_request.to_string()),
+            RouterErrorCode::InvalidMessage
+        );
+        let mut invalid_response = response.clone();
+        invalid_response[field] = value;
+        assert_eq!(
+            parse_server_message(&invalid_response.to_string()).err(),
+            Some(RouterErrorCode::InvalidMessage)
+        );
+    }
+}

@@ -35,6 +35,7 @@ use crate::{
     },
     install::{self, InstallOutcome},
     integrations::IntegrationPublic,
+    onboarding::OnboardingProvider,
     process::{
         self, AdminControl, HealthProbe, NativeChildConfig, NativeChildSupervisor, NativeLauncher,
         OwnedServe, ProbeFailure, ProcessFuture, ProfilePublisher, ReqwestHealthProbe,
@@ -54,6 +55,7 @@ use crate::{
         ExternalResolutionOutcome, StopEvidence as TaskStopEvidence, TaskDetail, TaskEvent,
         TaskMutationResult, TaskState, TaskSummary,
     },
+    tui::{self, UiExit, UiOptions, state::Ownership},
 };
 
 const CHILD_COMMAND: &str = "__router-child";
@@ -156,6 +158,7 @@ async fn run_cli(arguments: &[OsString]) -> Result<i32, CliError> {
         .as_ref()
         .ok_or_else(|| CliError::usage("command_required", "a command is required"))?;
     cli::validate_command(command).map_err(|error| attach_command_ids(error, command))?;
+    cli::validate_globals(&cli)?;
     if cli.dry_run {
         let plan = cli::plan_dry_run(&cli, &mut RandomOperationIds)?;
         cli::write_dry_run_plan(&mut io::stdout().lock(), &plan)?;
@@ -215,12 +218,13 @@ fn interactive_selection() -> Result<Option<Cli>, CliError> {
     output
         .write_all(
             b"Agent Session Router\n\
-              1) Start local router in background\n\
+              1) Start router and open console\n\
               2) Stop local router\n\
               3) List profiles\n\
               4) List workspaces on this device\n\
               5) List credentials on this device\n\
               6) Run doctor\n\
+              7) Open console for running router\n\
               q) Cancel\n\
               Selection: ",
         )
@@ -234,17 +238,18 @@ fn interactive_selection() -> Result<Option<Cli>, CliError> {
         .read_line(&mut choice)
         .map_err(|error| CliError::runtime("input_failed", error.to_string()))?;
     let arguments: Option<&[&str]> = match choice.trim() {
-        "1" => Some(&["asr", "router", "start", "--background"]),
+        "1" => Some(&["asr", "router", "start"]),
         "2" => Some(&["asr", "router", "stop"]),
         "3" => Some(&["asr", "profile", "list"]),
         "4" => Some(&["asr", "--profile", DEVICE_PROFILE, "workspace", "list"]),
         "5" => Some(&["asr", "--profile", DEVICE_PROFILE, "credential", "list"]),
         "6" => Some(&["asr", "doctor"]),
+        "7" => Some(&["asr", "ui"]),
         "q" | "Q" | "" => None,
         _ => {
             return Err(CliError::usage(
                 "invalid_selection",
-                "menu selection must be 1 through 6 or q",
+                "menu selection must be 1 through 7 or q",
             ));
         }
     };
@@ -264,11 +269,13 @@ async fn dispatch(cli: &Cli, stdin: Option<StdinPayload>) -> Result<i32, CliErro
     match command {
         Command::Profile(args) => profile_command(&args.command),
         Command::Install(args) => install_command(args.bin_dir.as_deref()),
-        Command::Router(args) => router_command(args.action, args.background, args.share).await,
+        Command::Router(args) => router_command(cli, args).await,
+        Command::Ui(args) => ui_command(cli, args).await,
         Command::Workspace(args) => workspace_command(cli, &args.command, stdin).await,
         Command::Task(args) => task_command(cli, &args.command, stdin).await,
         Command::Integration(args) => integration_command(cli, &args.command).await,
         Command::Credential(args) => credential_command(cli, &args.command).await,
+        Command::Onboarding(args) => onboarding_command(cli, &args.command).await,
         Command::Doctor => doctor_command(cli).await,
         Command::Mcp(args) => mcp_command(cli, args).await,
         Command::Codex(args) => codex_command(cli, args).await,
@@ -283,13 +290,16 @@ async fn dispatch(cli: &Cli, stdin: Option<StdinPayload>) -> Result<i32, CliErro
 }
 
 async fn mcp_command(cli: &Cli, args: &cli::McpArgs) -> Result<i32, CliError> {
-    let invocation = hosts::mcp_invocation(
+    let mut invocation = hosts::mcp_invocation(
         args,
         cli.profile.as_deref(),
         cli.credential.as_deref(),
         cli.dry_run,
     )
     .map_err(|error| host_error(&error))?;
+    hosts::resolve_mcp_route(&mut invocation)
+        .await
+        .map_err(|error| host_error(&error))?;
     hosts::run_mcp_stdio(
         invocation.role,
         invocation.agent_id,
@@ -306,10 +316,28 @@ fn selected_agent_credential(
     requested_agent: Option<&str>,
     side: AgentSide,
     client: AgentClient,
-) -> Result<(config::Selection, PathBuf, CredentialFile), CliError> {
-    let selection = config::select(cli.profile.as_deref(), cli.credential.as_deref())
-        .map_err(|error| config_error(&error))?;
+) -> Result<(config::ProviderSelection, PathBuf, CredentialFile), CliError> {
+    let provider = match (side, client) {
+        (AgentSide::Claude, AgentClient::ClaudeCode) => Some(OnboardingProvider::ClaudeCode),
+        (AgentSide::Codex, AgentClient::CodexCli) => Some(OnboardingProvider::CodexCli),
+        (AgentSide::Generic, AgentClient::Omp) => Some(OnboardingProvider::Omp),
+        _ => None,
+    };
+    let selection = if let Some(provider) = provider {
+        config::select_provider(cli.profile.as_deref(), cli.credential.as_deref(), provider)
+            .map_err(|error| config_error(&error))?
+    } else {
+        config::ProviderSelection {
+            selection: config::select(cli.profile.as_deref(), cli.credential.as_deref())
+                .map_err(|error| config_error(&error))?,
+            routes: Vec::new(),
+            ca_file: None,
+            initial_workspace: None,
+            expected_server_id: None,
+        }
+    };
     let credential_path = selection
+        .selection
         .credential_file
         .clone()
         .ok_or_else(|| config_error(&config::ConfigError::Required))?;
@@ -333,12 +361,42 @@ fn child_selection(
     requested_agent: Option<&str>,
     side: AgentSide,
     client: AgentClient,
-) -> Result<McpChildSelection, CliError> {
-    let (_, credential_file, _) = selected_agent_credential(cli, requested_agent, side, client)?;
-    Ok(McpChildSelection {
-        profile: cli.profile.clone(),
-        credential_file: Some(credential_file),
-    })
+) -> Result<(McpChildSelection, Option<WorkspaceName>), CliError> {
+    let (selection, credential_file, _) =
+        selected_agent_credential(cli, requested_agent, side, client)?;
+    let pinned = selection.expected_server_id.is_some();
+    let workspace = selection.initial_workspace;
+    // A binding belongs to its named profile, not to every MCP registration
+    // inherited by this wrapper. Only promote a user-supplied override.
+    let explicit_credential = cli.credential.is_some()
+        || env::var_os("ASR_CREDENTIAL_FILE").is_some_and(|value| !value.is_empty());
+    Ok((
+        McpChildSelection {
+            profile: if pinned {
+                selection.selection.profile
+            } else {
+                cli.profile.clone()
+            },
+            credential_file: explicit_credential.then_some(credential_file),
+        },
+        workspace,
+    ))
+}
+
+fn stock_workspace(
+    explicit: Option<&str>,
+    bound: Option<WorkspaceName>,
+) -> Result<Option<WorkspaceName>, CliError> {
+    if let Some(value) = explicit {
+        return workspace_name(value).map(Some);
+    }
+    if let Some(value) = env::var_os("ASR_WORKSPACE").filter(|value| !value.is_empty()) {
+        let value = value
+            .into_string()
+            .map_err(|_| config_error(&config::ConfigError::Invalid))?;
+        return workspace_name(&value).map(Some);
+    }
+    Ok(bound)
 }
 
 fn primary_client_config(
@@ -361,7 +419,7 @@ fn primary_client_config(
     .token()
     .clone();
     Ok(ClientConfig {
-        router_url: selection.router_url,
+        router_url: selection.selection.router_url,
         role: ClientRole::Primary {
             agent: AgentRegistration {
                 agent_id: credential.subject.clone(),
@@ -422,13 +480,13 @@ async fn codex_command(cli: &Cli, args: &cli::ProviderArgs) -> Result<i32, CliEr
 }
 
 fn codex_cli_command(cli: &Cli, args: &cli::CodexCliArgs) -> Result<i32, CliError> {
-    let selection = child_selection(
+    let (selection, bound_workspace) = child_selection(
         cli,
         args.agent.as_deref(),
         AgentSide::Codex,
         AgentClient::CodexCli,
     )?;
-    let workspace = args.workspace.as_deref().map(workspace_name).transpose()?;
+    let workspace = stock_workspace(args.workspace.as_deref(), bound_workspace)?;
     let (current_executable, caller_cwd, _) = host_context()?;
     let plan = hosts::stock_codex_plan(
         required_executable("codex")?.into_os_string(),
@@ -443,13 +501,13 @@ fn codex_cli_command(cli: &Cli, args: &cli::CodexCliArgs) -> Result<i32, CliErro
 }
 
 fn claude_command(cli: &Cli, args: &cli::ClaudeArgs) -> Result<i32, CliError> {
-    let selection = child_selection(
+    let (selection, bound_workspace) = child_selection(
         cli,
         args.agent.as_deref(),
         AgentSide::Claude,
         AgentClient::ClaudeCode,
     )?;
-    let workspace = args.workspace.as_deref().map(workspace_name).transpose()?;
+    let workspace = stock_workspace(args.workspace.as_deref(), bound_workspace)?;
     let (_, caller_cwd, _) = host_context()?;
     let plan = hosts::stock_claude_plan(
         required_executable("claude")?.into_os_string(),
@@ -463,13 +521,13 @@ fn claude_command(cli: &Cli, args: &cli::ClaudeArgs) -> Result<i32, CliError> {
 }
 
 async fn omp_command(cli: &Cli, args: &cli::OmpArgs) -> Result<i32, CliError> {
-    let selection = child_selection(
+    let (selection, bound_workspace) = child_selection(
         cli,
         args.agent.as_deref(),
         AgentSide::Generic,
         AgentClient::Omp,
     )?;
-    let workspace = args.workspace.as_deref().map(workspace_name).transpose()?;
+    let workspace = stock_workspace(args.workspace.as_deref(), bound_workspace)?;
     let (current_executable, caller_cwd, source_environment) = host_context()?;
     let program = required_executable("omp")?;
     hosts::preflight_omp_plugin(
@@ -705,12 +763,9 @@ fn profile_command(command: &ProfileCommand) -> Result<i32, CliError> {
             }
             let url =
                 config::normalize_router_url(address).map_err(|error| config_error(&error))?;
-            stored.profiles.insert(
-                name.clone(),
-                Profile {
-                    router_url: url.to_string(),
-                },
-            );
+            stored
+                .profiles
+                .insert(name.clone(), Profile::manual(url.to_string()));
             stored.default_profile = Some(name.clone());
             config::save_config(&path, &stored).map_err(|error| config_error(&error))?;
             println!("selected profile {name}");
@@ -744,11 +799,7 @@ fn install_command(bin_dir: Option<&Path>) -> Result<i32, CliError> {
     Ok(0)
 }
 
-async fn router_command(
-    action: RouterAction,
-    background: bool,
-    share: Option<ShareMode>,
-) -> Result<i32, CliError> {
+async fn router_command(cli: &Cli, args: &cli::RouterArgs) -> Result<i32, CliError> {
     let data_dir = absolute_data_dir()?;
     ensure_private_directory(&data_dir, true)
         .map_err(|error| CliError::runtime("launcher_permissions", error.to_string()))?;
@@ -766,10 +817,11 @@ async fn router_command(
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from)
         });
-    let mut launcher = native_launcher(&data_dir, bind, ca_file)?;
-    match action {
+    let mut launcher = native_launcher(&data_dir, bind, ca_file.clone())?;
+    match args.action {
         RouterAction::Start => {
-            let share = match share {
+            let auto_ui = terminal_available() && !args.background && !args.no_ui;
+            let share = match args.share {
                 None => ShareRequest::Local,
                 Some(ShareMode::Auto) => ShareRequest::Auto,
                 Some(ShareMode::Tailscale) => ShareRequest::Tailscale,
@@ -780,11 +832,23 @@ async fn router_command(
                     bind,
                     share,
                     tls,
-                    background,
+                    background: args.background || auto_ui,
                     instance_id: None,
                 })
                 .await
                 .map_err(|error| launch_error(&error))?;
+            if auto_ui {
+                let (record, ownership) = match outcome {
+                    StartOutcome::Started(record) => (record, Ownership::Owned),
+                    StartOutcome::Reused(record) => (record, Ownership::Reused),
+                    StartOutcome::ForegroundExited { code, .. } => return Ok(code),
+                };
+                let (config, options) =
+                    owned_console_connection(cli, record, data_dir, ca_file, ownership, None)
+                        .await
+                        .map_err(console_start_error)?;
+                return run_console(config, options, true).await;
+            }
             match outcome {
                 StartOutcome::Reused(record) => {
                     println!("router already running at {}", record.control_url);
@@ -808,6 +872,248 @@ async fn router_command(
     Ok(0)
 }
 
+fn terminal_available() -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && env::var_os("TERM").is_none_or(|term| term != "dumb")
+}
+
+async fn ui_command(cli: &Cli, args: &cli::UiArgs) -> Result<i32, CliError> {
+    if !terminal_available() {
+        return Err(CliError::runtime(
+            "terminal_required",
+            "the console requires terminal stdin and stdout and TERM other than dumb",
+        ));
+    }
+    let (config, options) = ui_connection(cli, args).await?;
+    run_console(config, options, false).await
+}
+
+async fn ui_connection(
+    cli: &Cli,
+    args: &cli::UiArgs,
+) -> Result<(ClientConfig, UiOptions), CliError> {
+    let workspace = args.workspace.as_deref().map(workspace_name).transpose()?;
+    let explicit_endpoint =
+        cli.profile.is_some() || env::var("ROUTER_URL").is_ok_and(|value| !value.trim().is_empty());
+    let (config, options) = if explicit_endpoint {
+        let (config, profile_name) = operator_client_config(cli)?;
+        let owned = owned_runtime_for_url(&config.router_url);
+        let (owned_runtime, owned_data_dir) = if let Some((data_dir, record)) = owned {
+            if verify_owned_runtime(&data_dir, &record, &config, false).await? {
+                (Some(record), Some(data_dir))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        let ownership = if owned_runtime.is_some() {
+            Ownership::Reused
+        } else {
+            Ownership::Remote
+        };
+        (
+            config,
+            UiOptions {
+                profile_name,
+                workspace,
+                owned_runtime,
+                ownership,
+                owned_data_dir,
+            },
+        )
+    } else {
+        let data_dir = absolute_data_dir()?;
+        let record = read_owned_runtime(&data_dir)?.ok_or_else(router_not_running)?;
+        let ca_file = env::var_os("ASR_CA_FILE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        owned_console_connection(cli, record, data_dir, ca_file, Ownership::Reused, workspace)
+            .await?
+    };
+    Ok((config, options))
+}
+
+async fn owned_console_connection(
+    cli: &Cli,
+    record: RuntimeRecord,
+    data_dir: PathBuf,
+    ca_file: Option<PathBuf>,
+    ownership: Ownership,
+    workspace: Option<WorkspaceName>,
+) -> Result<(ClientConfig, UiOptions), CliError> {
+    let credential_path = cli.credential.clone().or_else(|| {
+        env::var_os("ASR_CREDENTIAL_FILE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    });
+    let config = owned_ui_config(&record, &data_dir, ca_file, credential_path.as_deref())?;
+    let admin = verify_owned_runtime(&data_dir, &record, &config, true).await?;
+    if credential_path.is_none() && !admin {
+        return Err(CliError::runtime(
+            "permission_denied",
+            "the owned credential is not an administrator",
+        ));
+    }
+    Ok((
+        config,
+        UiOptions {
+            profile_name: None,
+            workspace,
+            owned_runtime: admin.then_some(record),
+            ownership: if admin { ownership } else { Ownership::Remote },
+            owned_data_dir: admin.then_some(data_dir),
+        },
+    ))
+}
+
+fn read_owned_runtime(data_dir: &Path) -> Result<Option<RuntimeRecord>, CliError> {
+    match data_dir.try_exists() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(_) => return Err(launch_error(&RouterLaunchError::Io)),
+    }
+    RuntimeStore::new(data_dir.to_path_buf())
+        .and_then(|store| store.read())
+        .map_err(|error| launch_error(&error))
+}
+
+fn owned_runtime_for_url(router_url: &Url) -> Option<(PathBuf, RuntimeRecord)> {
+    // An explicit endpoint never acquires authority from missing or unverifiable local state.
+    let data_dir = absolute_data_dir().ok()?;
+    let record = read_owned_runtime(&data_dir).ok()??;
+    (record.control_url == router_url.as_str()).then_some((data_dir, record))
+}
+
+async fn verify_owned_runtime(
+    data_dir: &Path,
+    record: &RuntimeRecord,
+    config: &ClientConfig,
+    implicit_owned: bool,
+) -> Result<bool, CliError> {
+    let store = RuntimeStore::new(data_dir.to_path_buf()).map_err(|error| launch_error(&error))?;
+    let _lock = store.lock().map_err(|error| launch_error(&error))?;
+    if store.read().map_err(|error| launch_error(&error))?.as_ref() != Some(record) {
+        return Err(launch_error(&RouterLaunchError::InstanceChanged));
+    }
+    let marker = ReqwestHealthProbe::new(config.ca_file.clone())
+        .probe(record)
+        .await
+        .map_err(|failure| {
+            if implicit_owned && failure == ProbeFailure::ConnectionRefused {
+                router_not_running()
+            } else {
+                launch_error(&RouterLaunchError::Health(failure))
+            }
+        })?;
+    marker
+        .verify(record.instance_id)
+        .map_err(|error| launch_error(&error))?;
+    let (client, _) = RouterClient::connect(config.clone())
+        .await
+        .map_err(|error| client_error(&error))?;
+    // The file's claims are not authority: a scoped token must not unlock local admin actions.
+    let admin = client.operator_is_admin() == Some(true);
+    client.close().await.map_err(|error| client_error(&error))?;
+    Ok(admin)
+}
+
+fn owned_ui_config(
+    record: &RuntimeRecord,
+    data_dir: &Path,
+    ca_file: Option<PathBuf>,
+    explicit_credential: Option<&Path>,
+) -> Result<ClientConfig, CliError> {
+    let admin_path = data_dir.join(ADMIN_CREDENTIAL);
+    let credential = read_credential(explicit_credential.unwrap_or(&admin_path)).map_err(|_| {
+        CliError::runtime(
+            "credential_invalid",
+            "console operator credential is invalid",
+        )
+    })?;
+    if credential.role != CredentialRole::Operator
+        || (explicit_credential.is_none()
+            && (credential.subject != "admin" || !credential.workspaces.is_empty()))
+    {
+        return Err(CliError::runtime(
+            "credential_invalid",
+            "console requires an operator credential",
+        ));
+    }
+    Ok(ClientConfig {
+        router_url: Url::parse(&record.control_url)
+            .map_err(|_| launch_error(&RouterLaunchError::InvalidRuntimeRecord))?,
+        role: ClientRole::Operator { credential },
+        ca_file,
+    })
+}
+
+async fn run_console(
+    config: ClientConfig,
+    options: UiOptions,
+    known_running: bool,
+) -> Result<i32, CliError> {
+    let ca_file = config.ca_file.clone();
+    let owned = options
+        .owned_runtime
+        .as_ref()
+        .zip(options.owned_data_dir.as_ref())
+        .map(|(record, data_dir)| (record.instance_id, data_dir.clone()));
+    match tui::run(config, options).await {
+        Ok(UiExit::Detached) => {
+            println!(
+                "Console detached; router was not stopped. Run `asr ui` to reattach; reuse explicit profile/credential options for remote or scoped sessions."
+            );
+        }
+        Ok(UiExit::StopOwnedRouter) => {
+            let (instance, data_dir) = owned.ok_or_else(|| {
+                CliError::runtime(
+                    "permission_denied",
+                    "only a verified owned admin console may stop the router",
+                )
+            })?;
+            // run has restored the terminal before returning this explicit stop request.
+            let bind = DEFAULT_BIND.parse().expect("constant loopback bind");
+            let mut launcher = native_launcher(&data_dir, bind, ca_file)?;
+            match launcher
+                .stop_if_instance(instance)
+                .await
+                .map_err(|error| launch_error(&error))?
+            {
+                StopOutcome::NotRunning => println!("router is not running"),
+                StopOutcome::StaleRecovered => println!("removed stale router state"),
+                StopOutcome::Stopped(record) => {
+                    println!("router stopped at {}", record.control_url);
+                }
+            }
+        }
+        Err(error) => {
+            let error = CliError::runtime(error.code, error.message);
+            return Err(if known_running || owned.is_some() {
+                console_start_error(error)
+            } else {
+                error
+            });
+        }
+    }
+    Ok(0)
+}
+
+fn console_start_error(mut error: CliError) -> CliError {
+    error
+        .message
+        .push_str("; the server remains running; run `asr ui` to reattach");
+    error
+}
+
+fn router_not_running() -> CliError {
+    CliError::runtime(
+        "router_not_running",
+        "no running owned router; run `asr router start`",
+    )
+}
+
 type ApplicationLauncher = NativeLauncher<
     ReqwestHealthProbe,
     AuthenticatedAdmin,
@@ -825,13 +1131,21 @@ fn native_launcher(
         .map_err(|error| CliError::runtime("child_launch_failed", error.to_string()))?;
     let cwd = env::current_dir()
         .map_err(|error| CliError::runtime("child_launch_failed", error.to_string()))?;
-    let environment = env::vars_os()
+    let configured_assets = env::var_os("ASR_BOOTSTRAP_DIR").filter(|value| !value.is_empty());
+    let assets_dir = process::bootstrap_assets_directory(data_dir, &cwd, configured_assets.clone());
+    let bootstrap_validation = configured_assets.is_some() || assets_dir.exists();
+    let mut environment: Vec<_> = env::vars_os()
         .filter(|(key, _)| {
             key != "ASR_LAUNCH_INSTANCE_ID"
                 && key != "ASR_BACKGROUND_CHILD"
                 && key != "ASR_RUNTIME_SHARE_MODE"
+                && key != "ASR_BOOTSTRAP_DIR"
         })
         .collect();
+    environment.push((
+        OsString::from("ASR_BOOTSTRAP_DIR"),
+        assets_dir.into_os_string(),
+    ));
     let child = NativeChildSupervisor::new(NativeChildConfig {
         program: current_exe,
         arguments: vec![
@@ -846,6 +1160,11 @@ fn native_launcher(
         stderr_file: data_dir.join("router.stderr.log"),
         signal_process_group: true,
     });
+    let child = if bootstrap_validation {
+        child.with_startup_timeout(Duration::from_secs(120))
+    } else {
+        child
+    };
     let store = RuntimeStore::new(data_dir.to_path_buf()).map_err(|error| launch_error(&error))?;
     let admin = AuthenticatedAdmin {
         data_dir: data_dir.to_path_buf(),
@@ -897,7 +1216,12 @@ async fn run_owned_child(arguments: &[OsString]) -> Result<i32, CliError> {
     } else {
         RouterExposure::Direct
     };
+    let cwd = env::current_dir()
+        .map_err(|error| CliError::runtime("child_launch_failed", error.to_string()))?;
+    let assets_dir =
+        process::bootstrap_assets_directory(&data_dir, &cwd, env::var_os("ASR_BOOTSTRAP_DIR"));
     let mut runtime = RouterRuntime::start_paused(RouterConfig {
+        onboarding_assets_dir: Some(assets_dir),
         bind,
         data_dir,
         instance_id,
@@ -1043,11 +1367,16 @@ impl ProfilePublisher for LocalProfilePublisher {
         _record: &RuntimeRecord,
     ) -> Result<(), RouterLaunchError> {
         let mut stored = config::load_config(&self.path).map_err(|_| RouterLaunchError::Profile)?;
+        if stored
+            .profiles
+            .get(DEVICE_PROFILE)
+            .is_some_and(|profile| profile.server_id.is_some())
+        {
+            return Ok(());
+        }
         stored.profiles.insert(
             DEVICE_PROFILE.to_owned(),
-            Profile {
-                router_url: router_url.to_owned(),
-            },
+            Profile::manual(router_url.to_owned()),
         );
         config::save_config(&self.path, &stored).map_err(|_| RouterLaunchError::Profile)
     }
@@ -1095,7 +1424,7 @@ impl TailscaleControl for AvailableTailscale {
     }
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
     env::var_os("PATH").and_then(|path| {
         env::split_paths(&path).find_map(|directory| {
@@ -2350,6 +2679,85 @@ async fn wait_send_result(
     .map_err(|_| CliError::runtime("request_timeout", "agent request timed out"))?
 }
 
+async fn onboarding_command(cli: &Cli, command: &cli::OnboardingCommand) -> Result<i32, CliError> {
+    match command {
+        cli::OnboardingCommand::Install { provider, .. } => {
+            // Keep token-bearing input out of the general, Debug-visible stdin payload.
+            let bytes =
+                cli::read_bounded(&mut io::stdin().lock(), crate::onboarding::MAX_TICKET_BYTES)?;
+            let ticket = crate::onboarding::OnboardingTicket::parse(&bytes)
+                .map_err(|error| CliError::usage("invalid_ticket", error.to_string()))?;
+            let report = crate::onboarding::install::install(&ticket, *provider).await?;
+            write_json(&report)?;
+        }
+        cli::OnboardingCommand::Resume {
+            invite_id,
+            provider,
+        } => {
+            let report = crate::onboarding::install::resume(*invite_id, *provider).await?;
+            write_json(&report)?;
+        }
+        cli::OnboardingCommand::Status { provider, json } => {
+            let profile = cli.profile.as_deref().ok_or_else(|| {
+                CliError::usage("onboarding_profile_required", "use --profile NAME")
+            })?;
+            let report = crate::onboarding::install::status(profile, *provider).await?;
+            if *json {
+                write_json(&report)?;
+            } else {
+                print_field("profile", &report.profile);
+                print_field("provider", report.provider.as_str());
+                print_field("serverId", &report.server_id.to_string());
+                print_field("workspace", report.workspace.as_str());
+                print_field("route", &report.route);
+                print_serialized_field("stage", &report.stage)?;
+                print_field("transport", report.transport.unwrap_or("unreachable"));
+                print_field("activation", report.activation);
+                print_field("nextAction", &report.next_action);
+            }
+        }
+        cli::OnboardingCommand::Prompt(args) => {
+            if cli.profile.is_some() || cli.credential.is_some() {
+                return Err(CliError::usage(
+                    "owned_server_required",
+                    "onboarding prompt uses the owned server; omit --profile and --credential",
+                ));
+            }
+            let prompt = crate::onboarding::issue::issue_prompt(&absolute_data_dir()?, crate::onboarding::issue::PromptOptions {
+                workspace: workspace_name(&args.workspace)?, create_workspace: args.create_workspace,
+                name: args.name.clone(), provider: args.provider, endpoints: args.endpoints.clone(), ca_file: args.ca_file.clone(),
+            }).await.map_err(|error| {
+                let message = match error.0 {
+                    "router_not_running" => "start the owned server with asr router start",
+                    "bootstrap_assets_missing" => "place the asr-bootstrap-bundle Actions artifact in ASR_BOOTSTRAP_DIR or ASR_DATA_DIR/bootstrap before issuing invitations",
+                    _ => error.0,
+                };
+                CliError::runtime(error.0, message)
+            })?;
+            print!("{}", prompt.text);
+        }
+        cli::OnboardingCommand::Revoke { invite_id } => {
+            let (client, _events) = operator_client(cli).await?;
+            let response = client
+                .call(ClientMessage::OnboardingInviteRevoke {
+                    request_id: request_id("onboarding-revoke"),
+                    invite_id: *invite_id,
+                })
+                .await
+                .map_err(|error| client_error(&error))?;
+            client.close().await.map_err(|error| client_error(&error))?;
+            match response {
+                ServerMessage::OnboardingInviteRevoked { .. } => println!("revoked {invite_id}"),
+                ServerMessage::Error { code, .. } => {
+                    return Err(CliError::runtime(code.as_str(), code.to_string()));
+                }
+                _ => return Err(unexpected_response()),
+            }
+        }
+    }
+    Ok(0)
+}
+
 async fn credential_command(cli: &Cli, command: &CredentialCommand) -> Result<i32, CliError> {
     let (client, _events) = operator_client(cli).await?;
     match command {
@@ -2488,7 +2896,7 @@ async fn issue_credential(
     Ok(())
 }
 
-async fn operator_client(cli: &Cli) -> Result<(RouterClient, ClientEvents), CliError> {
+fn operator_client_config(cli: &Cli) -> Result<(ClientConfig, Option<String>), CliError> {
     let selection = config::select(cli.profile.as_deref(), cli.credential.as_deref())
         .map_err(|error| config_error(&error))?;
     let credential_path = match selection.credential_file {
@@ -2503,13 +2911,21 @@ async fn operator_client(cli: &Cli) -> Result<(RouterClient, ClientEvents), CliE
     let credential = read_credential(&credential_path)
         .map_err(|error| CliError::runtime("credential_invalid", error.to_string()))?;
     let ca_file = env::var_os("ASR_CA_FILE").map(PathBuf::from);
-    RouterClient::connect(ClientConfig {
-        router_url: selection.router_url,
-        role: ClientRole::Operator { credential },
-        ca_file,
-    })
-    .await
-    .map_err(|error| client_error(&error))
+    Ok((
+        ClientConfig {
+            router_url: selection.router_url,
+            role: ClientRole::Operator { credential },
+            ca_file,
+        },
+        selection.profile,
+    ))
+}
+
+async fn operator_client(cli: &Cli) -> Result<(RouterClient, ClientEvents), CliError> {
+    let (config, _) = operator_client_config(cli)?;
+    RouterClient::connect(config)
+        .await
+        .map_err(|error| client_error(&error))
 }
 
 fn owned_local_admin_path(router_url: &Url) -> Result<Option<PathBuf>, CliError> {
@@ -2627,6 +3043,8 @@ fn config_error(error: &config::ConfigError) -> CliError {
         config::ConfigError::InvalidUrl => "invalid_router_url",
         config::ConfigError::InvalidProfile => "invalid_profile",
         config::ConfigError::InvalidDelegateContext => "invalid_delegate_context",
+        config::ConfigError::ProfileConflict => "profile_conflict",
+        config::ConfigError::BindingConflict => "binding_conflict",
         config::ConfigError::Io(_) => "configuration_io",
     };
     CliError::runtime("configuration_error", message)
@@ -2649,8 +3067,18 @@ fn client_error(error: &crate::client::ClientError) -> CliError {
 }
 
 fn launch_error(error: &RouterLaunchError) -> CliError {
+    if matches!(error, RouterLaunchError::InstanceChanged) {
+        return CliError::runtime(
+            "router_instance_changed",
+            "the owned router instance changed; the replacement was not stopped; run `asr ui` to reattach",
+        );
+    }
     let message = match error {
         RouterLaunchError::RouterBusy => "router_busy",
+        RouterLaunchError::InstanceChanged => "router_instance_changed",
+        RouterLaunchError::Interrupted => {
+            return CliError::interrupted("foreground router startup interrupted");
+        }
         RouterLaunchError::Permissions => "launcher_permissions",
         RouterLaunchError::Io => "launcher_io",
         RouterLaunchError::InvalidRuntimeRecord => "runtime_record_invalid",
@@ -2679,6 +3107,7 @@ fn router_error(error: &crate::router::RouterRuntimeError) -> CliError {
         crate::router::RouterRuntimeError::Configuration => "configuration_required",
         crate::router::RouterRuntimeError::Store(_) => "store_error",
         crate::router::RouterRuntimeError::Credential(_) => "credential_error",
+        crate::router::RouterRuntimeError::Bootstrap(_) => "bootstrap_assets_invalid",
         crate::router::RouterRuntimeError::Io(_) => "router_io",
         crate::router::RouterRuntimeError::ActorStopped => "router_actor_stopped",
     };
@@ -2691,4 +3120,377 @@ fn unexpected_response() -> CliError {
 
 fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+#[cfg(all(test, unix))]
+mod console_tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    fn isolated(test: &str, environment: Option<&str>) -> bool {
+        if env::var("ASR_CONSOLE_TEST_CHILD").as_deref() == Ok(test) {
+            return false;
+        }
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private console test home");
+        let home = root
+            .path()
+            .canonicalize()
+            .expect("canonical console test home");
+        let mut command = std::process::Command::new(env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env_clear()
+            .env("ASR_CONSOLE_TEST_CHILD", test)
+            .env("HOME", &home)
+            .env("ASR_DATA_DIR", home.join("data"))
+            .env("ASR_CONFIG_PATH", home.join("config.json"));
+        if environment.is_some() {
+            command.env("ASR_CREDENTIAL_FILE", home.join("scoped.json"));
+        }
+        if environment == Some("route") {
+            command.env("ROUTER_URL", "wss://environment.example.test/ws");
+        }
+        let output = command.output().expect("isolated selection test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    async fn fixture() -> (RouterRuntime, RuntimeRecord, PathBuf) {
+        let data_dir = absolute_data_dir().unwrap();
+        let instance_id = Uuid::new_v4();
+        let runtime = RouterRuntime::start(RouterConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: data_dir.clone(),
+            instance_id,
+            tls_cert_file: None,
+            tls_key_file: None,
+            public_url: None,
+            exposure: RouterExposure::Direct,
+            onboarding_assets_dir: None,
+        })
+        .await
+        .unwrap();
+        let record = RuntimeRecord {
+            instance_id,
+            control_url: format!("ws://{}/ws", runtime.address),
+            share_mode: RuntimeShareMode::Local,
+            advertised_url: None,
+            owned_serve: None,
+        };
+        RuntimeStore::new(data_dir.clone())
+            .unwrap()
+            .write(&record)
+            .unwrap();
+        let config = config::ConfigFile {
+            version: config::CONFIG_VERSION,
+            default_profile: Some("remote".to_owned()),
+            profiles: [
+                (
+                    "remote".to_owned(),
+                    Profile::manual("wss://saved.example.test/ws".to_owned()),
+                ),
+                (
+                    "owned".to_owned(),
+                    Profile::manual(record.control_url.clone()),
+                ),
+            ]
+            .into(),
+        };
+        config::save_config(&config::config_path().unwrap(), &config).unwrap();
+        (runtime, record, data_dir)
+    }
+
+    async fn scoped_credential(record: &RuntimeRecord, data_dir: &Path) -> CredentialFile {
+        let admin = owned_ui_config(record, data_dir, None, None).unwrap();
+        let (client, _) = RouterClient::connect(admin).await.unwrap();
+        let workspace = WorkspaceName::parse("project-room").unwrap();
+        let created = client
+            .call(ClientMessage::WorkspaceCreate {
+                request_id: "create-room".to_owned(),
+                name: workspace.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(created, ServerMessage::WorkspaceCreated { .. }));
+        let response = client
+            .call(ClientMessage::CredentialIssue {
+                request_id: "issue-scoped".to_owned(),
+                role: CredentialRole::Operator,
+                subject: "scoped".to_owned(),
+                agent_side: None,
+                agent_client: None,
+                workspaces: vec![workspace],
+            })
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+        let ServerMessage::CredentialIssued { credential, .. } = response else {
+            panic!("scoped operator was not issued");
+        };
+        credential
+    }
+
+    fn ui_cli(profile: Option<&str>, credential: Option<PathBuf>) -> Cli {
+        Cli {
+            profile: profile.map(str::to_owned),
+            credential,
+            dry_run: false,
+            command: Some(Command::Ui(cli::UiArgs { workspace: None })),
+        }
+    }
+
+    fn remote_only(options: &UiOptions) {
+        assert_eq!(options.ownership, Ownership::Remote);
+        assert!(options.owned_runtime.is_none());
+        assert!(options.owned_data_dir.is_none());
+    }
+
+    #[test]
+    fn implicit_console_ignores_saved_default_and_tailnet_advertisement() {
+        if isolated(
+            "app::console_tests::implicit_console_ignores_saved_default_and_tailnet_advertisement",
+            None,
+        ) {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (runtime, mut record, data_dir) = fixture().await;
+            record.share_mode = RuntimeShareMode::Tailscale;
+            record.advertised_url = Some("ws://100.64.0.1:8787/ws".to_owned());
+            record.owned_serve = Some(OwnedServe::loopback(
+                record.instance_id,
+                runtime.address.port(),
+            ));
+            let store = RuntimeStore::new(data_dir.clone()).unwrap();
+            store.write(&record).unwrap();
+            let cli = ui_cli(None, None);
+            let args = cli::UiArgs {
+                workspace: Some("project-room".to_owned()),
+            };
+            let (config, options) = ui_connection(&cli, &args).await.unwrap();
+            assert_eq!(config.router_url.as_str(), record.control_url);
+            assert_eq!(options.ownership, Ownership::Reused);
+            assert_eq!(options.owned_runtime, Some(record.clone()));
+            assert_eq!(options.owned_data_dir.as_deref(), Some(data_dir.as_path()));
+            assert_eq!(
+                options.workspace.as_ref().map(WorkspaceName::as_str),
+                Some("project-room")
+            );
+            let ClientRole::Operator { credential } = config.role else {
+                panic!("operator role")
+            };
+            assert_eq!(credential.subject, "admin");
+
+            let agent_path = data_dir.join("credentials/provider.json");
+            let agent = CredentialFile::generate(
+                CredentialRole::Agent,
+                "provider".to_owned(),
+                Some(AgentSide::Generic),
+                Some(AgentClient::Omp),
+                vec![WorkspaceName::parse("project-room").unwrap()],
+            )
+            .unwrap();
+            write_credential_exclusive(&agent_path, &agent).unwrap();
+            let config_path = config::config_path().unwrap();
+            let mut saved = config::load_config(&config_path).unwrap();
+            let remote = saved.profiles.get_mut("remote").unwrap();
+            remote.server_id = Some(Uuid::new_v4());
+            remote.routes.push(config::StoredOnboardingRoute {
+                kind: crate::onboarding::RouteKind::Public,
+                router_url: remote.router_url.clone(),
+                ca_file: None,
+            });
+            remote.bindings.insert(
+                OnboardingProvider::Omp,
+                config::ProviderBinding {
+                    credential_file: agent_path,
+                    workspace: WorkspaceName::parse("project-room").unwrap(),
+                },
+            );
+            config::save_config(&config_path, &saved).unwrap();
+            // Existing operator selection still uses the remote default and cannot borrow admin.
+            let error = operator_client_config(&cli)
+                .err()
+                .expect("remote requires credential");
+            assert_eq!(error.code, "configuration_required");
+            let error = ui_connection(&ui_cli(Some("remote"), None), &args)
+                .await
+                .err()
+                .expect("remote provider binding is not operator authority");
+            assert_eq!(error.code, "configuration_required");
+            fs::write(
+                config::config_path().unwrap(),
+                b"malformed saved configuration",
+            )
+            .unwrap();
+            let (config, options) = ui_connection(&cli, &args).await.unwrap();
+            assert_eq!(config.router_url.as_str(), record.control_url);
+            assert_eq!(options.ownership, Ownership::Reused);
+            store.remove_if_instance(record.instance_id).unwrap();
+            let error = ui_connection(&cli, &args)
+                .await
+                .err()
+                .expect("owned record required");
+            assert_eq!(error.code, "router_not_running");
+            assert!(error.message.contains("asr router start"));
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scoped_console_credentials_never_borrow_admin_even_with_forged_claims() {
+        if isolated(
+            "app::console_tests::scoped_console_credentials_never_borrow_admin_even_with_forged_claims",
+            None,
+        ) {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (runtime, record, data_dir) = fixture().await;
+            let scoped = scoped_credential(&record, &data_dir).await;
+            let scoped_path = data_dir.join("credentials/scoped.json");
+            write_credential_exclusive(&scoped_path, &scoped).unwrap();
+            let admin_path = data_dir.join(ADMIN_CREDENTIAL);
+            let selected_admin = data_dir.join("credentials/selected-admin.json");
+            let admin = read_credential(&admin_path).unwrap();
+            write_credential_exclusive(&selected_admin, &admin).unwrap();
+            fs::remove_file(&admin_path).unwrap();
+            let args = cli::UiArgs { workspace: None };
+            for profile in [None, Some("owned")] {
+                let cli = ui_cli(profile, Some(scoped_path.clone()));
+                let (config, options) = ui_connection(&cli, &args).await.unwrap();
+                assert_eq!(config.router_url.as_str(), record.control_url);
+                let ClientRole::Operator { credential } = config.role else {
+                    panic!("operator role")
+                };
+                assert_eq!(credential.token_hash(), scoped.token_hash());
+                remote_only(&options);
+            }
+            // Auto-start's connection preparation follows the same explicit-credential authority.
+            let cli = ui_cli(None, Some(scoped_path.clone()));
+            let (_, options) = owned_console_connection(
+                &cli,
+                record.clone(),
+                data_dir.clone(),
+                None,
+                Ownership::Owned,
+                None,
+            )
+            .await
+            .unwrap();
+            remote_only(&options);
+            let mut forged = scoped;
+            forged.subject = "admin".to_owned();
+            forged.workspaces.clear();
+            let forged_path = data_dir.join("credentials/forged.json");
+            write_credential_exclusive(&forged_path, &forged).unwrap();
+            let (_, options) = ui_connection(&ui_cli(Some("owned"), Some(forged_path)), &args)
+                .await
+                .unwrap();
+            remote_only(&options);
+            let (_, options) = ui_connection(&ui_cli(Some("owned"), Some(selected_admin)), &args)
+                .await
+                .unwrap();
+            assert_eq!(options.ownership, Ownership::Reused);
+            assert_eq!(options.owned_runtime, Some(record));
+            let error = ui_connection(&ui_cli(None, Some(data_dir.join("missing.json"))), &args)
+                .await
+                .err()
+                .expect("invalid explicit credential");
+            assert_eq!(error.code, "credential_invalid");
+            let agent = CredentialFile::generate(
+                CredentialRole::Agent,
+                "provider".to_owned(),
+                Some(AgentSide::Generic),
+                Some(AgentClient::Omp),
+                Vec::new(),
+            )
+            .unwrap();
+            let agent_path = data_dir.join("credentials/agent.json");
+            write_credential_exclusive(&agent_path, &agent).unwrap();
+            let error = ui_connection(&ui_cli(None, Some(agent_path)), &args)
+                .await
+                .err()
+                .expect("agent cannot fall back to owned admin");
+            assert_eq!(error.code, "credential_invalid");
+            assert!(!admin_path.exists());
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn console_operator_selection_preserves_environment_and_profile_precedence() {
+        if isolated(
+            "app::console_tests::console_operator_selection_preserves_environment_and_profile_precedence",
+            Some("route"),
+        ) {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (runtime, record, data_dir) = fixture().await;
+            let scoped = scoped_credential(&record, &data_dir).await;
+            let environment_credential = PathBuf::from(env::var_os("ASR_CREDENTIAL_FILE").unwrap());
+            write_credential_exclusive(&environment_credential, &scoped).unwrap();
+            let args = cli::UiArgs { workspace: None };
+            let (config, options) = ui_connection(&ui_cli(None, None), &args).await.unwrap();
+            assert_eq!(
+                config.router_url.as_str(),
+                "wss://environment.example.test/ws"
+            );
+            remote_only(&options);
+            let (config, options) = ui_connection(&ui_cli(Some("owned"), None), &args)
+                .await
+                .unwrap();
+            assert_eq!(config.router_url.as_str(), record.control_url);
+            remote_only(&options);
+            let ClientRole::Operator { credential } = config.role else {
+                panic!("operator role")
+            };
+            assert_eq!(credential.token_hash(), scoped.token_hash());
+            let (_, options) = ui_connection(
+                &ui_cli(Some("owned"), Some(data_dir.join(ADMIN_CREDENTIAL))),
+                &args,
+            )
+            .await
+            .unwrap();
+            assert_eq!(options.ownership, Ownership::Reused);
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn implicit_console_preserves_environment_credential_without_a_profile() {
+        if isolated(
+            "app::console_tests::implicit_console_preserves_environment_credential_without_a_profile",
+            Some("credential"),
+        ) {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (runtime, record, data_dir) = fixture().await;
+            let scoped = scoped_credential(&record, &data_dir).await;
+            let credential_path = PathBuf::from(env::var_os("ASR_CREDENTIAL_FILE").unwrap());
+            write_credential_exclusive(&credential_path, &scoped).unwrap();
+            fs::remove_file(data_dir.join(ADMIN_CREDENTIAL)).unwrap();
+            let (config, options) =
+                ui_connection(&ui_cli(None, None), &cli::UiArgs { workspace: None })
+                    .await
+                    .unwrap();
+            assert_eq!(config.router_url.as_str(), record.control_url);
+            let ClientRole::Operator { credential } = config.role else {
+                panic!("operator role")
+            };
+            assert_eq!(credential.token_hash(), scoped.token_hash());
+            remote_only(&options);
+            runtime.shutdown().await.unwrap();
+        });
+    }
 }

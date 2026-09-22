@@ -1,0 +1,12 @@
+{
+  "name": "asr-local",
+  "owner": {
+    "name": "Agent Session Router"
+  },
+  "plugins": [
+    {
+      "name": "asr",
+      "source": "./plugins/asr"
+    }
+  ]
+}

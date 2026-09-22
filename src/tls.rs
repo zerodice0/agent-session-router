@@ -58,20 +58,34 @@ pub enum TlsError {
 /// native roots cannot be loaded completely, the additional CA is invalid, or
 /// no trust anchor remains.
 pub fn load_client_config(explicit_ca_file: Option<&Path>) -> Result<Arc<ClientConfig>, TlsError> {
-    install_crypto_provider()?;
-    if env::var_os("SSL_CERT_FILE").is_some() || env::var_os("SSL_CERT_DIR").is_some() {
-        return Err(TlsError::EnvironmentOverride);
-    }
-
-    let mut roots = native_roots()?;
+    let mut roots = client_roots()?;
     let ca_file = explicit_ca_file.map(Path::to_path_buf).or_else(asr_ca_file);
     if let Some(path) = ca_file {
         append_ca_file(&mut roots, &path)?;
     }
+    client_config(roots)
+}
+
+/// Uses already-validated public CA bytes without reopening a persisted pathname.
+/// Native trust and environment-override policy are identical to file-based clients.
+pub(crate) fn load_client_config_with_ca_pem(ca_pem: &[u8]) -> Result<Arc<ClientConfig>, TlsError> {
+    let mut roots = client_roots()?;
+    append_ca_bytes(&mut roots, ca_pem)?;
+    client_config(roots)
+}
+
+fn client_roots() -> Result<RootCertStore, TlsError> {
+    install_crypto_provider()?;
+    if env::var_os("SSL_CERT_FILE").is_some() || env::var_os("SSL_CERT_DIR").is_some() {
+        return Err(TlsError::EnvironmentOverride);
+    }
+    native_roots()
+}
+
+fn client_config(roots: RootCertStore) -> Result<Arc<ClientConfig>, TlsError> {
     if roots.is_empty() {
         return Err(TlsError::EmptyTrustStore);
     }
-
     Ok(Arc::new(
         ClientConfig::builder()
             .with_root_certificates(roots)
@@ -234,6 +248,10 @@ fn append_ca_file(roots: &mut RootCertStore, path: &Path) -> Result<(), TlsError
     file.take((MAX_CA_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| TlsError::InvalidCa)?;
+    append_ca_bytes(roots, &bytes)
+}
+
+fn append_ca_bytes(roots: &mut RootCertStore, bytes: &[u8]) -> Result<(), TlsError> {
     if bytes.is_empty() || bytes.len() > MAX_CA_FILE_BYTES {
         return Err(TlsError::InvalidCa);
     }

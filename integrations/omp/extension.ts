@@ -1,3 +1,13 @@
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  type Stats,
+} from "node:fs";
+import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   StdioClientTransport,
@@ -11,6 +21,47 @@ const DEFAULT_TIMEOUT_MS = 65_000;
 const DEFAULT_WORK_TIMEOUT_MS = 600_000;
 const WORK_TIMEOUT_MARGIN_MS = 5_000;
 const PREFIX = "notifications/agent_session_router/";
+const MAX_BINDING_BYTES = 16 * 1024;
+// config::validate_profile_name and protocol::is_workspace_name share this grammar.
+const NativeNameSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?![\s\S])/);
+const OnboardingBindingSchema = z.object({
+  version: z.literal(1),
+  executable: z.string().min(1),
+  profile: NativeNameSchema,
+  workspace: NativeNameSchema,
+}).strict();
+const WorkspaceJoinSchema = z.object({ name: NativeNameSchema }).strict();
+const WorkspacePageSchema = z.object({
+  workspaces: z.array(z.object({
+    name: NativeNameSchema,
+    createdAt: z.number().int().nonnegative(),
+    connectedAgents: z.number().int().nonnegative(),
+  }).strict()).max(100),
+  nextCursor: NativeNameSchema.nullable(),
+  hasMore: z.boolean(),
+}).strict();
+const MembersSchema = z.object({
+  agents: z.array(z.object({
+    agentId: z.string().min(1),
+    side: z.string(),
+    client: z.string(),
+  }).passthrough()),
+}).strict();
+
+export type OnboardingBinding = z.infer<typeof OnboardingBindingSchema>;
+
+class OmpConfigurationError extends Error {
+  constructor(readonly code: string) {
+    super(`agent-session-router: ${code}; repair the OMP onboarding configuration and restart the OMP process.`);
+    this.name = "OmpConfigurationError";
+  }
+}
+
+class WorkspaceCommandError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+  }
+}
 
 const TaskRefSchema = z
   .object({ taskId: z.number().int().positive(), attemptId: z.string().min(1) })
@@ -137,6 +188,10 @@ export interface OmpHost {
     event: string,
     handler: (event: unknown, context: OmpContext) => void | Promise<void>,
   ): void;
+  sendMessage(
+    message: { customType: string; content: string; display: true },
+    options: { triggerTurn: false },
+  ): void;
   sendUserMessage(
     content: string,
     options: { attribution: "agent"; deliverAs: "followUp" },
@@ -229,7 +284,7 @@ async function connectSdk(
   args.push("mcp", "omp");
 
   const env = getDefaultEnvironment();
-  for (const key of ["ASR_CONFIG_PATH", "ASR_CA_FILE", "ROUTER_URL"] as const) {
+  for (const key of ["ASR_CONFIG_PATH", "XDG_CONFIG_HOME", "ASR_CA_FILE", "ROUTER_URL"] as const) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
@@ -275,7 +330,12 @@ class OmpController {
   private selection: ChildSelection | null = null;
   private context: OmpContext | null = null;
   private activeWork: ActiveWork | null = null;
-  private consumedInitialWorkspace = false;
+  private starting: Promise<void> | null = null;
+  private joinedWorkspace: string | null = null;
+  private membershipChanging = false;
+  private membershipUncertain = false;
+  private readonly pendingRequests = new Set<symbol>();
+  private generation = 0;
 
   constructor(
     private readonly pi: OmpHost,
@@ -285,27 +345,55 @@ class OmpController {
   async start(context: OmpContext): Promise<void> {
     this.context = context;
     if (!context.hasUI) return;
-    const env = this.dependencies.env ?? process.env;
-    const executable = env.ASR_EXECUTABLE;
-    if (!executable) return;
-    const initialWorkspace = this.consumedInitialWorkspace ? undefined : env.ASR_WORKSPACE;
-    this.consumedInitialWorkspace = true;
-    this.selection = {
-      executable,
-      credentialFile: env.ASR_CREDENTIAL_FILE,
-      profile: env.ASR_PROFILE,
-      workspace: initialWorkspace,
-      cwd: context.cwd,
-    };
-    await this.ensureConnected();
-    if (initialWorkspace) {
-      await this.call("workspace_join", { workspace: initialWorkspace }, undefined);
+    if (this.starting) return this.starting;
+    if (this.connection) return;
+    const generation = this.generation;
+    try {
+      this.selection ??= this.readSelection(context);
+      if (!this.selection) return;
+      const initialWorkspace = this.selection.workspace;
+      this.starting = (async () => {
+        await this.ensureConnected();
+        // OMP's backend intentionally rejects initial_workspace. Join only after MCP connects.
+        if (initialWorkspace) {
+          checkedResult(await this.changeMembership("workspace_join", { name: initialWorkspace }));
+        }
+        await this.notify(`${PREFIX}host_state`, { v: 1, ready: context.isIdle() });
+      })().catch((error: unknown) => {
+        if (generation === this.generation) context.ui.notify(commandErrorMessage(error), "error");
+      });
+      await this.starting;
+    } catch (error) {
+      context.ui.notify(commandErrorMessage(error), "error");
+    } finally {
+      if (generation === this.generation) this.starting = null;
     }
-    await this.notify(`${PREFIX}host_state`, { v: 1, ready: context.isIdle() });
+  }
+
+  private readSelection(context: OmpContext): ChildSelection | null {
+    const env = this.dependencies.env ?? process.env;
+    if (env.ASR_EXECUTABLE !== undefined) {
+      if (!env.ASR_EXECUTABLE) throw new OmpConfigurationError("onboarding_executable_invalid");
+      return {
+        executable: env.ASR_EXECUTABLE,
+        credentialFile: env.ASR_CREDENTIAL_FILE,
+        profile: env.ASR_PROFILE,
+        workspace: env.ASR_WORKSPACE,
+        cwd: context.cwd,
+      };
+    }
+    const binding = readOnboardingBinding(env);
+    return binding
+      ? { executable: binding.executable, profile: binding.profile, workspace: binding.workspace, cwd: context.cwd }
+      : null;
   }
 
   async execute(name: string, params: JsonObject, signal?: AbortSignal): Promise<unknown> {
+    if (name === "workspace_join" || name === "workspace_leave") {
+      return this.changeMembership(name, params, signal);
+    }
     const result = await this.call(name, params, signal);
+    if (toolFailure(result)) return result;
     const active = this.activeWork;
     if (
       name === "agent_reply" &&
@@ -321,39 +409,172 @@ class OmpController {
     return result;
   }
 
-  async command(raw: string, context: OmpContext): Promise<void> {
+  async command(raw: string, context: OmpContext, namespaced = false): Promise<void> {
     this.context = context;
     try {
       const words = splitCommand(raw);
+      if (namespaced && words.shift() !== "workspace") throw new WorkspaceCommandError("usage");
       const command = words.shift();
-      if (!command) throw new Error("usage");
+      if (!command) throw new WorkspaceCommandError("usage");
+      let result: unknown;
+      if (command === "create") {
+        const workspace = words.shift();
+        if (!NativeNameSchema.safeParse(workspace).success || words.length) {
+          throw new WorkspaceCommandError("usage");
+        }
+        this.display("Server administrator action", {
+          instruction: `Run on the server: asr onboarding prompt --workspace ${workspace} --create-workspace`,
+        });
+        return;
+      }
       if (command === "join") {
         const parsed = parseJoin(words);
-        if (this.connection || this.connecting) throw new Error("connected");
-        const executable = (this.dependencies.env ?? process.env).ASR_EXECUTABLE;
-        if (!executable) throw new Error("configuration");
-        this.selection = { executable, cwd: context.cwd, ...parsed };
-        await this.ensureConnected();
-        await this.call("workspace_join", { workspace: parsed.workspace }, undefined);
-      } else if (command === "list") {
-        await this.call("workspace_list", {}, undefined);
-      } else if (command === "members") {
-        await this.call("workspace_members", {}, undefined);
-      } else if (command === "history") {
-        await this.call("workspace_history", {}, undefined);
+        this.selection ??= this.readSelection(context);
+        if (!this.selection) throw new OmpConfigurationError("onboarding_configuration_required");
+        if (this.connection || this.connecting) {
+          if (
+            (parsed.profile !== undefined && parsed.profile !== this.selection.profile) ||
+            (parsed.credentialFile !== undefined && parsed.credentialFile !== this.selection.credentialFile)
+          ) {
+            throw new WorkspaceCommandError("profile_restart_required");
+          }
+        } else {
+          if (parsed.profile !== undefined) this.selection.profile = parsed.profile;
+          if (parsed.credentialFile !== undefined) this.selection.credentialFile = parsed.credentialFile;
+        }
+        result = checkedResult(await this.execute("workspace_join", { name: parsed.workspace }));
+      } else if (command === "list" || command === "find") {
+        if (command === "list" && words.length) throw new WorkspaceCommandError("usage");
+        const query = asciiLower(words.join(" "));
+        result = { workspaces: await this.listWorkspaces(query) };
+      } else if (command === "members" || command === "history") {
+        if (words.length) throw new WorkspaceCommandError("usage");
+        result = checkedResult(await this.execute(`workspace_${command}`, {}));
       } else if (command === "post") {
         const content = words.join(" ");
-        if (!content) throw new Error("usage");
-        await this.call("workspace_post", { content }, undefined);
+        if (!content) throw new WorkspaceCommandError("usage");
+        result = checkedResult(await this.execute("workspace_post", { content }));
       } else if (command === "leave") {
-        await this.call("workspace_leave", {}, undefined);
-        await this.close();
+        if (words.length) throw new WorkspaceCommandError("usage");
+        result = checkedResult(await this.execute("workspace_leave", {}));
+        // Keep the MCP connection; a connected but unjoined provider may inspect and rejoin.
+      } else if (command === "status") {
+        if (words.length) throw new WorkspaceCommandError("usage");
+        result = await this.status();
       } else {
-        throw new Error("usage");
+        throw new WorkspaceCommandError("usage");
       }
-      context.ui.notify("agent-session-router command completed", "info");
-    } catch {
-      context.ui.notify("agent-session-router command failed", "error");
+      this.display(`Workspace ${command}`, result);
+    } catch (error) {
+      context.ui.notify(commandErrorMessage(error), "error");
+    }
+  }
+
+  private display(label: string, value: unknown): void {
+    const json = JSON.stringify(value, null, 2).replace(/[\u007f-\u009f]/g, (character) =>
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    this.pi.sendMessage({
+      customType: "agent-session-router",
+      content: `${label}\n\n\`\`\`json\n${json}\n\`\`\``,
+      display: true,
+    }, { triggerTurn: false });
+  }
+
+  private async listWorkspaces(query = ""): Promise<z.infer<typeof WorkspacePageSchema>["workspaces"]> {
+    const generation = this.generation;
+    const workspaces: z.infer<typeof WorkspacePageSchema>["workspaces"] = [];
+    const seenCursors = new Set<string>();
+    let after: string | undefined;
+    for (;;) {
+      const result = checkedResult(await this.call("workspace_list", { limit: 100, ...(after ? { after } : {}) }));
+      if (generation !== this.generation) throw new WorkspaceCommandError("session_changed");
+      const parsed = WorkspacePageSchema.safeParse(result);
+      if (!parsed.success) throw new WorkspaceCommandError("invalid_mcp_response");
+      const page = parsed.data;
+      for (const workspace of page.workspaces) {
+        if (asciiLower(workspace.name).includes(query)) workspaces.push(workspace);
+      }
+      if (!page.hasMore) return workspaces;
+      if (!page.nextCursor || seenCursors.has(page.nextCursor) || (after && page.nextCursor <= after)) {
+        throw new WorkspaceCommandError("invalid_workspace_cursor");
+      }
+      seenCursors.add(page.nextCursor);
+      after = page.nextCursor;
+    }
+  }
+
+  private async status(): Promise<JsonObject> {
+    const generation = this.generation;
+    const workspaces = await this.listWorkspaces();
+    const workspace = this.joinedWorkspace;
+    if (!workspace || this.membershipUncertain) {
+      return { workspace, workspaces, participation: "not_checked" };
+    }
+    const before = MembersSchema.parse(checkedResult(await this.call("workspace_members", {})));
+    const peers = MembersSchema.parse(checkedResult(await this.call("agent_list", {})));
+    const after = MembersSchema.parse(checkedResult(await this.call("workspace_members", {})));
+    const beforeIds = before.agents.map((agent) => agent.agentId).sort();
+    const afterIds = after.agents.map((agent) => agent.agentId).sort();
+    const peerIds = new Set(peers.agents.map((agent) => agent.agentId));
+    const self = after.agents.filter((agent) => !peerIds.has(agent.agentId));
+    const stable = beforeIds.length === afterIds.length &&
+      beforeIds.every((id, index) => id === afterIds[index]) &&
+      new Set(afterIds).size === afterIds.length &&
+      peers.agents.every((agent) => afterIds.includes(agent.agentId));
+    // The native agent_list excludes exactly this connection, unlike workspace_members.
+    const confirmed = stable && self.length === 1 && self[0]?.side === "generic" &&
+      self[0]?.client === "omp" && this.joinedWorkspace === workspace && generation === this.generation &&
+      !this.membershipChanging && !this.membershipUncertain &&
+      workspaces.some((entry) => entry.name === workspace);
+    return {
+      workspace,
+      workspaces,
+      members: after.agents,
+      participation: confirmed ? "confirmed" : "not_checked",
+      ...(confirmed ? { agentId: self[0]?.agentId } : {}),
+    };
+  }
+
+  private async changeMembership(
+    name: "workspace_join" | "workspace_leave",
+    params: JsonObject,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const joining = name === "workspace_join" ? WorkspaceJoinSchema.safeParse(params) : null;
+    if ((joining && !joining.success) || (!joining && Object.keys(params).length !== 0)) {
+      throw new WorkspaceCommandError("invalid_message");
+    }
+    if (this.membershipUncertain) throw new WorkspaceCommandError("leave_unconfirmed");
+    // OMP is streaming during user-directed tool calls too; only ASR work fences membership changes.
+    if (this.membershipChanging || this.activeWork || this.pendingRequests.size > 0) {
+      throw new WorkspaceCommandError("workspace_busy");
+    }
+    const expected = joining?.success ? joining.data.name : null;
+    if (expected && this.joinedWorkspace && this.joinedWorkspace !== expected) {
+      throw new WorkspaceCommandError("leave_required");
+    }
+    this.membershipChanging = true;
+    const generation = this.generation;
+    try {
+      const value = await this.call(name, params, signal);
+      const failure = toolFailure(value);
+      if (failure) {
+        if (failure.code === "leave_unconfirmed") this.membershipUncertain = true;
+        return value;
+      }
+      const result = structuredResult(value);
+      if (generation !== this.generation) throw new WorkspaceCommandError("session_changed");
+      if (expected ? result.workspace !== expected : result.workspace !== this.joinedWorkspace) {
+        throw new WorkspaceCommandError("invalid_mcp_response");
+      }
+      this.joinedWorkspace = expected;
+      return value;
+    } catch (error) {
+      if (generation === this.generation) this.membershipUncertain = true;
+      throw error;
+    } finally {
+      if (generation === this.generation) this.membershipChanging = false;
     }
   }
 
@@ -396,43 +617,65 @@ class OmpController {
 
   async close(): Promise<void> {
     const connection = this.connection;
+    this.generation += 1;
     this.connection = null;
     this.connecting = null;
+    this.starting = null;
     this.selection = null;
     this.activeWork = null;
+    this.joinedWorkspace = null;
+    this.membershipChanging = false;
+    this.membershipUncertain = false;
+    this.pendingRequests.clear();
     if (connection) await connection.close();
   }
 
   private async ensureConnected(): Promise<OmpMcpConnection> {
     if (this.connection) return this.connection;
     if (this.connecting) return this.connecting;
-    if (!this.selection) throw new Error("configuration");
+    if (!this.selection && this.context) this.selection = this.readSelection(this.context);
+    if (!this.selection) throw new OmpConfigurationError("onboarding_configuration_required");
+    const generation = this.generation;
     this.connecting = this.dependencies
-      .connect(this.selection, (notification) => this.handleNotification(notification))
-      .then((connection) => {
+      .connect(this.selection, (notification) =>
+        generation === this.generation ? this.handleNotification(notification) : Promise.resolve(),
+      )
+      .then(async (connection) => {
+        if (generation !== this.generation) {
+          await connection.close();
+          throw new WorkspaceCommandError("session_changed");
+        }
         this.connection = connection;
         this.connecting = null;
         return connection;
       })
       .catch((error: unknown) => {
-        this.connecting = null;
+        if (generation === this.generation) this.connecting = null;
         throw error;
       });
     return this.connecting;
   }
 
   private async call(name: string, params: JsonObject, signal?: AbortSignal): Promise<unknown> {
-    const connection = await this.ensureConnected();
-    const requested = numberField(params, "timeoutMs") ?? DEFAULT_WORK_TIMEOUT_MS;
-    const timeout = name === "agent_send" || name === "task_request"
-      ? requested + WORK_TIMEOUT_MARGIN_MS
-      : DEFAULT_TIMEOUT_MS;
-    return connection.callTool(name, params, {
-      signal,
-      timeout,
-      maxTotalTimeout: timeout,
-      resetTimeoutOnProgress: false,
-    });
+    const isRequest = name === "agent_send" || name === "task_request";
+    if (isRequest && (this.membershipChanging || this.membershipUncertain)) {
+      throw new WorkspaceCommandError("workspace_busy");
+    }
+    const pending = isRequest ? Symbol() : null;
+    if (pending) this.pendingRequests.add(pending);
+    try {
+      const connection = await this.ensureConnected();
+      const requested = numberField(params, "timeoutMs") ?? DEFAULT_WORK_TIMEOUT_MS;
+      const timeout = isRequest ? requested + WORK_TIMEOUT_MARGIN_MS : DEFAULT_TIMEOUT_MS;
+      return await connection.callTool(name, params, {
+        signal,
+        timeout,
+        maxTotalTimeout: timeout,
+        resetTimeoutOnProgress: false,
+      });
+    } finally {
+      if (pending) this.pendingRequests.delete(pending);
+    }
   }
 
   private async notify(method: string, params: JsonObject): Promise<void> {
@@ -444,7 +687,7 @@ class OmpController {
     const context = this.context;
     if (!context) return;
     if (notification.method === `${PREFIX}work`) {
-      if (this.activeWork || !context.isIdle()) {
+      if (this.activeWork || this.membershipChanging || this.membershipUncertain || !context.isIdle()) {
         await this.notify(`${PREFIX}work_finished`, {
           v: 1,
           requestId: notification.params.requestId,
@@ -546,6 +789,10 @@ export function createOmpExtension(
       description: "Join or inspect agent-session-router workspaces",
       handler: (args, context) => controller.command(args, context),
     });
+    pi.registerCommand("asr", {
+      description: "Use ASR workspace list, find, join, members, history, post, leave, or status",
+      handler: (args, context) => controller.command(args, context, true),
+    });
     pi.on("session_start", (_event, context) => controller.start(context));
     for (const eventName of [
       "agent_start",
@@ -587,25 +834,26 @@ function splitCommand(input: string): string[] {
       word += character;
     }
   }
-  if (escaped || quote) throw new Error("usage");
+  if (escaped || quote) throw new WorkspaceCommandError("usage");
   if (word) words.push(word);
   return words;
 }
 
 function parseJoin(words: string[]): Omit<ChildSelection, "executable" | "cwd"> & { workspace: string } {
   const workspace = words.shift();
-  if (!workspace) throw new Error("usage");
+  if (!NativeNameSchema.safeParse(workspace).success || workspace === undefined) {
+    throw new WorkspaceCommandError("usage");
+  }
   let credentialFile: string | undefined;
   let profile: string | undefined;
   while (words.length > 0) {
     const option = words.shift();
     const value = words.shift();
-    if (!value) throw new Error("usage");
+    if (!value) throw new WorkspaceCommandError("usage");
     if (option === "--credential" && credentialFile === undefined) credentialFile = value;
-    else if (option === "--profile" && profile === undefined) profile = value;
-    else throw new Error("usage");
+    else if (option === "--profile" && profile === undefined && NativeNameSchema.safeParse(value).success) profile = value;
+    else throw new WorkspaceCommandError("usage");
   }
-  if (!credentialFile) throw new Error("usage");
   return { workspace, credentialFile, profile };
 }
 
@@ -614,3 +862,218 @@ function numberField(value: JsonObject, key: string): number | null {
   return typeof field === "number" && Number.isSafeInteger(field) && field > 0 ? field : null;
 }
 
+/** Reads only the public launch descriptor, never the profile or credential contents. */
+export function readOnboardingBinding(
+  env: Record<string, string | undefined>,
+): OnboardingBinding | undefined {
+  let configPath: string;
+  if (env.ASR_CONFIG_PATH) {
+    configPath = env.ASR_CONFIG_PATH;
+    rejectUnsafePath(configPath);
+    if (configPath === "~" || configPath.startsWith("~/")) {
+      if (!env.HOME) throw new OmpConfigurationError("onboarding_home_required");
+      rejectUnsafePath(env.HOME);
+      configPath = configPath === "~" ? env.HOME : join(env.HOME, configPath.slice(2));
+    }
+  } else if (env.XDG_CONFIG_HOME) {
+    // Rust deliberately does not expand a tilde in XDG_CONFIG_HOME.
+    configPath = `${env.XDG_CONFIG_HOME}/agent-session-router/config.json`;
+  } else if (env.HOME) {
+    configPath = `${env.HOME}/.config/agent-session-router/config.json`;
+  } else {
+    return undefined;
+  }
+  rejectUnsafePath(configPath);
+  const configDirectory = dirname(resolve(configPath));
+  const hostsDirectory = join(configDirectory, "hosts");
+  const descriptor = join(hostsDirectory, "omp.json");
+  let fd: number | undefined;
+  try {
+    const parents = inspectDirectories(hostsDirectory, [configDirectory, hostsDirectory]);
+    if (!parents) return undefined;
+    let before: Stats;
+    try {
+      before = lstatSync(descriptor);
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      throw error;
+    }
+    validatePrivateFile(before);
+    fd = openSync(descriptor, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const opened = fstatSync(fd);
+    validatePrivateFile(opened);
+    if (!sameFile(before, opened)) throw new OmpConfigurationError("onboarding_binding_changed");
+    const bytes = Buffer.alloc(MAX_BINDING_BYTES + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = readSync(fd, bytes, size, bytes.length - size, null);
+      if (count === 0) break;
+      size += count;
+    }
+    if (size > MAX_BINDING_BYTES) throw new OmpConfigurationError("onboarding_binding_too_large");
+    const after = fstatSync(fd);
+    if (
+      !sameFile(opened, lstatSync(descriptor)) ||
+      after.size !== opened.size ||
+      after.mtimeMs !== opened.mtimeMs ||
+      after.ctimeMs !== opened.ctimeMs ||
+      size !== opened.size
+    ) {
+      throw new OmpConfigurationError("onboarding_binding_changed");
+    }
+    for (const [path, metadata] of parents) {
+      const current = lstatSync(path);
+      if (!current.isDirectory() || !sameFile(metadata, current)) {
+        throw new OmpConfigurationError("onboarding_binding_changed");
+      }
+    }
+    let value: unknown;
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size));
+      const keys = new Set<string>();
+      for (const token of text.matchAll(/("(?:[^"\\]|\\[\s\S])*")\s*(:)?/g)) {
+        if (token[2]) {
+          const key = JSON.parse(token[1]!) as string;
+          if (keys.has(key)) throw new OmpConfigurationError("onboarding_binding_invalid");
+          keys.add(key);
+        }
+      }
+      value = JSON.parse(text);
+    } catch {
+      throw new OmpConfigurationError("onboarding_binding_invalid");
+    }
+    const parsed = OnboardingBindingSchema.safeParse(value);
+    if (!parsed.success) throw new OmpConfigurationError("onboarding_binding_invalid");
+    const binding = parsed.data;
+    if (!isAbsolute(binding.executable)) {
+      throw new OmpConfigurationError("onboarding_executable_invalid");
+    }
+    rejectUnsafePath(binding.executable);
+    if (!inspectDirectories(dirname(binding.executable), [])) {
+      throw new OmpConfigurationError("onboarding_executable_invalid");
+    }
+    let executable: Stats;
+    try {
+      executable = lstatSync(binding.executable);
+    } catch {
+      throw new OmpConfigurationError("onboarding_executable_invalid");
+    }
+    if (
+      !executable.isFile() ||
+      executable.uid !== currentUid() ||
+      (executable.mode & 0o022) !== 0 ||
+      (executable.mode & 0o7000) !== 0 ||
+      (executable.mode & 0o100) === 0
+    ) {
+      throw new OmpConfigurationError("onboarding_executable_invalid");
+    }
+    return binding;
+  } catch (error) {
+    if (error instanceof OmpConfigurationError) throw error;
+    throw new OmpConfigurationError("onboarding_binding_unreadable");
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function currentUid(): number {
+  if (!process.getuid) throw new OmpConfigurationError("onboarding_platform_unsupported");
+  return process.getuid();
+}
+
+function rejectUnsafePath(path: string): void {
+  if (path.includes("\0") || path.split("/").includes("..")) {
+    throw new OmpConfigurationError("onboarding_path_unsafe");
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function sameFile(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.uid === right.uid;
+}
+
+function validatePrivateFile(metadata: Stats): void {
+  if (!metadata.isFile() || metadata.uid !== currentUid() || (metadata.mode & 0o077) !== 0 || metadata.nlink !== 1) {
+    throw new OmpConfigurationError("onboarding_binding_permissions");
+  }
+  if (metadata.size > MAX_BINDING_BYTES) throw new OmpConfigurationError("onboarding_binding_too_large");
+}
+
+function inspectDirectories(
+  path: string,
+  privatePaths: readonly string[],
+): Array<[string, Stats]> | undefined {
+  rejectUnsafePath(path);
+  const absolute = resolve(path);
+  let current = parse(absolute).root;
+  const inspected: Array<[string, Stats]> = [];
+  for (const component of absolute.slice(current.length).split("/").filter(Boolean)) {
+    current = join(current, component);
+    let metadata: Stats;
+    try {
+      metadata = lstatSync(current);
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      throw error;
+    }
+    if (!metadata.isDirectory()) throw new OmpConfigurationError("onboarding_path_unsafe");
+    if (privatePaths.includes(current) && (metadata.uid !== currentUid() || (metadata.mode & 0o077) !== 0)) {
+      throw new OmpConfigurationError("onboarding_binding_permissions");
+    }
+    inspected.push([current, metadata]);
+  }
+  return inspected;
+}
+
+function structuredResult(value: unknown): JsonObject {
+  if (typeof value !== "object" || value === null || !("structuredContent" in value)) {
+    throw new WorkspaceCommandError("invalid_mcp_response");
+  }
+  const content = value.structuredContent;
+  if (typeof content !== "object" || content === null || Array.isArray(content)) {
+    throw new WorkspaceCommandError("invalid_mcp_response");
+  }
+  return content as JsonObject;
+}
+
+function toolFailure(value: unknown): WorkspaceCommandError | undefined {
+  if (typeof value !== "object" || value === null || !("isError" in value) || value.isError !== true) {
+    return undefined;
+  }
+  const content = structuredResult(value);
+  // Only native bounded error codes are displayed, never subprocess output or arbitrary exceptions.
+  const code = typeof content.error === "string" && /^[a-z][a-z0-9_]{0,63}(?![\s\S])/.test(content.error)
+    ? content.error
+    : "mcp_tool_failed";
+  return new WorkspaceCommandError(code);
+}
+
+function checkedResult(value: unknown): JsonObject {
+  const error = toolFailure(value);
+  if (error) throw error;
+  return structuredResult(value);
+}
+
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 32));
+}
+
+function commandErrorMessage(error: unknown): string {
+  if (error instanceof OmpConfigurationError) return error.message;
+  const code = error instanceof WorkspaceCommandError ? error.code : "mcp_connection_failed";
+  const instruction = code === "usage"
+    ? "Use /asr workspace list|find QUERY|join NAME|members|history|post TEXT|leave|status."
+    : code === "profile_restart_required"
+      ? "Profile and credential changes require a new OMP process; live connections are not replaced."
+      : code === "leave_required"
+        ? "Leave the current workspace successfully before joining another room."
+        : code === "workspace_busy" || code === "task_stop_unconfirmed"
+          ? "Wait for pending/running work and confirmed task stop before changing workspaces."
+          : code === "leave_unconfirmed"
+            ? "Membership is uncertain. Restart the OMP process; do not retry leave or switch rooms here."
+            : "Inspect the configuration or server state and retry; after plugin changes restart the OMP process.";
+  return `agent-session-router: ${code}. ${instruction}`;
+}

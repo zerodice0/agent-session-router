@@ -1,7 +1,10 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    fs::File,
+    io::Read as _,
+    os::unix::fs::MetadataExt as _,
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -23,17 +26,21 @@ use tokio_util::{
 };
 
 use crate::{
+    bootstrap::routes::{RouteError, probe_routes},
     cli::{McpArgs, McpRoleArg, escape_terminal},
     client::{
         AgentSendResult, ClientConfig, ClientError, ClientEvent, ClientEvents, ClientRole,
         RouterClient,
     },
-    config::{self, ConfigError, DELEGATE_CONTEXT_VERSION, DelegateLaunchContext},
+    config::{
+        self, ConfigError, DELEGATE_CONTEXT_VERSION, DelegateLaunchContext, ProviderSelection,
+    },
     credentials::{self, CredentialError, CredentialRole, SecretToken},
     install::{AssetError, resolve_integration_asset},
     mcp::{
         BackendError, McpRole, McpRuntimeError, McpServer, RouterMcpBackend, catalog, serve_stdio,
     },
+    onboarding::{MAX_CA_BYTES, OnboardingProvider, OnboardingRoute, validate_ca_pem},
     process::{LaunchError, LaunchMode, LaunchPlan, MAX_COMMAND_OUTPUT_BYTES},
     protocol::{
         AgentClient, AgentRegistration, AgentSide, ClientMessage, DeliveryMode, RouterErrorCode,
@@ -75,6 +82,8 @@ pub enum HostError {
     Config(#[from] ConfigError),
     #[error("{0}")]
     Credential(#[from] CredentialError),
+    #[error("{0}")]
+    Route(#[from] RouteError),
     #[error("MCP dry-run commands must be planned before credential resolution")]
     McpDryRun,
     #[error("delegate MCP does not accept profile or credential selection")]
@@ -114,6 +123,7 @@ pub struct McpInvocation {
     pub agent_id: String,
     pub config: ClientConfig,
     pub initial_workspace: Option<WorkspaceName>,
+    pub provider_selection: Option<ProviderSelection>,
 }
 
 pub fn mcp_invocation(
@@ -166,6 +176,7 @@ fn delegate_mcp_invocation(
             ca_file,
         },
         initial_workspace: None,
+        provider_selection: None,
     })
 }
 
@@ -174,20 +185,36 @@ fn primary_mcp_invocation(
     profile: Option<&str>,
     credential_file: Option<&Path>,
 ) -> Result<McpInvocation, HostError> {
-    let (expected_side, expected_client, delivery_mode) = match role {
-        McpRoleArg::CodexCli => (AgentSide::Codex, AgentClient::CodexCli, DeliveryMode::Pull),
+    let (provider, expected_side, expected_client, delivery_mode) = match role {
+        McpRoleArg::CodexCli => (
+            OnboardingProvider::CodexCli,
+            AgentSide::Codex,
+            AgentClient::CodexCli,
+            DeliveryMode::Pull,
+        ),
         McpRoleArg::ClaudeChannel => (
+            OnboardingProvider::ClaudeCode,
             AgentSide::Claude,
             AgentClient::ClaudeCode,
             DeliveryMode::Push,
         ),
-        McpRoleArg::Omp => (AgentSide::Generic, AgentClient::Omp, DeliveryMode::Push),
+        McpRoleArg::Omp => (
+            OnboardingProvider::Omp,
+            AgentSide::Generic,
+            AgentClient::Omp,
+            DeliveryMode::Push,
+        ),
         McpRoleArg::Delegate { .. } => return Err(HostError::McpCredentialClaims),
     };
     let environment_profile = env::var("ASR_PROFILE")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let selection = config::select(profile.or(environment_profile.as_deref()), credential_file)?;
+    let provider_selection = config::select_provider(
+        profile.or(environment_profile.as_deref()),
+        credential_file,
+        provider,
+    )?;
+    let selection = &provider_selection.selection;
     let credential_path = selection
         .credential_file
         .as_deref()
@@ -213,6 +240,7 @@ fn primary_mcp_invocation(
                     .and_then(|value| WorkspaceName::parse(value).map_err(|_| ConfigError::Invalid))
             })
             .transpose()?
+            .or_else(|| provider_selection.initial_workspace.clone())
     } else {
         None
     };
@@ -220,7 +248,7 @@ fn primary_mcp_invocation(
         role: role.mcp_role(),
         agent_id: agent_id.clone(),
         config: ClientConfig {
-            router_url: selection.router_url,
+            router_url: selection.router_url.clone(),
             role: ClientRole::Primary {
                 agent: AgentRegistration {
                     agent_id,
@@ -232,12 +260,128 @@ fn primary_mcp_invocation(
                 credential,
                 delegation_token: None,
             },
-            ca_file: env::var_os("ASR_CA_FILE")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            ca_file: provider_selection.ca_file.clone(),
         },
         initial_workspace,
+        provider_selection: Some(provider_selection),
     })
+}
+
+/// Selects a verified route only before opening a new provider MCP connection.
+/// Reconnects of a live client retain their existing endpoint.
+pub async fn resolve_mcp_route(invocation: &mut McpInvocation) -> Result<(), HostError> {
+    let Some(selection) = invocation.provider_selection.as_ref() else {
+        return Ok(());
+    };
+    let Some(server_id) = selection.expected_server_id else {
+        return Ok(());
+    };
+    let explicit_pem = if env::var_os("ASR_CA_FILE").is_some_and(|value| !value.is_empty()) {
+        selection
+            .ca_file
+            .as_deref()
+            .map(|path| read_provider_ca(path, false))
+            .transpose()?
+    } else {
+        None
+    };
+    let routes = selection
+        .routes
+        .iter()
+        .map(|route| {
+            let ca_pem = if route.router_url.starts_with("wss://") {
+                match &explicit_pem {
+                    Some(pem) => Some(pem.clone()),
+                    None => route
+                        .ca_file
+                        .as_deref()
+                        .map(|path| read_provider_ca(path, true))
+                        .transpose()?,
+                }
+            } else {
+                None
+            };
+            Ok(OnboardingRoute {
+                kind: route.kind,
+                router_url: route.router_url.clone(),
+                ca_pem,
+            })
+        })
+        .collect::<Result<Vec<_>, RouteError>>()?;
+    let config_path = config::config_path()?;
+    let ca_directory = config_path
+        .parent()
+        .ok_or(ConfigError::Invalid)?
+        .join("onboarding/ca");
+    let verified = probe_routes(&routes, server_id, None, &ca_directory).await?;
+    invocation.config.router_url = config::normalize_router_url(&verified.route.router_url)?;
+    // Use the exact validated CA bytes persisted by the probe, including an
+    // explicit override, rather than reopening a possibly changed input file.
+    invocation.config.ca_file = verified.ca_file;
+    Ok(())
+}
+
+fn read_provider_ca(path: &Path, private: bool) -> Result<String, RouteError> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let uid = rustix::process::getuid().as_raw();
+    let file_flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = if private {
+        let parent = path.parent().ok_or(RouteError::InvalidCa)?;
+        let name = path.file_name().ok_or(RouteError::InvalidCa)?;
+        let directory_flags =
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut directory = File::from(
+            open(
+                if path.is_absolute() { "/" } else { "." },
+                directory_flags,
+                Mode::empty(),
+            )
+            .map_err(|_| RouteError::InvalidCa)?,
+        );
+        for component in parent.components() {
+            match component {
+                Component::Normal(name) => {
+                    directory = File::from(
+                        openat(&directory, name, directory_flags, Mode::empty())
+                            .map_err(|_| RouteError::InvalidCa)?,
+                    );
+                }
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir | Component::Prefix(_) => return Err(RouteError::InvalidCa),
+            }
+        }
+        let metadata = directory.metadata().map_err(|_| RouteError::InvalidCa)?;
+        if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            return Err(RouteError::InvalidCa);
+        }
+        File::from(
+            openat(
+                &directory,
+                name,
+                file_flags | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|_| RouteError::InvalidCa)?,
+        )
+    } else {
+        // An explicit CA may be a system-owned file or user-selected symlink.
+        File::from(open(path, file_flags, Mode::empty()).map_err(|_| RouteError::InvalidCa)?)
+    };
+    let metadata = file.metadata().map_err(|_| RouteError::InvalidCa)?;
+    if !metadata.is_file()
+        || metadata.len() > MAX_CA_BYTES as u64
+        || (private
+            && (metadata.uid() != uid || metadata.mode() & 0o077 != 0 || metadata.nlink() != 1))
+    {
+        return Err(RouteError::InvalidCa);
+    }
+    let mut pem = String::new();
+    file.take((MAX_CA_BYTES + 1) as u64)
+        .read_to_string(&mut pem)
+        .map_err(|_| RouteError::InvalidCa)?;
+    validate_ca_pem(&pem).map_err(|_| RouteError::InvalidCa)?;
+    Ok(pem)
 }
 
 /// Runs the production router MCP server over the bounded stdio transport.

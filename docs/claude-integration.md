@@ -2,16 +2,28 @@
 
 ASR has two Claude paths:
 
-- `asr claude` runs the installed Claude Code host with the Claude Channel MCP
-  boundary.
-- `asr gateway claude` owns a managed Claude bridge and uses the retained Node
-  Claude SDK package.
+- Stock Claude Code uses invitation provider `claude-code`. The installer
+  configures a local plugin and the Claude Channel MCP boundary; the
+  `asr claude` launcher supplies the development-Channel opt-in.
+- `asr gateway claude` owns a managed Claude bridge using the retained Node
+  Claude SDK package. This is a lower-level compatibility mode, not an
+  invitation provider.
 
-Both paths accept an optional workspace and a credential whose claims match the
-selected client. Router collaboration and task delivery require an explicit
-workspace join. Pass `--workspace ROOM` to join at startup, or use
-`workspace_join` through stock Claude's MCP tools after launch. Until joined,
-the provider can run local work but receives no router transcript or task delivery:
+For the stock path, use the administrator-generated
+[invitation onboarding prompt](provider-integration.md#invitation-onboarding).
+It installs ASR even when ASR is absent, registers the selected provider, and
+creates a private workspace-scoped credential locally. Do not manually copy a
+long-lived credential or run a second setup flow after invitation installation.
+It requires an existing Claude Code CLI supporting user-scoped local
+marketplaces, plugin install/list and marketplace list JSON inspection, and
+stdio MCP add/get. Provider login/model access remains Claude Code's own setup.
+
+Both paths need explicit workspace membership for router collaboration and task
+delivery. An invitation binding selects the initial workspace; manually
+provisioned hosts can use `--workspace ROOM`, or stock Claude can use
+`workspace_join({"name":"ROOM"})` through MCP. Without a selected/joined workspace,
+local provider work receives no router transcript or task delivery. The
+lower-level explicit-credential command forms are:
 
 ```sh
 asr --profile local --credential "$HOME/.config/agent-session-router/claude-code.json" \
@@ -22,21 +34,63 @@ asr --profile local --credential "$HOME/.config/agent-session-router/claude-sdk.
 
 ## Stock Claude Code and Channel
 
-Prepare the local MCP registration once:
+Invitation installation adds the packaged local marketplace `asr-local` and the
+user-scoped plugin `asr@asr-local`. The plugin supplies `/asr:workspace`, not a
+second MCP server. Its package/skill assets come from the native bundle and its
+version follows Cargo. The installer uses these native host operations, with
+the actual installed absolute paths:
 
-```sh
-asr setup-claude
+```text
+claude plugin marketplace add INSTALLED_CLAUDE_PLUGIN_DIR --scope user
+claude plugin install asr@asr-local --scope user
+claude mcp add --transport stdio --scope user agent-session-router-channel -- ABSOLUTE_ASR --profile office mcp claude-channel
 ```
 
-Then obtain the required development/organization channel opt-in and restart the
-Claude host. The native host launches Claude with the Channel MCP registration;
-it does not rely on a legacy Python process or a shared router environment token.
+These describe installer-owned definitions, not extra setup commands to repeat.
+The fixed MCP name selects one explicit profile for this provider. Its credential,
+CA, and workspace come from that profile binding. Unknown existing marketplace,
+plugin/cache, or MCP definitions are not overwritten, even if their names look
+right; only the exact journal-owned installation can resume. See
+[ownership and resume](provider-integration.md#private-state-ownership-and-resume).
 
-Stock Claude uses an explicit readiness boundary. A successful process launch is
-not a workspace join: join with `--workspace team-room` at startup or
-`workspace_join` after launch, using a credential that grants the room. The
-Channel server must also report ready. Ordinary workspace chat does not wake a
-Claude turn. Claude must inspect task state and explicitly call lifecycle tools.
+`configured` / `restart_required` is not proof that this conversation has loaded
+the plugin, MCP connection, Channel, or a working model. Follow the installer's
+`nextAction`: restart using its absolute-ASR command, whose form is:
+
+```text
+ABSOLUTE_ASR --profile office claude --workspace team-room
+```
+
+This launcher passes
+`--dangerously-load-development-channels server:agent-session-router-channel`.
+Applicable account/organization policy must allow Channels; this is not a
+permission-bypass flag. Ordinary MCP workspace tools and the plugin skill are
+distinct from Channel push/autonomous execution. See
+[Claude Channel integration](claude-channel-integration.md) for that boundary.
+
+In the new Claude Code session:
+
+```text
+/asr:workspace list
+/asr:workspace find team
+/asr:workspace join team-room
+/asr:workspace members
+/asr:workspace history
+/asr:workspace post Hello team
+/asr:workspace status
+/asr:workspace leave
+```
+
+The skill uses this session's actual MCP tools. List/find traverse accessible
+bounded pages; history is bounded and cursor-based. Status must confirm the
+provider's own exact identity in the invited room, not an operator's connection.
+Leave must be confirmed before switching rooms, and active-work/stop fences
+remain in force. Ordinary workspace chat does not wake a Claude turn. Claude
+must inspect task state and explicitly call lifecycle tools.
+
+For a separate manually provisioned installation, `asr setup-claude` remains the
+local MCP setup command; it is not the invitation plugin installer. Obtain the
+required Channel opt-in and restart the host after that setup as well.
 
 Claude Code's provider resume option is explicit:
 
@@ -67,9 +121,11 @@ of the child, and terminates the child when the host is interrupted. The current
 gateway command has no implicit chat-resume behavior; start a new managed session
 after reviewing the checkpoint and use an explicit task transition.
 
-## Credentials and setup
+## Manual credentials and setup
 
-Issue separate credentials for the stock and managed clients:
+The invitation flow provisions its own `claude-code` binding; the following is
+only for manually provisioned stock hosts or the managed SDK route. Issue
+separate credentials for those clients:
 
 ```sh
 asr --profile local credential issue \
@@ -97,9 +153,11 @@ task_checkpoint
 task_pause or task_complete
 ```
 
-The executor calls `task_begin` for the assigned attempt, records summary,
-next steps, artifacts, and risks in `task_checkpoint`, then explicitly pauses or
-completes. A Claude response or readiness event does not begin or complete work.
+Assignment names the intended responsible agent; it does not start execution.
+A request, the actual executor/session's `task_begin`, and completion are
+separate transitions. The executor records summary, next steps, artifacts, and
+risks in `task_checkpoint`, then explicitly pauses or completes. A Claude reply,
+chat message, installation result, or readiness event is not a task transition.
 
 `task interrupt` requests a stop but initially leaves stop evidence unknown.
 Assignment to a replacement is allowed while evidence is unknown, but new
@@ -132,3 +190,10 @@ auto sharing selects local or LAN by bind; without TLS it selects valid Tailscal
 or local on loopback, never plaintext LAN. See the
 [README transport examples](../README.md#profiles-remote-routers-and-tls).
 Certificate verification is never disabled to make Claude connect.
+
+Invitation candidates must already be reachable routes to the same server.
+Only advertised/supplied Tailnet → LAN → public candidates are tried, and trust
+or server-identity mismatches stop the flow. Local-only invitations are not
+remote access. Installation does not create TLS certificates, public tunnels,
+Tailscale membership, or firewall/ACL exceptions. See the
+[invitation network contract](provider-integration.md#network-and-trust).

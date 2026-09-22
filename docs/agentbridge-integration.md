@@ -8,7 +8,13 @@ boundaries. AgentBridge can remain an external system, but there is no built-in
 command that attaches it, imports its sessions, or translates its environment
 contract.
 
-Use the native provider commands for current integrations:
+AgentBridge is not an invitation provider. The supported stock onboarding
+providers are exactly `omp`, `claude-code`, and `codex-cli`; use an administrator's
+[generated invitation](provider-integration.md#invitation-onboarding) for those
+hosts, without preinstalling ASR or manually copying long-lived credentials.
+That flow neither installs AgentBridge nor imports its sessions.
+
+For separately provisioned native integrations, the lower-level commands remain:
 
 ```sh
 asr --profile local --credential "$HOME/.config/agent-session-router/codex.json" \
@@ -18,11 +24,14 @@ asr --profile local --credential "$HOME/.config/agent-session-router/claude.json
 ```
 
 These commands use an explicit workspace for router collaboration and delivery,
-plus a scoped credential. A local provider prompt can omit the workspace and
-receives no router transcript or task delivery until explicitly joined. Stock
-Claude can call `workspace_join` through MCP after launch; interactive Codex
-supports `/workspace join ROOM`. The commands do not read an AgentBridge personal
-backlog or consume the old shared-token launcher environment.
+plus a scoped credential. Without a selected/joined workspace, a local provider
+prompt receives no router transcript or task delivery. Stock Claude can call
+`workspace_join({"name":"ROOM"})` through MCP after launch; interactive Codex
+supports `/workspace join ROOM`. The managed SDK/App Server routes documented in
+[Claude integration](claude-integration.md) and [Codex integration](codex-integration.md)
+remain distinct compatibility modes, not additional invitation providers. These
+commands do not read an AgentBridge personal backlog or consume the old
+shared-token launcher environment.
 
 ## Upstream reference
 
@@ -43,16 +52,20 @@ They do not define ASR v2's identity, workspace, or task lifecycle.
 
 | AgentBridge concept | Native ASR v2 boundary |
 | --- | --- |
-| Attach/admission | A scoped credential plus explicit `workspace_join`. |
+| Attach/admission | A scoped credential plus explicit workspace membership (invitation startup binding or MCP `workspace_join({"name":"ROOM"})`). |
 | Agent identity | Credential subject, side, client, and workspace grants. |
 | Turn delivery | Durable task request to a joined-ready provider; stock Codex uses explicit MCP pull, while Channel uses a correlated notification. |
 | Reply correlation | `request_id` and provider-specific reply tools; replies do not complete tasks. |
 | Session handoff | `task interrupt`, confirmed stop evidence (automatic managed-host evidence or operator recovery), then a new request/attempt in a new provider session. |
 | External work item | An administrator-configured GitHub or Linear target and an explicit import/link/publish command. |
+| Assignment/execution | Assignee names responsibility; only the requested attempt's `task_begin` establishes its actual executor/session. Chat and replies are not task completion. |
 
 No concept mapping automatically migrates an AgentBridge session. A migration
-must create or select an ASR workspace, issue scoped credentials, and review any
-prior checkpoint before beginning work.
+must have an administrator create/select the ASR workspace, obtain an invitation
+for a supported stock host or separately issue the appropriate managed credential,
+and review any prior checkpoint before beginning work. Invitation installation
+records configuration (`configured` / `restart_required`), not active membership
+or model execution; verify the new provider through its own actual MCP tools.
 
 Assignment to a replacement is permitted while stop evidence is unknown, but a
 new `task_request` or `task_begin` is fenced. Managed hosts can automatically

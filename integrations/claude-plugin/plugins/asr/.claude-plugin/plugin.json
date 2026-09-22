@@ -1,0 +1,4 @@
+{
+  "name": "asr",
+  "description": "Use the current provider's ASR MCP connection to discover, join, and work in accessible workspaces."
+}

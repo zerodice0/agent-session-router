@@ -2,21 +2,29 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    fs::{self, File},
+    io::{self, Read, Write},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
 };
 
+use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, open, openat, renameat, unlinkat};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
-use crate::protocol::{RouterErrorCode, WorkspaceName};
+use crate::{
+    bootstrap::routes::persist_ca,
+    onboarding::{
+        OnboardingProvider, OnboardingRoute, OnboardingTicket, RouteKind, validate_routes,
+    },
+    protocol::{RouterErrorCode, WorkspaceName},
+};
 
 pub const DEFAULT_ROUTER_URL: &str = "ws://127.0.0.1:8787/ws";
 pub const DEFAULT_PROFILE: &str = "local";
-pub const CONFIG_VERSION: u8 = 1;
+pub const CONFIG_VERSION: u8 = 2;
 pub const DELEGATE_CONTEXT_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -30,9 +38,52 @@ pub struct ConfigFile {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Profile {
     pub router_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<StoredOnboardingRoute>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<OnboardingProvider, ProviderBinding>,
+}
+
+impl Profile {
+    #[must_use]
+    pub fn manual(router_url: String) -> Self {
+        Self {
+            router_url,
+            server_id: None,
+            routes: Vec::new(),
+            bindings: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredOnboardingRoute {
+    pub kind: RouteKind,
+    pub router_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderBinding {
+    pub credential_file: PathBuf,
+    pub workspace: WorkspaceName,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderSelection {
+    pub selection: Selection,
+    pub routes: Vec<StoredOnboardingRoute>,
+    pub ca_file: Option<PathBuf>,
+    pub initial_workspace: Option<WorkspaceName>,
+    pub expected_server_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -78,6 +129,10 @@ pub enum ConfigError {
     InvalidProfile,
     #[error("invalid_delegate_context")]
     InvalidDelegateContext,
+    #[error("profile_conflict")]
+    ProfileConflict,
+    #[error("binding_conflict")]
+    BindingConflict,
     #[error("configuration_io")]
     Io(#[from] io::Error),
 }
@@ -90,7 +145,9 @@ impl From<ConfigError> for RouterErrorCode {
             ConfigError::Invalid
             | ConfigError::InvalidUrl
             | ConfigError::InvalidProfile
-            | ConfigError::InvalidDelegateContext => Self::InvalidMessage,
+            | ConfigError::InvalidDelegateContext
+            | ConfigError::ProfileConflict
+            | ConfigError::BindingConflict => Self::InvalidMessage,
         }
     }
 }
@@ -127,48 +184,139 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 }
 
 pub fn load_config(path: &Path) -> Result<ConfigFile, ConfigError> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            if bytes.len() > 256 * 1024 {
-                return Err(ConfigError::Invalid);
-            }
-            let config: ConfigFile =
-                serde_json::from_slice(&bytes).map_err(|_| ConfigError::Invalid)?;
-            validate_config(&config)?;
-            Ok(config)
+    let result = (|| {
+        let parent = open_config_parent(path, false)?;
+        let file = openat(
+            &parent,
+            path.file_name().ok_or(ConfigError::Invalid)?,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from)?;
+        if !file.metadata()?.is_file() {
+            return Err(ConfigError::Invalid);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ConfigFile {
+        let mut bytes = Vec::new();
+        file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 256 * 1024 {
+            return Err(ConfigError::Invalid);
+        }
+        let config: ConfigFile =
+            serde_json::from_slice(&bytes).map_err(|_| ConfigError::Invalid)?;
+        validate_config(&config)?;
+        Ok(config)
+    })();
+    match result {
+        Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(ConfigFile {
             version: CONFIG_VERSION,
             ..ConfigFile::default()
         }),
-        Err(error) => Err(ConfigError::Io(error)),
+        other => other,
     }
 }
 
 pub fn save_config(path: &Path, config: &ConfigFile) -> Result<(), ConfigError> {
     validate_config(config)?;
-    let parent = path.parent().ok_or(ConfigError::Invalid)?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    let payload = serde_json::to_vec(config).map_err(|_| ConfigError::Invalid)?;
-    let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let parent = open_config_parent(path, true)?;
+    let metadata = parent.metadata()?;
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(ConfigError::Invalid);
+    }
+    parent.set_permissions(fs::Permissions::from_mode(0o700))?;
+    let name = path.file_name().ok_or(ConfigError::Invalid)?;
+    let existing = config_file_identity(&parent, name)?;
+    let mut current = config.clone();
+    current.version = CONFIG_VERSION;
+    let payload = serde_json::to_vec(&current).map_err(|_| ConfigError::Invalid)?;
+    if payload.len() + 1 > 256 * 1024 {
+        return Err(ConfigError::Invalid);
+    }
+    let temporary = format!(".config-{}.tmp", Uuid::new_v4());
+    let fd = openat(
+        &parent,
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(io::Error::from)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
+        let mut file = File::from(fd);
         file.write_all(&payload)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&temp, path)?;
-        File::open(parent)?.sync_all()?;
-        Ok::<(), io::Error>(())
+        if config_file_identity(&parent, name)? != existing {
+            return Err(ConfigError::Invalid);
+        }
+        if existing.is_some() {
+            renameat(&parent, temporary.as_str(), &parent, name).map_err(io::Error::from)?;
+        } else {
+            linkat(&parent, temporary.as_str(), &parent, name, AtFlags::empty())
+                .map_err(io::Error::from)?;
+            unlinkat(&parent, temporary.as_str(), AtFlags::empty()).map_err(io::Error::from)?;
+        }
+        parent.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = unlinkat(&parent, temporary.as_str(), AtFlags::empty());
     }
-    result.map_err(ConfigError::Io)
+    result
+}
+
+fn config_file_identity(parent: &File, name: &OsStr) -> Result<Option<(u64, u64)>, ConfigError> {
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let metadata = File::from(fd).metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != rustix::process::getuid().as_raw()
+                || metadata.nlink() != 1
+            {
+                return Err(ConfigError::Invalid);
+            }
+            Ok(Some((metadata.dev(), metadata.ino())))
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(ConfigError::Io(error.into())),
+    }
+}
+
+fn open_config_parent(path: &Path, create: bool) -> Result<File, ConfigError> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let mut directory = File::from(
+        open(
+            if path.is_absolute() { "/" } else { "." },
+            flags,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    for component in path.parent().ok_or(ConfigError::Invalid)?.components() {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir | Component::Prefix(_) => return Err(ConfigError::Invalid),
+        };
+        let fd = match openat(&directory, name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) if create => {
+                match mkdirat(&directory, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(ConfigError::Io(error.into())),
+                }
+                directory.sync_all()?;
+                openat(&directory, name, flags, Mode::empty()).map_err(io::Error::from)?
+            }
+            Err(error) => return Err(ConfigError::Io(error.into())),
+        };
+        directory = File::from(fd);
+    }
+    Ok(directory)
 }
 
 pub fn select(
@@ -177,16 +325,24 @@ pub fn select(
 ) -> Result<Selection, ConfigError> {
     let path = config_path()?;
     let config = load_config(&path)?;
+    select_from_config(&config, explicit_profile, explicit_credential)
+}
+
+fn select_from_config(
+    config: &ConfigFile,
+    explicit_profile: Option<&str>,
+    explicit_credential: Option<&Path>,
+) -> Result<Selection, ConfigError> {
     let environment_url = env::var("ROUTER_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let (profile, raw_url) = if let Some(profile) = explicit_profile {
-        let raw = profile_url(&config, profile)?;
+        let raw = profile_url(config, profile)?;
         (Some(profile.to_owned()), raw)
     } else if let Some(raw) = environment_url {
         (None, raw)
     } else if let Some(profile) = &config.default_profile {
-        let raw = profile_url(&config, profile)?;
+        let raw = profile_url(config, profile)?;
         (Some(profile.clone()), raw)
     } else {
         (
@@ -204,6 +360,173 @@ pub fn select(
         router_url: normalize_router_url(&raw_url)?,
         credential_file,
     })
+}
+
+pub fn select_provider(
+    explicit_profile: Option<&str>,
+    explicit_credential: Option<&Path>,
+    provider: OnboardingProvider,
+) -> Result<ProviderSelection, ConfigError> {
+    let config = load_config(&config_path()?)?;
+    let selection = select_from_config(&config, explicit_profile, explicit_credential)?;
+    let profile = selection
+        .profile
+        .as_ref()
+        .and_then(|name| config.profiles.get(name));
+    let mut result = ProviderSelection {
+        selection,
+        routes: Vec::new(),
+        ca_file: env::var_os("ASR_CA_FILE")
+            .filter(|value| !value.is_empty())
+            .map(|value| expand_home(&value))
+            .transpose()?,
+        initial_workspace: None,
+        expected_server_id: None,
+    };
+    if let Some(profile) = profile {
+        result.routes.clone_from(&profile.routes);
+        result.expected_server_id = profile.server_id;
+        if let Some(binding) = profile.bindings.get(&provider) {
+            if result.selection.credential_file.is_none() {
+                result.selection.credential_file = Some(binding.credential_file.clone());
+            }
+            result.initial_workspace = Some(binding.workspace.clone());
+        }
+        if result.ca_file.is_none() {
+            result.ca_file = profile
+                .routes
+                .iter()
+                .find(|route| {
+                    normalize_router_url(&route.router_url).ok().as_ref()
+                        == Some(&result.selection.router_url)
+                })
+                .and_then(|route| route.ca_file.clone());
+        }
+    }
+    Ok(result)
+}
+
+pub fn store_onboarding_routes(
+    routes: &[OnboardingRoute],
+    ca_directory: &Path,
+) -> Result<Vec<StoredOnboardingRoute>, ConfigError> {
+    validate_routes(routes).map_err(|_| ConfigError::Invalid)?;
+    validate_stored_path(&ca_directory.join("certificate.pem"))?;
+    routes
+        .iter()
+        .map(|route| {
+            Ok(StoredOnboardingRoute {
+                kind: route.kind,
+                router_url: normalize_router_url(&route.router_url)?.to_string(),
+                ca_file: route
+                    .ca_pem
+                    .as_deref()
+                    .map(|pem| persist_ca(ca_directory, pem).map_err(|_| ConfigError::Invalid))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// The caller holds the configuration lock through exchange and publication.
+pub fn check_onboarding_binding(
+    path: &Path,
+    ticket: &OnboardingTicket,
+    provider: OnboardingProvider,
+    credential_file: &Path,
+) -> Result<(), ConfigError> {
+    ticket.validate().map_err(|_| ConfigError::Invalid)?;
+    if ticket.provider.is_some_and(|expected| expected != provider) {
+        return Err(ConfigError::BindingConflict);
+    }
+    validate_stored_path(credential_file)?;
+    let config = load_config(path)?;
+    check_binding(&config, ticket, provider, credential_file)?;
+    let parent = open_config_parent(path, true)?;
+    if parent.metadata()?.uid() != rustix::process::getuid().as_raw() {
+        return Err(ConfigError::Invalid);
+    }
+    config_file_identity(&parent, path.file_name().ok_or(ConfigError::Invalid)?)?;
+    // Exercise the same directory publication requires before consuming an invite.
+    let temporary = format!(".config-preflight-{}.tmp", Uuid::new_v4());
+    let fd = openat(
+        &parent,
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(io::Error::from)?;
+    let synced = File::from(fd).sync_all();
+    let removed = unlinkat(&parent, temporary.as_str(), AtFlags::empty());
+    synced?;
+    removed.map_err(io::Error::from)?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+fn check_binding(
+    config: &ConfigFile,
+    ticket: &OnboardingTicket,
+    provider: OnboardingProvider,
+    credential_file: &Path,
+) -> Result<(), ConfigError> {
+    if let Some(profile) = config.profiles.get(&ticket.profile_name) {
+        if profile.server_id != Some(ticket.server_id) {
+            return Err(ConfigError::ProfileConflict);
+        }
+        if profile.bindings.get(&provider).is_some_and(|binding| {
+            binding.credential_file != credential_file || binding.workspace != ticket.workspace
+        }) {
+            return Err(ConfigError::BindingConflict);
+        }
+    }
+    Ok(())
+}
+
+/// The caller holds the configuration lock; unrelated bindings are retained.
+pub fn publish_onboarding_binding(
+    path: &Path,
+    ticket: &OnboardingTicket,
+    provider: OnboardingProvider,
+    credential_file: &Path,
+    router_url: &str,
+    routes: Vec<StoredOnboardingRoute>,
+) -> Result<(), ConfigError> {
+    check_onboarding_binding(path, ticket, provider, credential_file)?;
+    validate_stored_routes(&routes)?;
+    let router_url = normalize_router_url(router_url)?.to_string();
+    if routes.len() != ticket.routes.len()
+        || !routes.iter().any(|route| route.router_url == router_url)
+    {
+        return Err(ConfigError::Invalid);
+    }
+    for route in &routes {
+        if !ticket.routes.iter().any(|candidate| {
+            candidate.kind == route.kind
+                && normalize_router_url(&candidate.router_url)
+                    .is_ok_and(|url| url.as_str() == route.router_url)
+                && candidate.ca_pem.is_some() == route.ca_file.is_some()
+        }) {
+            return Err(ConfigError::Invalid);
+        }
+    }
+    let mut config = load_config(path)?;
+    check_binding(&config, ticket, provider, credential_file)?;
+    let profile = config
+        .profiles
+        .entry(ticket.profile_name.clone())
+        .or_insert_with(|| Profile::manual(router_url.clone()));
+    profile.server_id = Some(ticket.server_id);
+    profile.router_url = router_url;
+    profile.routes = routes;
+    profile.bindings.insert(
+        provider,
+        ProviderBinding {
+            credential_file: credential_file.to_path_buf(),
+            workspace: ticket.workspace.clone(),
+        },
+    );
+    save_config(path, &config)
 }
 
 pub fn normalize_router_url(raw: &str) -> Result<Url, ConfigError> {
@@ -255,7 +578,7 @@ pub fn validate_workspace_argument(value: &str) -> Result<WorkspaceName, ConfigE
 }
 
 fn validate_config(config: &ConfigFile) -> Result<(), ConfigError> {
-    if config.version != CONFIG_VERSION {
+    if !matches!(config.version, 1 | CONFIG_VERSION) {
         return Err(ConfigError::Invalid);
     }
     if let Some(default) = &config.default_profile {
@@ -270,6 +593,78 @@ fn validate_config(config: &ConfigFile) -> Result<(), ConfigError> {
             return Err(ConfigError::Invalid);
         }
         normalize_router_url(&profile.router_url)?;
+        if profile.server_id.is_some_and(|id| id.is_nil())
+            || (profile.server_id.is_none()
+                && (!profile.routes.is_empty() || !profile.bindings.is_empty()))
+        {
+            return Err(ConfigError::Invalid);
+        }
+        if profile.server_id.is_some() {
+            validate_stored_routes(&profile.routes)?;
+            if !profile.routes.iter().any(|route| {
+                normalize_router_url(&route.router_url).ok()
+                    == normalize_router_url(&profile.router_url).ok()
+            }) {
+                return Err(ConfigError::Invalid);
+            }
+        }
+        for binding in profile.bindings.values() {
+            validate_stored_path(&binding.credential_file)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_stored_routes(routes: &[StoredOnboardingRoute]) -> Result<(), ConfigError> {
+    let candidates = routes
+        .iter()
+        .map(|route| {
+            let url = normalize_router_url(&route.router_url)?;
+            if let Some(path) = &route.ca_file {
+                if url.scheme() != "wss" {
+                    return Err(ConfigError::Invalid);
+                }
+                validate_stored_path(path)?;
+            }
+            Ok(OnboardingRoute {
+                kind: route.kind,
+                router_url: url.to_string(),
+                ca_pem: None,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    validate_routes(&candidates).map_err(|_| ConfigError::Invalid)
+}
+
+fn validate_stored_path(path: &Path) -> Result<(), ConfigError> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .to_str()
+            .is_none_or(|value| value.chars().any(char::is_control))
+    {
+        return Err(ConfigError::Invalid);
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => current.push(component),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(ConfigError::Invalid);
+            }
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || (current != path && !metadata.is_dir())
+                    || (current == path && !metadata.is_file()) =>
+            {
+                return Err(ConfigError::Invalid);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ConfigError::Io(error)),
+        }
     }
     Ok(())
 }

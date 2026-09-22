@@ -17,12 +17,17 @@ pub const INTEGRATIONS_ENV: &str = "ASR_INTEGRATIONS_DIR";
 pub const BINARY_NAME: &str = "asr";
 pub const LEGACY_LAUNCHER_NAME: &str = "agent-session-router";
 const SHARE_RELATIVE: &str = "share/agent-session-router/integrations";
-const REQUIRED_ASSETS: [&str; 5] = [
+const REQUIRED_ASSETS: [&str; 10] = [
     "omp/index.js",
     "omp/package.json",
     "claude-sdk/bridge.js",
     "claude-sdk/manifest.json",
     "claude-sdk/package.json",
+    "claude-plugin/.claude-plugin/marketplace.json",
+    "claude-plugin/plugins/asr/.claude-plugin/plugin.json",
+    "claude-plugin/plugins/asr/skills/workspace/SKILL.md",
+    "codex/skills/asr/SKILL.md",
+    "omp/skills/asr/SKILL.md",
 ];
 
 #[derive(Debug, Error)]

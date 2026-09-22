@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use agent_session_router::{
-    client::{ClientConfig, ClientError, ClientEvent, ClientRole, RouterClient},
+    client::{
+        ClientConfig, ClientConnectionState, ClientError, ClientEvent, ClientRole, RouterClient,
+    },
     credentials::{CredentialFile, CredentialRole},
     protocol::{
         AgentClient, AgentDescriptor, AgentRegistration, AgentSide, AgentStatus, ClientMessage,
@@ -239,6 +241,8 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
     let workspace = WorkspaceName::parse("restore-room").expect("valid workspace");
     let server_workspace = workspace.clone();
     let (restored_tx, restored_rx) = tokio::sync::oneshot::channel();
+    let (unsubscribe_seen_tx, unsubscribe_seen_rx) = tokio::sync::oneshot::channel();
+    let closed_attempts = [Uuid::new_v4(), Uuid::new_v4()];
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("first restore connection");
         let mut socket = accept_async(stream).await.expect("first restore websocket");
@@ -274,6 +278,40 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
             },
         )
         .await;
+        let ClientMessage::WorkspaceUnsubscribe {
+            request_id: old_unsubscribe,
+        } = recv_client(&mut socket).await
+        else {
+            panic!("expected pending unsubscribe");
+        };
+        unsubscribe_seen_tx
+            .send(())
+            .expect("signal pending unsubscribe");
+        let ClientMessage::WorkspaceSubscribe { request_id, after } =
+            recv_client(&mut socket).await
+        else {
+            panic!("expected newer subscription");
+        };
+        assert_eq!(after, 0);
+        send_server(
+            &mut socket,
+            &ServerMessage::WorkspaceSubscription {
+                request_id,
+                workspace: server_workspace.clone(),
+                events: Vec::new(),
+                next_cursor: 3,
+                live: true,
+            },
+        )
+        .await;
+        let stale_unsubscribe = ServerMessage::WorkspaceUnsubscribed {
+            request_id: old_unsubscribe,
+            workspace: server_workspace.clone(),
+        };
+        // Neither the older pending operation nor its unmatched duplicate may erase
+        // the newer subscription, even though both name the same workspace.
+        send_server(&mut socket, &stale_unsubscribe).await;
+        send_server(&mut socket, &stale_unsubscribe).await;
         assert!(matches!(
             recv_client(&mut socket).await,
             ClientMessage::Ping { request_id } if request_id == "cursor-fence"
@@ -298,6 +336,18 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
         assert_eq!(name, server_workspace);
         send_server(
             &mut socket,
+            &ServerMessage::TaskAttemptChanged {
+                workspace: server_workspace.clone(),
+                task_id: 81,
+                attempt: None,
+                closed_attempt_id: Some(closed_attempts[0]),
+                current: None,
+                stop_pending: None,
+            },
+        )
+        .await;
+        send_server(
+            &mut socket,
             &ServerMessage::WorkspaceJoined {
                 request_id,
                 workspace: server_workspace.clone(),
@@ -311,6 +361,18 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
             panic!("expected restored workspace subscription");
         };
         assert_eq!(after, 7);
+        send_server(
+            &mut socket,
+            &ServerMessage::TaskAttemptChanged {
+                workspace: server_workspace.clone(),
+                task_id: 82,
+                attempt: None,
+                closed_attempt_id: Some(closed_attempts[1]),
+                current: None,
+                stop_pending: None,
+            },
+        )
+        .await;
         send_server(
             &mut socket,
             &ServerMessage::WorkspaceSubscription {
@@ -339,19 +401,30 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
 
     let credential = CredentialFile::generate(
         CredentialRole::Operator,
-        "restore-test".to_owned(),
+        "admin".to_owned(),
         None,
         None,
         Vec::new(),
     )
     .expect("restore credential");
-    let (client, _events) = RouterClient::connect(ClientConfig {
+    let (client, mut events) = RouterClient::connect(ClientConfig {
         router_url: Url::parse(&format!("ws://{address}")).expect("restore URL"),
         role: ClientRole::Operator { credential },
         ca_file: None,
     })
     .await
     .expect("connect restore client");
+    let mut state = client.connection_state();
+    assert_eq!(
+        *state.borrow_and_update(),
+        ClientConnectionState::Connected { epoch: 1 }
+    );
+    assert_eq!(client.session_id(), None);
+    assert_eq!(
+        client.operator_is_admin(),
+        Some(false),
+        "local admin-shaped claims must not override authenticated registration",
+    );
     client
         .workspace_join(workspace.clone())
         .await
@@ -361,6 +434,31 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
         .await
         .expect("initial subscription");
     assert!(live);
+    let unsubscribe_client = client.clone();
+    let unsubscribe = tokio::spawn(async move {
+        unsubscribe_client
+            .call(ClientMessage::WorkspaceUnsubscribe {
+                request_id: "older-unsubscribe".to_owned(),
+            })
+            .await
+    });
+    unsubscribe_seen_rx
+        .await
+        .expect("unsubscribe reached server");
+    assert!(
+        client
+            .workspace_subscribe(0)
+            .await
+            .expect("newer subscription")
+            .2
+    );
+    assert!(matches!(
+        unsubscribe
+            .await
+            .expect("unsubscribe task")
+            .expect("unsubscribe response"),
+        ServerMessage::WorkspaceUnsubscribed { .. }
+    ));
     client.ack_event(workspace, 7).expect("ack event cursor");
     assert!(matches!(
         client
@@ -375,6 +473,30 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
         .await
         .expect("restore timeout")
         .expect("restore signal");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        state.wait_for(|value| *value == (ClientConnectionState::Connected { epoch: 2 })),
+    )
+    .await
+    .expect("connected epoch deadline")
+    .expect("connected epoch sender");
+    for (task_id, closed_attempt_id) in [(81, closed_attempts[0]), (82, closed_attempts[1])] {
+        let item = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .expect("restored attempt deadline")
+            .expect("restored attempt event");
+        assert!(matches!(
+            item.event,
+            ClientEvent::TaskAttemptChanged {
+                task_id: received,
+                attempt: None,
+                closed_attempt_id: Some(closed),
+                current: None,
+                stop_pending: None,
+                ..
+            } if received == task_id && closed == closed_attempt_id
+        ));
+    }
     assert!(matches!(
         client
             .call(ClientMessage::Ping {
@@ -385,6 +507,14 @@ async fn reconnect_restores_membership_subscription_and_acknowledged_cursor() {
         ServerMessage::Pong { .. }
     ));
     client.close().await.expect("close restore client");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        state.wait_for(|value| *value == (ClientConnectionState::Closed { reason: None })),
+    )
+    .await
+    .expect("closed state deadline")
+    .expect("closed state sender");
+    assert_eq!(client.operator_is_admin(), None);
     server.await.expect("join restore server");
 }
 
@@ -787,4 +917,226 @@ async fn typed_reply_completes_after_same_socket_write_without_server_ack() {
             error: Some(RouterErrorCode::ProviderError),
         } if request_id == "inbound-request"
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn unmatched_or_wrong_workspace_subscription_cannot_resurrect_after_unsubscribe() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind subscription server");
+    let address = listener.local_addr().expect("subscription server address");
+    let workspace = WorkspaceName::parse("subscription-room").expect("workspace");
+    let server_workspace = workspace.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("initial connection");
+        let mut socket = accept_async(stream).await.expect("initial websocket");
+        register_operator(&mut socket).await;
+        let ClientMessage::WorkspaceJoin { request_id, .. } = recv_client(&mut socket).await else {
+            panic!("expected workspace join");
+        };
+        send_server(
+            &mut socket,
+            &ServerMessage::WorkspaceJoined {
+                request_id,
+                workspace: server_workspace.clone(),
+                cursor: 0,
+            },
+        )
+        .await;
+        let ClientMessage::WorkspaceSubscribe { request_id, .. } = recv_client(&mut socket).await
+        else {
+            panic!("expected initial subscription");
+        };
+        let old_subscription = ServerMessage::WorkspaceSubscription {
+            request_id,
+            workspace: server_workspace.clone(),
+            events: Vec::new(),
+            next_cursor: 0,
+            live: true,
+        };
+        send_server(&mut socket, &old_subscription).await;
+        let ClientMessage::WorkspaceUnsubscribe { request_id } = recv_client(&mut socket).await
+        else {
+            panic!("expected confirmed unsubscribe");
+        };
+        send_server(
+            &mut socket,
+            &ServerMessage::WorkspaceUnsubscribed {
+                request_id,
+                workspace: server_workspace.clone(),
+            },
+        )
+        .await;
+        let ClientMessage::WorkspaceSubscribe { request_id, .. } = recv_client(&mut socket).await
+        else {
+            panic!("expected subscription for current workspace");
+        };
+        send_server(
+            &mut socket,
+            &ServerMessage::WorkspaceSubscription {
+                request_id,
+                workspace: WorkspaceName::parse("other-room").expect("other workspace"),
+                events: Vec::new(),
+                next_cursor: 0,
+                live: true,
+            },
+        )
+        .await;
+        // An already-completed request is unmatched, even if its workspace is current.
+        send_server(&mut socket, &old_subscription).await;
+        let ClientMessage::Ping { request_id } = recv_client(&mut socket).await else {
+            panic!("expected association fence");
+        };
+        // Matching a pending ID alone is insufficient: this request was not Subscribe.
+        send_server(
+            &mut socket,
+            &ServerMessage::WorkspaceSubscription {
+                request_id,
+                workspace: server_workspace.clone(),
+                events: Vec::new(),
+                next_cursor: 0,
+                live: true,
+            },
+        )
+        .await;
+        socket
+            .close(None)
+            .await
+            .expect("cut unsubscribed connection");
+        drop(socket);
+
+        let (stream, _) = listener.accept().await.expect("reconnected connection");
+        let mut socket = accept_async(stream).await.expect("reconnected websocket");
+        register_operator(&mut socket).await;
+        let ClientMessage::WorkspaceJoin { request_id, name } = recv_client(&mut socket).await
+        else {
+            panic!("expected retained membership");
+        };
+        assert_eq!(name, server_workspace);
+        send_server(
+            &mut socket,
+            &ServerMessage::WorkspaceJoined {
+                request_id,
+                workspace: server_workspace,
+                cursor: 0,
+            },
+        )
+        .await;
+        let next = tokio::time::timeout(Duration::from_secs(3), recv_client(&mut socket))
+            .await
+            .expect("next command after membership restoration");
+        let ClientMessage::Ping { request_id } = next else {
+            panic!("confirmed unsubscribe must not restore a subscription");
+        };
+        assert_eq!(request_id, "still-unsubscribed");
+        send_server(&mut socket, &ServerMessage::Pong { request_id }).await;
+        let _ = socket.next().await;
+    });
+    let credential = CredentialFile::generate(
+        CredentialRole::Operator,
+        "subscription-test".to_owned(),
+        None,
+        None,
+        Vec::new(),
+    )
+    .expect("operator credential");
+    let (client, _events) = RouterClient::connect(ClientConfig {
+        router_url: Url::parse(&format!("ws://{address}")).expect("server URL"),
+        role: ClientRole::Operator { credential },
+        ca_file: None,
+    })
+    .await
+    .expect("connect operator");
+    let mut state = client.connection_state();
+    client
+        .workspace_join(workspace)
+        .await
+        .expect("join workspace");
+    client
+        .workspace_subscribe(0)
+        .await
+        .expect("initial subscribe");
+    assert!(matches!(
+        client
+            .call(ClientMessage::WorkspaceUnsubscribe {
+                request_id: "confirmed-unsubscribe".to_owned(),
+            })
+            .await
+            .expect("unsubscribe response"),
+        ServerMessage::WorkspaceUnsubscribed { .. }
+    ));
+    client
+        .workspace_subscribe(0)
+        .await
+        .expect("wrong-workspace response");
+    client
+        .call(ClientMessage::Ping {
+            request_id: "association-fence".to_owned(),
+        })
+        .await
+        .expect("wrong-effect response");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        state.wait_for(|value| *value == (ClientConnectionState::Connected { epoch: 2 })),
+    )
+    .await
+    .expect("membership-only reconnect deadline")
+    .expect("state sender");
+    assert!(matches!(
+        client
+            .call_with_deadline(
+                ClientMessage::Ping {
+                    request_id: "still-unsubscribed".to_owned()
+                },
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .expect("call after membership-only restoration"),
+        ServerMessage::Pong { .. }
+    ));
+    client.close().await.expect("close operator");
+    server.await.expect("subscription server task");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_initial_connect_closes_stalled_registration_transport() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled registration server");
+    let address = listener.local_addr().expect("stalled registration address");
+    let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("registration connection");
+        let mut socket = accept_async(stream).await.expect("registration websocket");
+        assert!(matches!(
+            recv_client(&mut socket).await,
+            ClientMessage::RegisterOperator { .. }
+        ));
+        registered_tx.send(()).expect("registration reached server");
+        match tokio::time::timeout(Duration::from_secs(1), socket.next()).await {
+            Ok(None | Some(Err(_) | Ok(Message::Close(_)))) => {}
+            _ => panic!("cancelled connect must promptly release its registration transport"),
+        }
+    });
+    let credential = CredentialFile::generate(
+        CredentialRole::Operator,
+        "cancelled-registration".to_owned(),
+        None,
+        None,
+        Vec::new(),
+    )
+    .expect("registration credential");
+    let connecting = tokio::spawn(RouterClient::connect(ClientConfig {
+        router_url: Url::parse(&format!("ws://{address}")).expect("registration URL"),
+        role: ClientRole::Operator { credential },
+        ca_file: None,
+    }));
+    tokio::time::timeout(Duration::from_secs(3), registered_rx)
+        .await
+        .expect("registration request deadline")
+        .expect("registration request signal");
+    connecting.abort();
+    assert!(connecting.await.is_err_and(|error| error.is_cancelled()));
+    server.await.expect("cancelled registration server");
 }

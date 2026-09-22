@@ -42,6 +42,8 @@ pub struct Cli {
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     Router(RouterArgs),
+    /// Open the console for a running router without starting one.
+    Ui(UiArgs),
     Codex(ProviderArgs),
     #[command(name = "codex-cli")]
     CodexCli(CodexCliArgs),
@@ -59,10 +61,59 @@ pub enum Command {
     Profile(ProfileArgs),
     Workspace(WorkspaceArgs),
     Credential(CredentialArgs),
+    Onboarding(OnboardingArgs),
     Task(TaskArgs),
     Integration(IntegrationArgs),
     Smoke(SmokeArgs),
 }
+
+#[derive(Clone, Debug, Args)]
+pub struct OnboardingArgs {
+    #[command(subcommand)]
+    pub command: OnboardingCommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum OnboardingCommand {
+    Prompt(OnboardingPromptArgs),
+    Revoke {
+        invite_id: Uuid,
+    },
+    Install {
+        #[arg(long, value_enum)]
+        provider: crate::onboarding::OnboardingProvider,
+        #[arg(long, required = true)]
+        stdin: bool,
+    },
+    Resume {
+        invite_id: Uuid,
+        #[arg(long, value_enum)]
+        provider: crate::onboarding::OnboardingProvider,
+    },
+    Status {
+        #[arg(long, value_enum)]
+        provider: crate::onboarding::OnboardingProvider,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OnboardingPromptArgs {
+    #[arg(long)]
+    pub workspace: String,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub create_workspace: bool,
+    #[arg(long, value_enum)]
+    pub provider: Option<crate::onboarding::OnboardingProvider>,
+    #[arg(long = "endpoint", value_name = "KIND=URL")]
+    pub endpoints: Vec<String>,
+    #[arg(long)]
+    pub ca_file: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct McpArgs {
     #[command(subcommand)]
@@ -120,8 +171,18 @@ pub struct RouterArgs {
     pub action: RouterAction,
     #[arg(long)]
     pub background: bool,
+    /// Keep the router in the foreground without opening the console.
+    #[arg(long, conflicts_with = "background")]
+    pub no_ui: bool,
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "auto")]
     pub share: Option<ShareMode>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct UiArgs {
+    /// Select the initial workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -785,15 +846,56 @@ impl OperationIdSource for RandomOperationIds {
     }
 }
 
+/// Check authority-changing globals before reading stdin, including in dry runs.
+pub fn validate_globals(cli: &Cli) -> Result<(), CliError> {
+    match &cli.command {
+        Some(Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Install { .. } | OnboardingCommand::Resume { .. },
+        })) if cli.profile.is_some() || cli.credential.is_some() => Err(CliError::usage(
+            "onboarding_override_forbidden",
+            "install and resume use the invitation authority; omit --profile and --credential",
+        )),
+        Some(Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Status { .. },
+        })) if cli.profile.is_none() || cli.credential.is_some() => Err(CliError::usage(
+            "onboarding_profile_required",
+            "status requires --profile NAME before onboarding and does not accept --credential",
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub fn validate_command(command: &Command) -> Result<(), CliError> {
     match command {
+        Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Resume { invite_id, .. },
+        }) if invite_id.is_nil() => {
+            return Err(CliError::usage(
+                "invalid_invite_id",
+                "invite ID must not be nil",
+            ));
+        }
         Command::Router(args)
-            if args.action == RouterAction::Stop && (args.share.is_some() || args.background) =>
+            if args.action == RouterAction::Stop
+                && (args.share.is_some() || args.background || args.no_ui) =>
         {
             return Err(CliError::usage(
                 "invalid_arguments",
-                "router stop does not accept --share or --background",
+                "router stop does not accept --share, --background, or --no-ui",
             ));
+        }
+        Command::Router(args) if args.no_ui && args.background => {
+            return Err(CliError::usage(
+                "invalid_arguments",
+                "--no-ui conflicts with --background",
+            ));
+        }
+        Command::Ui(args) => {
+            if let Some(workspace) = &args.workspace {
+                crate::config::validate_workspace_argument(workspace).map_err(|_| {
+                    CliError::usage("invalid_workspace", "invalid initial workspace name")
+                })?;
+            }
         }
         Command::Workspace(WorkspaceArgs {
             command: WorkspaceCommand::History { after, limit, .. },
@@ -1038,6 +1140,11 @@ pub fn command_needs_operation_id(command: &Command) -> bool {
 #[must_use]
 pub fn command_uses_json(command: &Command) -> bool {
     match command {
+        Command::Onboarding(OnboardingArgs { command }) => match command {
+            OnboardingCommand::Install { .. } | OnboardingCommand::Resume { .. } => true,
+            OnboardingCommand::Status { json, .. } => *json,
+            _ => false,
+        },
         Command::Workspace(WorkspaceArgs {
             command:
                 WorkspaceCommand::List { json }
@@ -1123,6 +1230,7 @@ pub fn plan_dry_run(
         .as_ref()
         .ok_or_else(|| CliError::usage("command_required", "--dry-run requires a command"))?;
     validate_command(command)?;
+    validate_globals(cli)?;
     let explicit_operation_id = command_operation_id(command);
     let operation_id = command_needs_operation_id(command)
         .then(|| explicit_operation_id.unwrap_or_else(|| operation_ids.next_operation_id()));
@@ -1176,6 +1284,7 @@ fn command_identity(command: &Command) -> (&'static str, Option<&str>, Option<i6
         },
         Command::Task(TaskArgs { command }) => task_identity(command),
         Command::Router(_) => ("router", None, None),
+        Command::Ui(args) => ("ui", args.workspace.as_deref(), None),
         Command::Codex(_) => ("codex", None, None),
         Command::CodexCli(_) => ("codex-cli", None, None),
         Command::Claude(_) => ("claude", None, None),
@@ -1188,6 +1297,21 @@ fn command_identity(command: &Command) -> (&'static str, Option<&str>, Option<i6
         Command::Install(_) => ("install", None, None),
         Command::Profile(_) => ("profile", None, None),
         Command::Credential(_) => ("credential", None, None),
+        Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Revoke { .. },
+        }) => ("onboarding.revoke", None, None),
+        Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Prompt(args),
+        }) => ("onboarding.prompt", Some(&args.workspace), None),
+        Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Install { .. },
+        }) => ("onboarding.install", None, None),
+        Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Resume { .. },
+        }) => ("onboarding.resume", None, None),
+        Command::Onboarding(OnboardingArgs {
+            command: OnboardingCommand::Status { .. },
+        }) => ("onboarding.status", None, None),
         Command::Integration(_) => ("integration", None, None),
         Command::Smoke(args) => ("smoke", Some(&args.workspace), None),
     }

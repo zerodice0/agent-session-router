@@ -51,17 +51,21 @@ impl NativeHarness {
                 .expect("native CLI working directory")
                 .join(executable)
         };
-        Self {
-            root: tempfile::Builder::new()
-                .prefix("router-native-")
-                .tempdir_in(
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .expect("HOME directory"),
-                )
-                .expect("private temporary directory"),
-            executable,
+        let root = tempfile::Builder::new()
+            .prefix("router-native-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .expect("HOME directory"),
+            )
+            .expect("private temporary directory");
+        for name in [".config", ".codex", ".claude", ".omp"] {
+            fs::create_dir(root.path().join(name)).expect("isolated provider directory");
+            fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o700))
+                .expect("private provider directory");
         }
+        Self { root, executable }
     }
 
     fn data_dir(&self) -> PathBuf {
@@ -71,10 +75,20 @@ impl NativeHarness {
     fn process(&self) -> Command {
         let mut command = Command::new(&self.executable);
         command
+            .env("HOME", self.root.path())
+            .env("XDG_CONFIG_HOME", self.root.path().join(".config"))
+            .env("XDG_DATA_HOME", self.root.path().join(".local/share"))
+            .env("CODEX_HOME", self.root.path().join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", self.root.path().join(".claude"))
+            .env("OMP_CONFIG_DIR", self.root.path().join(".omp"))
             .env("ASR_DATA_DIR", self.data_dir())
             .env("ASR_CONFIG_PATH", self.root.path().join("config.json"))
             .env("ASR_BIND", "127.0.0.1:0");
         for key in [
+            "ROUTER_URL",
+            "ASR_CREDENTIAL_FILE",
+            "ASR_BOOTSTRAP_DIR",
+            "ASR_INTEGRATIONS_DIR",
             "ASR_CA_FILE",
             "NODE_EXTRA_CA_CERTS",
             "ROUTER_PUBLIC_URL",
@@ -416,6 +430,64 @@ fn profile_arguments(command: &[&str]) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn native_router_start_preserves_onboarded_this_device_profile() {
+    use agent_session_router::{
+        config::{self, ConfigFile, Profile, ProviderBinding, StoredOnboardingRoute},
+        onboarding::{OnboardingProvider, RouteKind},
+    };
+
+    let harness = NativeHarness::new();
+    let credential_file = agent_credential_file(
+        &harness,
+        "bound-claude",
+        AgentSide::Claude,
+        AgentClient::ClaudeCode,
+    );
+    let endpoint = "wss://onboarded.example/ws".to_owned();
+    let profile = Profile {
+        router_url: endpoint.clone(),
+        server_id: Some(Uuid::new_v4()),
+        routes: vec![StoredOnboardingRoute {
+            kind: RouteKind::Public,
+            router_url: endpoint,
+            ca_file: None,
+        }],
+        bindings: [(
+            OnboardingProvider::ClaudeCode,
+            ProviderBinding {
+                credential_file,
+                workspace: WorkspaceName::parse("existing-room").unwrap(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let expected = serde_json::to_value(&profile).unwrap();
+    let path = harness.root.path().join("config.json");
+    config::save_config(
+        &path,
+        &ConfigFile {
+            version: config::CONFIG_VERSION,
+            default_profile: Some("this-device".to_owned()),
+            profiles: [("this-device".to_owned(), profile)].into_iter().collect(),
+        },
+    )
+    .unwrap();
+
+    // Both initial startup and reuse publish the runtime's convenience profile.
+    for _ in 0..2 {
+        assert_success(&harness.command(["router", "start", "--background"]));
+        let stored = config::load_config(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored.profiles["this-device"]).unwrap(),
+            expected
+        );
+        assert_eq!(stored.default_profile.as_deref(), Some("this-device"));
+    }
+    assert_success(&harness.command(["router", "stop"]));
+}
+
 #[allow(clippy::too_many_lines)]
 #[test]
 fn native_cli_owns_router_profiles_install_workspaces_and_credentials() {
@@ -686,6 +758,71 @@ fn native_cli_owns_router_profiles_install_workspaces_and_credentials() {
     assert_success(&stop);
     assert!(stdout(&stop).contains("router stopped at"));
     assert!(!harness.data_dir().join("router-runtime.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_foreground_no_ui_sigint_stops_server_and_removes_owned_runtime() {
+    let harness = NativeHarness::new();
+    let mut foreground = harness.spawn(["router", "start", "--no-ui"]);
+    let runtime_path = harness.data_dir().join("router-runtime.json");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let record: RuntimeRecord = loop {
+        if let Ok(bytes) = fs::read(&runtime_path)
+            && let Ok(record) = serde_json::from_slice(&bytes)
+        {
+            break record;
+        }
+        assert!(
+            foreground.try_wait().expect("foreground status").is_none(),
+            "foreground router exited before publishing its runtime"
+        );
+        if Instant::now() >= deadline {
+            foreground.kill().expect("kill timed-out foreground CLI");
+            let _ = foreground.wait();
+            panic!("foreground router did not become ready");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Authenticate against the actual server, not just a published startup record.
+    let listed = harness
+        .process()
+        .env("ROUTER_URL", &record.control_url)
+        .args(["workspace", "list", "--json"])
+        .output()
+        .expect("foreground workspace list");
+    assert_success(&listed);
+    let pid = rustix::process::Pid::from_raw(i32::try_from(foreground.id()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).expect("signal private CLI");
+    let deadline =
+        Instant::now() + agent_session_router::process::SHUTDOWN_TIMEOUT + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = foreground.try_wait().expect("foreground exit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            foreground.kill().expect("kill timed-out foreground CLI");
+            let _ = foreground.wait();
+            panic!("foreground CLI did not reap its router after SIGINT");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
+    let address = Url::parse(&record.control_url)
+        .unwrap()
+        .socket_addrs(|| None)
+        .unwrap()[0];
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err(),
+        "the foreground router must stop before the CLI exits"
+    );
+    assert!(
+        agent_session_router::process::RuntimeStore::new(harness.data_dir())
+            .unwrap()
+            .read()
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[cfg(unix)]
@@ -2190,4 +2327,515 @@ fn dry_run_and_noninteractive_usage_have_stable_exit_contracts() {
     let usage = harness.command(std::iter::empty::<&str>());
     assert_eq!(usage.status.code(), Some(2));
     assert!(stderr(&usage).contains("command_required"));
+}
+
+#[test]
+fn native_onboarding_dry_run_never_reads_stdin_or_opens_configuration() {
+    let harness = NativeHarness::new();
+    let forbidden = harness.root.path().join("forbidden-config");
+    symlink("/definitely/not/an/asr/config", &forbidden).unwrap();
+    let mut child = harness
+        .process()
+        .args([
+            "--dry-run",
+            "onboarding",
+            "install",
+            "--provider",
+            "codex-cli",
+            "--stdin",
+        ])
+        .env("ASR_CONFIG_PATH", forbidden)
+        .env("PATH", harness.root.path().join("missing-bin"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep the pipe open and empty: any attempt to read stdin would block.
+    let input = child.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("onboarding dry-run blocked on stdin");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["command"], "onboarding.install");
+    assert!(!harness.root.path().join("onboarding").exists());
+
+    let sentinel = "stdin-secret-must-not-appear";
+    let invalid = harness.command_with_stdin(
+        ["onboarding", "install", "--provider", "omp", "--stdin"],
+        &format!("{{\"inviteToken\":\"{sentinel}\"}}"),
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(stderr(&invalid).contains("invalid_ticket"));
+    assert!(!stdout(&invalid).contains(sentinel));
+    assert!(!stderr(&invalid).contains(sentinel));
+}
+
+fn onboarding_archive(
+    harness: &NativeHarness,
+) -> (
+    agent_session_router::onboarding::BootstrapManifest,
+    String,
+    PathBuf,
+) {
+    use agent_session_router::onboarding::{BootstrapArtifact, BootstrapManifest, VERSION};
+    use sha2::{Digest as _, Sha256};
+    let binary = fs::read(&harness.executable).unwrap();
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+    let mut append = |name: &str, contents: &[u8], mode| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, name, contents).unwrap();
+    };
+    append("bin/asr", &binary, 0o755);
+    let omp_package = serde_json::json!({
+        "name": "@agent-session-router/omp-integration", "version": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string();
+    for asset in [
+        "omp/index.js",
+        "omp/package.json",
+        "claude-sdk/bridge.js",
+        "claude-sdk/manifest.json",
+        "claude-sdk/package.json",
+        "claude-plugin/.claude-plugin/marketplace.json",
+        "claude-plugin/plugins/asr/.claude-plugin/plugin.json",
+        "claude-plugin/plugins/asr/skills/workspace/SKILL.md",
+        "codex/skills/asr/SKILL.md",
+        "omp/skills/asr/SKILL.md",
+    ] {
+        let contents = if asset.ends_with("SKILL.md") {
+            "---\nname: asr\ndescription: Workspace operations\n---\nUse workspace_list and workspace_members.\n"
+        } else if asset == "omp/package.json" {
+            &omp_package
+        } else if std::path::Path::new(asset)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
+            "{}"
+        } else {
+            "export {};\n"
+        };
+        append(
+            &format!("share/agent-session-router/integrations/{asset}"),
+            contents.as_bytes(),
+            0o644,
+        );
+    }
+    let archive = builder.into_inner().unwrap().finish().unwrap();
+    let target = agent_session_router::bootstrap::install::host_target().unwrap();
+    let artifact = BootstrapArtifact {
+        target: target.to_owned(),
+        binary_file: format!("asr-{target}"),
+        binary_sha256: format!("{:x}", Sha256::digest(&binary)),
+        archive_file: format!("agent-session-router-{target}.tar.gz"),
+        archive_sha256: format!("{:x}", Sha256::digest(&archive)),
+        binary_bytes: binary.len() as u64,
+        archive_bytes: archive.len() as u64,
+    };
+    let assets = harness.root.path().join("bootstrap");
+    fs::create_dir(&assets).unwrap();
+    fs::set_permissions(&assets, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(assets.join(&artifact.binary_file), binary).unwrap();
+    fs::write(assets.join(&artifact.archive_file), archive).unwrap();
+    let manifest = BootstrapManifest {
+        version: VERSION,
+        asr_version: env!("CARGO_PKG_VERSION").to_owned(),
+        artifacts: vec![artifact],
+    };
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    fs::write(assets.join("bootstrap-manifest.json"), bytes).unwrap();
+    (manifest, digest, assets)
+}
+
+fn write_onboarding_codex(path: &Path) {
+    // This fixture persists and inspects the actual native adapter's registration.
+    // Enrollment and all subsequent credential assertions use the real router.
+    fs::write(path, r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/provider-calls"
+for arg in "$@"; do
+  if [ "$arg" = --help ]; then
+    if [ -f "$HOME/provider-unsupported" ]; then exit 2; fi
+    printf '%s\n' 'Usage: codex mcp add get list NAME -- COMMAND [ARGS] --json --env --url'
+    exit 0
+  fi
+done
+if [ "$1" = mcp ] && [ "$2" = get ]; then
+  if [ -f "$CODEX_HOME/asr-registry.json" ]; then
+    cat "$CODEX_HOME/asr-registry.json"
+    exit 0
+  fi
+  printf '%s\n' "Error: No MCP server named 'agent_session_router' found." >&2
+  exit 1
+fi
+if [ "$1" = mcp ] && [ "$2" = list ]; then
+  if [ -f "$CODEX_HOME/asr-registry.json" ]; then
+    printf '['; cat "$CODEX_HOME/asr-registry.json"; printf ']'
+  else printf '[]'; fi
+  exit 0
+fi
+if [ "$1" = mcp ] && [ "$2" = add ]; then
+  if [ -f "$HOME/provider-fail-add" ]; then
+    printf '%s\n' 'provider-secret-error-must-not-appear' >&2
+    exit 1
+  fi
+  [ "$3" = agent_session_router ] && [ "$4" = -- ] || exit 2
+  shift 4
+  printf '{"name":"agent_session_router","enabled":true,"transport":{"type":"stdio","command":"%s","args":["%s","%s","%s","%s"],"env":null,"env_vars":[],"cwd":null}}\n' "$1" "$2" "$3" "$4" "$5" > "$CODEX_HOME/asr-registry.json"
+  exit 0
+fi
+exit 2
+"#).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn onboarding_native_command(
+    harness: &NativeHarness,
+    bin: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Output {
+    let mut process = harness.process();
+    process
+        .args(args)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    if let Some(input) = input {
+        let mut child = process
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    } else {
+        process.output().unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn native_onboarding_preflight_resume_and_status_keep_one_identity_without_agent_connections()
+{
+    use agent_session_router::{
+        onboarding::{OnboardingProvider, OnboardingRoute, OnboardingTicket, RouteKind, VERSION},
+        router::{RouterConfig, RouterExposure, RouterRuntime},
+        store::{RouterStore, now_millis},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let harness = NativeHarness::new();
+    let (manifest, manifest_sha256, assets) = onboarding_archive(&harness);
+    let mut store = RouterStore::open(&harness.data_dir()).unwrap();
+    let invite = store
+        .issue_onboarding_invite(
+            &WorkspaceName::parse("install-room").unwrap(),
+            true,
+            Some(OnboardingProvider::CodexCli),
+            now_millis().unwrap(),
+        )
+        .unwrap();
+    store.close().unwrap();
+    let runtime = RouterRuntime::start(RouterConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        data_dir: harness.data_dir(),
+        instance_id: Uuid::new_v4(),
+        tls_cert_file: None,
+        tls_key_file: None,
+        public_url: None,
+        exposure: RouterExposure::Direct,
+        onboarding_assets_dir: Some(assets.clone()),
+    })
+    .await
+    .unwrap();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let sockets = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = format!("http://{}", runtime.address);
+    let handler = {
+        let posts = posts.clone();
+        let sockets = sockets.clone();
+        move |request: axum::extract::Request| {
+            let posts = posts.clone();
+            let sockets = sockets.clone();
+            let upstream = upstream.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                if path == "/ws" {
+                    sockets.fetch_add(1, Ordering::SeqCst);
+                    return axum::http::Response::builder()
+                        .status(503)
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
+                if path == "/onboarding/enroll" {
+                    posts.fetch_add(1, Ordering::SeqCst);
+                }
+                let method = request.method().clone();
+                let body = axum::body::to_bytes(request.into_body(), 128 * 1024)
+                    .await
+                    .unwrap();
+                let response = reqwest::Client::new()
+                    .request(method, format!("{upstream}{path}"))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let mime = response.headers().get("content-type").cloned();
+                let bytes = response.bytes().await.unwrap();
+                let mut builder = axum::http::Response::builder().status(status);
+                if let Some(mime) = mime {
+                    builder = builder.header("content-type", mime);
+                }
+                builder.body(axum::body::Body::from(bytes)).unwrap()
+            }
+        }
+    };
+    let proxy = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().fallback(handler))
+            .await
+            .unwrap();
+    });
+    let ticket = OnboardingTicket {
+        version: VERSION,
+        server_id: invite.server_id,
+        invite_id: invite.invite_id,
+        invite_token: invite.invite_token,
+        expires_at: invite.expires_at,
+        profile_name: "office".into(),
+        workspace: invite.workspace,
+        provider: invite.provider,
+        routes: vec![OnboardingRoute {
+            kind: RouteKind::Local,
+            router_url: format!("ws://{address}/ws"),
+            ca_pem: None,
+        }],
+        manifest_sha256,
+        artifacts: manifest.artifacts,
+    };
+    let input = serde_json::to_vec(&ticket).unwrap();
+    let bin = harness.root.path().join("provider-bin");
+    fs::create_dir(&bin).unwrap();
+    write_onboarding_codex(&bin.join("codex"));
+    let install = [
+        "onboarding",
+        "install",
+        "--provider",
+        "codex-cli",
+        "--stdin",
+    ];
+    let oversized = vec![b'x'; 128 * 1024 + 1];
+    let too_large = onboarding_native_command(&harness, &bin, &install, Some(&oversized));
+    assert_eq!(too_large.status.code(), Some(2));
+    assert!(stderr(&too_large).contains("stdin_too_large"));
+    let mismatch = onboarding_native_command(
+        &harness,
+        &bin,
+        &["onboarding", "install", "--provider", "omp", "--stdin"],
+        Some(&input),
+    );
+    assert_eq!(mismatch.status.code(), Some(2));
+    assert!(stderr(&mismatch).contains("provider_mismatch"));
+    let mut extra_field: Value = serde_json::from_slice(&input).unwrap();
+    extra_field["credentialToken"] = Value::String("unknown-secret-field".into());
+    let invalid = onboarding_native_command(
+        &harness,
+        &bin,
+        &install,
+        Some(&serde_json::to_vec(&extra_field).unwrap()),
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(!stderr(&invalid).contains("unknown-secret-field"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    fs::write(harness.root.path().join("provider-unsupported"), "").unwrap();
+    let refused = onboarding_native_command(&harness, &bin, &install, Some(&input));
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("host_upgrade_required"),
+        "unexpected preflight error: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        0,
+        "feature failure must not consume invitation"
+    );
+    fs::remove_file(harness.root.path().join("provider-unsupported")).unwrap();
+    fs::write(
+        harness.root.path().join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2, "profiles": {"office": {"routerUrl": "ws://127.0.0.1:8787/ws"}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let profile_conflict = onboarding_native_command(&harness, &bin, &install, Some(&input));
+    assert!(stderr(&profile_conflict).contains("profile_conflict"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    fs::remove_file(harness.root.path().join("config.json")).unwrap();
+    let skill = harness.root.path().join(".agents/skills/asr/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(&skill, "unknown user skill").unwrap();
+    let conflict = onboarding_native_command(&harness, &bin, &install, Some(&input));
+    assert!(stderr(&conflict).contains("provider_configuration_conflict"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read_to_string(&skill).unwrap(), "unknown user skill");
+    fs::remove_dir_all(skill.parent().unwrap()).unwrap();
+
+    fs::write(harness.root.path().join("provider-fail-add"), "").unwrap();
+    let interrupted = onboarding_native_command(&harness, &bin, &install, Some(&input));
+    assert!(!interrupted.status.success());
+    assert!(!stderr(&interrupted).contains("provider-secret-error-must-not-appear"));
+    assert!(stderr(&interrupted).contains("onboarding resume"));
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let state_path = harness
+        .root
+        .path()
+        .join("onboarding")
+        .join(ticket.invite_id.to_string())
+        .join("codex-cli/state.json");
+    let enrolled: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(enrolled["stage"], "enrolled");
+    let credential_path = PathBuf::from(enrolled["credentialFile"].as_str().unwrap());
+    let credential = read_credential(&credential_path).unwrap();
+    let saved_credential = fs::read(&credential_path).unwrap();
+    fs::remove_file(harness.root.path().join("provider-fail-add")).unwrap();
+    // The server may discard bootstrap assets immediately after initial install.
+    fs::remove_dir_all(assets).unwrap();
+    let invite_id = ticket.invite_id.to_string();
+    let resume = [
+        "onboarding",
+        "resume",
+        &invite_id,
+        "--provider",
+        "codex-cli",
+    ];
+    let installed = PathBuf::from(enrolled["executable"].as_str().unwrap());
+    let installed_skill = agent_session_router::install::installed_integrations_dir(&installed)
+        .unwrap()
+        .join("codex/skills/asr/SKILL.md");
+    let trusted_skill = fs::read(&installed_skill).unwrap();
+    fs::write(&installed_skill, "changed after enrollment").unwrap();
+    let changed_bundle = onboarding_native_command(&harness, &bin, &resume, None);
+    assert!(stderr(&changed_bundle).contains("bootstrap_install_conflict"));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "untrusted local assets must not be reused"
+    );
+    fs::write(&installed_skill, trusted_skill).unwrap();
+    let completed = onboarding_native_command(&harness, &bin, &resume, None);
+    assert_success(&completed);
+    let result: Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert_eq!(result["stage"], "configured");
+    assert_eq!(result["activation"], "restart_required");
+    assert_eq!(
+        result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "activation",
+            "nextAction",
+            "profile",
+            "provider",
+            "route",
+            "serverId",
+            "stage",
+            "workspace"
+        ]
+    );
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "resume replays the same enrollment"
+    );
+    assert_eq!(fs::read(&credential_path).unwrap(), saved_credential);
+    let configured: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(configured["enrollmentId"], enrolled["enrollmentId"]);
+    assert!(configured.get("ticket").is_none());
+    let calls = fs::read(harness.root.path().join("provider-calls")).unwrap();
+    let again = onboarding_native_command(&harness, &bin, &resume, None);
+    assert_success(&again);
+    let status = onboarding_native_command(
+        &harness,
+        &bin,
+        &[
+            "--profile",
+            "office",
+            "onboarding",
+            "status",
+            "--provider",
+            "codex-cli",
+            "--json",
+        ],
+        None,
+    );
+    assert_success(&status);
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["transport"], "reachable");
+    assert_eq!(report["activation"], "restart_required");
+    assert_eq!(report.as_object().unwrap().len(), 9);
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        sockets.load(Ordering::SeqCst),
+        0,
+        "installer must not impersonate a provider session"
+    );
+    assert_eq!(
+        fs::read(harness.root.path().join("provider-calls")).unwrap(),
+        calls
+    );
+    for output in [
+        &too_large,
+        &mismatch,
+        &invalid,
+        &refused,
+        &profile_conflict,
+        &conflict,
+        &interrupted,
+        &completed,
+        &again,
+        &status,
+    ] {
+        for secret in [ticket.invite_token.expose(), credential.token.expose()] {
+            assert!(!stdout(output).contains(secret));
+            assert!(!stderr(output).contains(secret));
+        }
+    }
+    let config = fs::read_to_string(harness.root.path().join("config.json")).unwrap();
+    assert!(!config.contains(credential.token.expose()));
+    assert!(!config.contains(ticket.invite_token.expose()));
+    proxy.abort();
+    runtime.shutdown().await.unwrap();
+    runtime.wait().await.unwrap();
+    let store = RouterStore::open(&harness.data_dir()).unwrap();
+    assert_eq!(
+        store.credential_count().unwrap(),
+        2,
+        "admin plus exactly one invited identity"
+    );
+    store.close().unwrap();
 }

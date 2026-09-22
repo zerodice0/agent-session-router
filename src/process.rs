@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File},
-    future::Future,
+    future::{Future, pending},
     io::{self, Read as _, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::MetadataExt as _,
@@ -17,7 +17,7 @@ use std::{
 
 use rustix::{
     fs::{FlockOperation, Mode, OFlags, flock, open},
-    process::{Pid, Signal, getuid, kill_process_group},
+    process::{Pid, Signal, getuid, kill_process, kill_process_group},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +25,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     process::{Child, ChildStdin, ChildStdout, Command as TokioCommand},
+    signal::unix::{Signal as SignalStream, SignalKind, signal},
     time::timeout,
 };
 use url::Url;
@@ -389,7 +390,7 @@ pub struct HealthMarker {
 }
 
 impl HealthMarker {
-    fn verify(&self, expected_instance: Uuid) -> Result<(), RouterLaunchError> {
+    pub(crate) fn verify(&self, expected_instance: Uuid) -> Result<(), RouterLaunchError> {
         if self.service != "agent-session-router"
             || self.protocol_version != 2
             || self.status != "ok"
@@ -438,6 +439,10 @@ impl TailscaleSnapshot {
 pub enum RouterLaunchError {
     #[error("router_busy")]
     RouterBusy,
+    #[error("router_instance_changed")]
+    InstanceChanged,
+    #[error("interrupted")]
+    Interrupted,
     #[error("launcher_permissions")]
     Permissions,
     #[error("launcher_io")]
@@ -1103,10 +1108,28 @@ where
     }
 
     pub async fn stop(&mut self) -> Result<StopOutcome, RouterLaunchError> {
+        self.stop_locked(None).await
+    }
+
+    pub async fn stop_if_instance(
+        &mut self,
+        expected: Uuid,
+    ) -> Result<StopOutcome, RouterLaunchError> {
+        self.stop_locked(Some(expected)).await
+    }
+
+    async fn stop_locked(
+        &mut self,
+        expected: Option<Uuid>,
+    ) -> Result<StopOutcome, RouterLaunchError> {
         let _launcher_lock = self.store.lock()?;
         let Some(record) = self.store.read()? else {
             return Ok(StopOutcome::NotRunning);
         };
+        // Fence the selected console instance before even probing or cleaning stale state.
+        if expected.is_some_and(|expected| expected != record.instance_id) {
+            return Err(RouterLaunchError::InstanceChanged);
+        }
         match self.health.probe(&record).await {
             Ok(marker) => verify_health_marker(&marker, record.instance_id)?,
             Err(ProbeFailure::ConnectionRefused) => {
@@ -1225,11 +1248,30 @@ pub struct NativeChildConfig {
     pub signal_process_group: bool,
 }
 
+/// Resolve bootstrap assets against the invoking process's working directory.
+#[must_use]
+pub fn bootstrap_assets_directory(
+    data_dir: &Path,
+    cwd: &Path,
+    configured: Option<OsString>,
+) -> PathBuf {
+    let path = configured
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| data_dir.join("bootstrap"), PathBuf::from);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 pub struct NativeChildSupervisor {
     config: NativeChildConfig,
+    startup_timeout: Duration,
     child: Option<Child>,
     startup_input: Option<ChildStdin>,
     startup_output: Option<ChildStdout>,
+    foreground_interrupt: Option<SignalStream>,
 }
 
 impl NativeChildSupervisor {
@@ -1237,52 +1279,82 @@ impl NativeChildSupervisor {
     pub fn new(config: NativeChildConfig) -> Self {
         Self {
             config,
+            startup_timeout: STARTUP_TIMEOUT,
             child: None,
             startup_input: None,
             startup_output: None,
+            foreground_interrupt: None,
         }
     }
 
+    /// Set the initial readiness budget without changing acknowledgement,
+    /// health-probe, or shutdown deadlines.
+    #[must_use]
+    pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
+
     async fn terminate_owned(&mut self) -> Result<(), RouterLaunchError> {
+        let signal = if self.config.signal_process_group {
+            Signal::TERM
+        } else {
+            Signal::KILL
+        };
+        self.terminate_owned_with_signal(signal, STARTUP_TIMEOUT)
+            .await
+    }
+
+    async fn terminate_owned_with_signal(
+        &mut self,
+        signal: Signal,
+        deadline: Duration,
+    ) -> Result<(), RouterLaunchError> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
         if child
             .try_wait()
             .map_err(|_| RouterLaunchError::Io)?
-            .is_some()
+            .is_none()
         {
-            self.child.take();
-            return Ok(());
-        }
-        if self.config.signal_process_group {
-            if let Some(pid) = child
-                .id()
-                .and_then(|id| i32::try_from(id).ok())
-                .and_then(Pid::from_raw)
-            {
-                let _ = kill_process_group(pid, Signal::TERM);
+            signal_owned_child(child, self.config.signal_process_group, signal);
+            if let Ok(result) = timeout(deadline, child.wait()).await {
+                result.map_err(|_| RouterLaunchError::Io)?;
+            } else {
+                signal_owned_child(child, self.config.signal_process_group, Signal::KILL);
+                child.wait().await.map_err(|_| RouterLaunchError::Io)?;
             }
-        } else {
-            let _ = child.start_kill();
-        }
-        if timeout(STARTUP_TIMEOUT, child.wait()).await.is_err() {
-            if self.config.signal_process_group
-                && let Some(pid) = child
-                    .id()
-                    .and_then(|id| i32::try_from(id).ok())
-                    .and_then(Pid::from_raw)
-            {
-                let _ = kill_process_group(pid, Signal::KILL);
-            }
-            let _ = child.start_kill();
-            child.wait().await.map_err(|_| RouterLaunchError::Io)?;
         }
         self.child.take();
         self.startup_input.take();
         self.startup_output.take();
+        self.foreground_interrupt.take();
         Ok(())
     }
+}
+
+fn signal_owned_child(child: &Child, process_group: bool, signal: Signal) {
+    let Some(pid) = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw)
+    else {
+        return;
+    };
+    // A retained, unreaped child owns this PID. Its group may not exist yet during startup.
+    if !process_group || kill_process_group(pid, signal).is_err() {
+        let _ = kill_process(pid, signal);
+    }
+}
+
+async fn foreground_interrupt(stream: &mut Option<SignalStream>) {
+    if let Some(stream) = stream
+        && stream.recv().await.is_some()
+    {
+        return;
+    }
+    pending::<()>().await;
 }
 
 impl ChildSupervisor for NativeChildSupervisor {
@@ -1315,6 +1387,12 @@ impl ChildSupervisor for NativeChildSupervisor {
             {
                 return Err(RouterLaunchError::ChildLaunch);
             }
+            // Install before spawning: readiness/acknowledgement can otherwise leave an orphan.
+            self.foreground_interrupt = if background {
+                None
+            } else {
+                Some(signal(SignalKind::interrupt()).map_err(|_| RouterLaunchError::Io)?)
+            };
             let stderr = open_private_append(&self.config.stderr_file)?;
             let mut command = TokioCommand::new(&self.config.program);
             command
@@ -1333,22 +1411,35 @@ impl ChildSupervisor for NativeChildSupervisor {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::from(stderr))
                 .kill_on_drop(false);
+            if self.config.signal_process_group && !background {
+                command.process_group(0);
+            }
             let mut child = command
                 .spawn()
                 .map_err(|_| RouterLaunchError::ChildLaunch)?;
             self.startup_input = child.stdin.take();
             self.startup_output = child.stdout.take();
             self.child = Some(child);
-            let ready = match read_startup_ready(
-                self.startup_output
-                    .as_mut()
-                    .ok_or(RouterLaunchError::ChildLaunch)?,
-            )
-            .await
-            {
+            let output = self
+                .startup_output
+                .as_mut()
+                .ok_or(RouterLaunchError::ChildLaunch)?;
+            let ready = tokio::select! {
+                biased;
+                () = foreground_interrupt(&mut self.foreground_interrupt) => {
+                    Err(RouterLaunchError::Interrupted)
+                }
+                ready = read_startup_ready(output, self.startup_timeout) => ready,
+            };
+            let ready = match ready {
                 Ok(ready) => ready,
                 Err(error) => {
-                    let _ = self.terminate_owned().await;
+                    if matches!(error, RouterLaunchError::Interrupted) {
+                        self.terminate_owned_with_signal(Signal::INT, SHUTDOWN_TIMEOUT)
+                            .await?;
+                    } else {
+                        self.terminate_owned().await?;
+                    }
                     return Err(error);
                 }
             };
@@ -1399,12 +1490,24 @@ impl ChildSupervisor for NativeChildSupervisor {
         Box::pin(async move {
             self.startup_input.take();
             self.startup_output.take();
-            let mut child = self
+            let child = self
                 .child
-                .take()
+                .as_mut()
                 .ok_or(RouterLaunchError::ChildTerminated)?;
-            let status = child.wait().await.map_err(|_| RouterLaunchError::Io)?;
-            Ok(map_exit_status(status))
+            let status = tokio::select! {
+                biased;
+                () = foreground_interrupt(&mut self.foreground_interrupt) => None,
+                status = child.wait() => Some(status),
+            };
+            if let Some(status) = status {
+                self.child.take();
+                self.foreground_interrupt.take();
+                Ok(map_exit_status(status.map_err(|_| RouterLaunchError::Io)?))
+            } else {
+                self.terminate_owned_with_signal(Signal::INT, SHUTDOWN_TIMEOUT)
+                    .await?;
+                Ok(130)
+            }
         })
     }
 
@@ -1412,6 +1515,7 @@ impl ChildSupervisor for NativeChildSupervisor {
         self.startup_input.take();
         self.startup_output.take();
         self.child.take();
+        self.foreground_interrupt.take();
     }
 }
 
@@ -1463,8 +1567,11 @@ impl StartupReady {
     }
 }
 
-async fn read_startup_ready(output: &mut ChildStdout) -> Result<StartupReady, RouterLaunchError> {
-    let bytes = read_startup_frame(output).await?;
+async fn read_startup_ready(
+    output: &mut ChildStdout,
+    startup_timeout: Duration,
+) -> Result<StartupReady, RouterLaunchError> {
+    let bytes = read_startup_frame(output, startup_timeout).await?;
     let ready: StartupReady =
         serde_json::from_slice(&bytes).map_err(|_| RouterLaunchError::StartupProtocol)?;
     ready.validate()?;
@@ -1475,15 +1582,18 @@ async fn read_startup_ack<R>(input: &mut R) -> Result<StartupAck, RouterLaunchEr
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let bytes = read_startup_frame(input).await?;
+    let bytes = read_startup_frame(input, STARTUP_TIMEOUT).await?;
     serde_json::from_slice(&bytes).map_err(|_| RouterLaunchError::StartupProtocol)
 }
 
-async fn read_startup_frame<R>(input: &mut R) -> Result<Vec<u8>, RouterLaunchError>
+async fn read_startup_frame<R>(
+    input: &mut R,
+    frame_timeout: Duration,
+) -> Result<Vec<u8>, RouterLaunchError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    timeout(STARTUP_TIMEOUT, async {
+    timeout(frame_timeout, async {
         let mut frame = Vec::new();
         let mut buffer = [0_u8; 512];
         loop {

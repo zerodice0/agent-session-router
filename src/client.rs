@@ -9,7 +9,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
@@ -41,6 +41,7 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 pub const RECONNECT_MAX: Duration = Duration::from_secs(10);
 
+#[derive(Clone)]
 pub enum ClientRole {
     Primary {
         agent: AgentRegistration,
@@ -56,10 +57,19 @@ pub enum ClientRole {
     },
 }
 
+#[derive(Clone)]
 pub struct ClientConfig {
     pub router_url: Url,
     pub role: ClientRole,
     pub ca_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientConnectionState {
+    Connecting,
+    Connected { epoch: u64 },
+    Reconnecting,
+    Closed { reason: Option<RouterErrorCode> },
 }
 
 #[derive(Clone)]
@@ -68,6 +78,7 @@ pub struct RouterClient {
     bytes: Arc<Semaphore>,
     membership_operation: Arc<AtomicBool>,
     connection: Arc<RwLock<ConnectionSnapshot>>,
+    connection_state: watch::Receiver<ClientConnectionState>,
 }
 
 pub struct ClientEvents {
@@ -173,6 +184,7 @@ impl RouterClient {
         let bytes = Arc::new(Semaphore::new(CLIENT_BYTE_CAPACITY));
         let event_bytes = Arc::new(Semaphore::new(CLIENT_BYTE_CAPACITY));
         let connection = Arc::new(RwLock::new(ConnectionSnapshot::default()));
+        let (state_tx, state_rx) = watch::channel(ClientConnectionState::Connecting);
         let (initial_tx, initial_rx) = oneshot::channel();
         tokio::spawn(connection_task(
             config,
@@ -180,7 +192,7 @@ impl RouterClient {
             command_rx,
             event_tx,
             event_bytes,
-            connection.clone(),
+            ConnectionMemory::new(connection.clone(), state_tx),
             initial_tx,
         ));
         initial_rx.await.map_err(|_| ClientError::Disconnected)??;
@@ -190,6 +202,7 @@ impl RouterClient {
                 bytes,
                 membership_operation: Arc::new(AtomicBool::new(false)),
                 connection,
+                connection_state: state_rx,
             },
             ClientEvents { receiver: event_rx },
         ))
@@ -264,6 +277,19 @@ impl RouterClient {
             .read()
             .ok()
             .and_then(|connection| connection.session_id)
+    }
+
+    #[must_use]
+    pub fn operator_is_admin(&self) -> Option<bool> {
+        self.connection
+            .read()
+            .ok()
+            .and_then(|connection| connection.operator_is_admin)
+    }
+
+    #[must_use]
+    pub fn connection_state(&self) -> watch::Receiver<ClientConnectionState> {
+        self.connection_state.clone()
     }
 
     pub async fn set_ready(&self, ready: bool) -> Result<(), ClientError> {
@@ -743,6 +769,7 @@ enum CallEffect {
     None,
     WorkspaceLeave,
     WorkspaceSubscribe(i64),
+    WorkspaceUnsubscribe,
 }
 
 impl CallEffect {
@@ -750,6 +777,7 @@ impl CallEffect {
         match message {
             ClientMessage::WorkspaceLeave { .. } => Self::WorkspaceLeave,
             ClientMessage::WorkspaceSubscribe { after, .. } => Self::WorkspaceSubscribe(*after),
+            ClientMessage::WorkspaceUnsubscribe { .. } => Self::WorkspaceUnsubscribe,
             _ => Self::None,
         }
     }
@@ -764,6 +792,8 @@ struct PendingCall {
     reply: PendingReply,
     deadline: tokio::time::Instant,
     effect: CallEffect,
+    workspace: Option<WorkspaceName>,
+    subscription_revision: u64,
 }
 
 impl PendingCall {
@@ -847,6 +877,7 @@ impl Drop for CancelOnDrop {
 #[derive(Clone, Debug, Default)]
 struct ConnectionSnapshot {
     session_id: Option<Uuid>,
+    operator_is_admin: Option<bool>,
     current: Option<TaskFence>,
     stop_pending: Option<TaskFence>,
 }
@@ -856,31 +887,64 @@ struct ConnectionMemory {
     acked_cursors: HashMap<WorkspaceName, i64>,
     subscribed_workspace: Option<WorkspaceName>,
     highest_enqueued: HashMap<WorkspaceName, i64>,
+    subscription_revision: u64,
     connected_once: bool,
     session_id: Option<Uuid>,
+    operator_is_admin: Option<bool>,
     current: Option<TaskFence>,
     stop_pending: Option<TaskFence>,
     shared: Arc<RwLock<ConnectionSnapshot>>,
+    state: watch::Sender<ClientConnectionState>,
+    epoch: u64,
 }
 
 impl ConnectionMemory {
+    fn new(
+        shared: Arc<RwLock<ConnectionSnapshot>>,
+        state: watch::Sender<ClientConnectionState>,
+    ) -> Self {
+        Self {
+            desired_workspace: None,
+            acked_cursors: HashMap::new(),
+            subscribed_workspace: None,
+            highest_enqueued: HashMap::new(),
+            subscription_revision: 0,
+            connected_once: false,
+            session_id: None,
+            operator_is_admin: None,
+            current: None,
+            stop_pending: None,
+            shared,
+            state,
+            epoch: 0,
+        }
+    }
+
+    fn closed(&mut self, reason: Option<RouterErrorCode>) {
+        self.clear_registration();
+        self.state
+            .send_replace(ClientConnectionState::Closed { reason });
+    }
+
     fn publish(&self) {
         if let Ok(mut shared) = self.shared.write() {
             shared.session_id = self.session_id;
+            shared.operator_is_admin = self.operator_is_admin;
             shared.current.clone_from(&self.current);
             shared.stop_pending.clone_from(&self.stop_pending);
         }
     }
 
-    fn set_registration(&mut self, session_id: Option<Uuid>) {
+    fn set_registration(&mut self, session_id: Option<Uuid>, operator_is_admin: Option<bool>) {
         self.session_id = session_id;
+        self.operator_is_admin = operator_is_admin;
         self.current = None;
         self.stop_pending = None;
         self.publish();
     }
 
     fn clear_registration(&mut self) {
-        self.set_registration(None);
+        self.set_registration(None, None);
     }
 
     fn set_attempts(&mut self, current: Option<TaskFence>, stop_pending: Option<TaskFence>) {
@@ -905,21 +969,10 @@ async fn connection_task(
     mut commands: mpsc::Receiver<ClientCommand>,
     events: mpsc::Sender<ClientEventItem>,
     event_bytes: Arc<Semaphore>,
-    connection: Arc<RwLock<ConnectionSnapshot>>,
+    mut memory: ConnectionMemory,
     initial: oneshot::Sender<Result<(), ClientError>>,
 ) {
     let mut initial = Some(initial);
-    let mut memory = ConnectionMemory {
-        desired_workspace: None,
-        acked_cursors: HashMap::new(),
-        subscribed_workspace: None,
-        highest_enqueued: HashMap::new(),
-        connected_once: false,
-        session_id: None,
-        current: None,
-        stop_pending: None,
-        shared: connection,
-    };
     let mut reconnect_attempt = 0_u32;
     loop {
         match establish(
@@ -928,12 +981,17 @@ async fn connection_task(
             &mut memory,
             &events,
             &event_bytes,
+            &mut commands,
         )
         .await
         {
             Ok(socket) => {
                 reconnect_attempt = 0;
                 memory.connected_once = true;
+                memory.epoch += 1;
+                memory.state.send_replace(ClientConnectionState::Connected {
+                    epoch: memory.epoch,
+                });
                 if let Some(initial) = initial.take() {
                     let _ = initial.send(Ok(()));
                 }
@@ -948,17 +1006,20 @@ async fn connection_task(
                 .await
                 {
                     PumpResult::Closed => {
-                        memory.clear_registration();
+                        memory.closed(None);
                         return;
                     }
                     PumpResult::Disconnected(mut pending) => {
                         memory.clear_registration();
+                        memory
+                            .state
+                            .send_replace(ClientConnectionState::Reconnecting);
                         for (_, pending) in pending.drain() {
                             pending.fail(ClientError::Disconnected);
                         }
                     }
                     PumpResult::Terminal(code, mut pending) => {
-                        memory.clear_registration();
+                        memory.closed(Some(code));
                         for (_, pending) in pending.drain() {
                             pending.fail(ClientError::Router(code));
                         }
@@ -972,14 +1033,30 @@ async fn connection_task(
                     }
                 }
             }
+            Err(ClientError::Closed) => {
+                memory.closed(None);
+                if let Some(initial) = initial.take() {
+                    let _ = initial.send(Err(ClientError::Closed));
+                }
+                return;
+            }
             Err(error) if !memory.connected_once => {
+                let reason = match &error {
+                    ClientError::Router(code) => Some(*code),
+                    _ => None,
+                };
+                memory.closed(reason);
                 if let Some(initial) = initial.take() {
                     let _ = initial.send(Err(error));
                 }
                 return;
             }
             Err(error) if terminal_connection_error(&error) => {
-                memory.clear_registration();
+                let reason = match &error {
+                    ClientError::Router(code) => Some(*code),
+                    _ => None,
+                };
+                memory.closed(reason);
                 if let ClientError::Router(code) = error {
                     let _ = enqueue_event(
                         &events,
@@ -996,28 +1073,15 @@ async fn connection_task(
         }
         let delay = reconnect_delay(reconnect_attempt);
         reconnect_attempt = reconnect_attempt.saturating_add(1);
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {}
-            command = commands.recv() => {
-                match command {
-                    Some(ClientCommand::Close { reply }) => {
-                        let _ = reply.send(());
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                () = &mut sleep => break,
+                command = commands.recv() => {
+                    if handle_disconnected_command(command, &mut memory).is_err() {
                         return;
                     }
-                    Some(ClientCommand::Rpc { reply, .. }) => {
-                        let _ = reply.send(Err(ClientError::Disconnected));
-                    }
-                    Some(ClientCommand::Barrier { reply, .. }) => {
-                        let _ = reply.send(Err(ClientError::Disconnected));
-                    }
-                    Some(ClientCommand::Write { reply, .. }) => {
-                        let _ = reply.send(Err(ClientError::Disconnected));
-                    }
-                    Some(ClientCommand::Cancel { .. }) => {}
-                    Some(ClientCommand::AckEvent { workspace, seq }) => {
-                        advance_cursor(&mut memory, workspace, seq);
-                    }
-                    None => return,
                 }
             }
         }
@@ -1027,12 +1091,111 @@ async fn connection_task(
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+fn handle_disconnected_command(
+    command: Option<ClientCommand>,
+    memory: &mut ConnectionMemory,
+) -> Result<(), ClientError> {
+    match command {
+        Some(ClientCommand::AckEvent { workspace, seq }) => {
+            advance_cursor(memory, workspace, seq);
+        }
+        Some(ClientCommand::Rpc { reply, .. }) => {
+            let _ = reply.send(Err(ClientError::Disconnected));
+        }
+        Some(ClientCommand::Barrier { reply, .. }) => {
+            let _ = reply.send(Err(ClientError::Disconnected));
+        }
+        Some(ClientCommand::Write { reply, .. }) => {
+            let _ = reply.send(Err(ClientError::Disconnected));
+        }
+        Some(ClientCommand::Cancel { .. }) => {}
+        Some(ClientCommand::Close { reply }) => {
+            memory.closed(None);
+            let _ = reply.send(());
+            return Err(ClientError::Closed);
+        }
+        None => {
+            memory.closed(None);
+            return Err(ClientError::Closed);
+        }
+    }
+    Ok(())
+}
+
+async fn wait_during_restore<T>(
+    future: impl Future<Output = Result<T, ClientError>>,
+    deadline: tokio::time::Instant,
+    commands: &mut mpsc::Receiver<ClientCommand>,
+    memory: &mut ConnectionMemory,
+) -> Result<T, ClientError> {
+    tokio::pin!(future);
+    let timeout = tokio::time::sleep_until(deadline);
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut timeout => return Err(ClientError::Transport),
+            command = commands.recv() => handle_disconnected_command(command, memory)?,
+            result = &mut future => return result,
+        }
+    }
+}
+
+fn membership_changed(
+    memory: &mut ConnectionMemory,
+    workspace: Option<WorkspaceName>,
+    cursor: i64,
+) -> ClientEvent {
+    if memory.subscribed_workspace.as_ref() != workspace.as_ref() {
+        memory.subscribed_workspace = None;
+    }
+    memory.desired_workspace.clone_from(&workspace);
+    if let Some(workspace) = &workspace {
+        memory
+            .acked_cursors
+            .entry(workspace.clone())
+            .or_insert(cursor);
+    }
+    ClientEvent::MembershipChanged { workspace, cursor }
+}
+
+fn restore_notification(
+    message: ServerMessage,
+    memory: &mut ConnectionMemory,
+) -> Result<ClientEvent, ClientError> {
+    match message {
+        ServerMessage::WorkspaceChanged { workspace, cursor } => {
+            Ok(membership_changed(memory, workspace, cursor))
+        }
+        ServerMessage::TaskAttemptChanged {
+            workspace,
+            task_id,
+            attempt,
+            closed_attempt_id,
+            current,
+            stop_pending,
+        } => {
+            memory.set_attempts(current.clone(), stop_pending.clone());
+            Ok(ClientEvent::TaskAttemptChanged {
+                workspace,
+                task_id,
+                attempt,
+                closed_attempt_id,
+                current,
+                stop_pending,
+            })
+        }
+        message => Err(server_error(message)),
+    }
+}
+
 async fn establish(
     config: &ClientConfig,
     tls_config: Option<&Arc<rustls::ClientConfig>>,
     memory: &mut ConnectionMemory,
     events: &mpsc::Sender<ClientEventItem>,
     event_bytes: &Arc<Semaphore>,
+    commands: &mut mpsc::Receiver<ClientCommand>,
 ) -> Result<WsStream, ClientError> {
     let connector = match tls_config {
         Some(config) => Connector::Rustls(config.clone()),
@@ -1042,22 +1205,34 @@ async fn establish(
         .max_message_size(Some(crate::protocol::MAX_WEBSOCKET_MESSAGE_BYTES))
         .max_frame_size(Some(crate::protocol::MAX_WEBSOCKET_MESSAGE_BYTES))
         .max_write_buffer_size(CLIENT_BYTE_CAPACITY);
-    let (mut socket, _) = tokio::time::timeout(
-        Duration::from_secs(5),
-        connect_async_tls_with_config(
-            config.router_url.as_str(),
-            Some(websocket_config),
-            false,
-            Some(connector),
-        ),
+    let (mut socket, _) = wait_during_restore(
+        Box::pin(async {
+            connect_async_tls_with_config(
+                config.router_url.as_str(),
+                Some(websocket_config),
+                false,
+                Some(connector),
+            )
+            .await
+            .map_err(|_| ClientError::Transport)
+        }),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        commands,
+        memory,
     )
-    .await
-    .map_err(|_| ClientError::Transport)?
-    .map_err(|_| ClientError::Transport)?;
+    .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let registration = registration_message(&config.role);
-    send_json(&mut socket, &registration).await?;
-    let registered = recv_server(&mut socket, Duration::from_secs(5)).await?;
-    let (workspace, cursor, session_id) = match (&config.role, registered) {
+    wait_during_restore(
+        send_json(&mut socket, &registration),
+        deadline,
+        commands,
+        memory,
+    )
+    .await?;
+    let registered =
+        wait_during_restore(recv_server(&mut socket), deadline, commands, memory).await?;
+    let (workspace, cursor, session_id, operator_is_admin) = match (&config.role, registered) {
         (
             ClientRole::Primary { .. } | ClientRole::Delegate { .. },
             ServerMessage::Registered {
@@ -1067,22 +1242,25 @@ async fn establish(
                 cursor,
                 ..
             },
-        ) if protocol_version == PROTOCOL_VERSION => (workspace, cursor, Some(agent.session_id)),
+        ) if protocol_version == PROTOCOL_VERSION => {
+            (workspace, cursor, Some(agent.session_id), None)
+        }
         (
             ClientRole::Operator { .. },
             ServerMessage::RegisteredOperator {
                 protocol_version,
+                admin,
                 workspace,
                 cursor,
                 ..
             },
-        ) if protocol_version == PROTOCOL_VERSION => (workspace, cursor, None),
+        ) if protocol_version == PROTOCOL_VERSION => (workspace, cursor, None, Some(admin)),
         (_, ServerMessage::Registered { .. } | ServerMessage::RegisteredOperator { .. }) => {
             return Err(ClientError::Router(RouterErrorCode::ProtocolMismatch));
         }
         (_, message) => return Err(server_error(message)),
     };
-    memory.set_registration(session_id);
+    memory.set_registration(session_id, operator_is_admin);
     if !memory.connected_once {
         memory.desired_workspace.clone_from(&workspace);
         if let Some(workspace) = &workspace {
@@ -1106,42 +1284,21 @@ async fn establish(
         && !matches!(config.role, ClientRole::Delegate { .. })
         && let Some(workspace) = memory.desired_workspace.clone()
     {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let request_id = new_request_id();
-        send_json(
-            &mut socket,
-            &ClientMessage::WorkspaceJoin {
-                request_id: request_id.clone(),
-                name: workspace,
-            },
-        )
-        .await?;
+        let join = ClientMessage::WorkspaceJoin {
+            request_id: request_id.clone(),
+            name: workspace,
+        };
+        wait_during_restore(send_json(&mut socket, &join), deadline, commands, memory).await?;
         loop {
-            match recv_server(&mut socket, Duration::from_secs(60)).await? {
+            match wait_during_restore(recv_server(&mut socket), deadline, commands, memory).await? {
                 ServerMessage::WorkspaceJoined { request_id: id, .. } if id == request_id => break,
-                ServerMessage::TaskAttemptChanged {
-                    workspace,
-                    task_id,
-                    attempt,
-                    closed_attempt_id,
-                    current,
-                    stop_pending,
-                } => {
-                    memory.set_attempts(current.clone(), stop_pending.clone());
-                    enqueue_event(
-                        events,
-                        event_bytes,
-                        memory,
-                        ClientEvent::TaskAttemptChanged {
-                            workspace,
-                            task_id,
-                            attempt,
-                            closed_attempt_id,
-                            current,
-                            stop_pending,
-                        },
-                    )?;
+                message => {
+                    let event = restore_notification(message, memory)?;
+                    enqueue_restored_event(events, event_bytes, memory, commands, event, deadline)
+                        .await?;
                 }
-                message => return Err(server_error(message)),
             }
         }
     }
@@ -1150,7 +1307,16 @@ async fn establish(
         && memory.subscribed_workspace.as_ref() == Some(&workspace)
     {
         let after = memory.acked_cursors.get(&workspace).copied().unwrap_or(0);
-        restore_subscription(&mut socket, workspace, after, memory, events, event_bytes).await?;
+        restore_subscription(
+            &mut socket,
+            workspace,
+            after,
+            memory,
+            events,
+            event_bytes,
+            commands,
+        )
+        .await?;
     }
     Ok(socket)
 }
@@ -1162,65 +1328,55 @@ async fn restore_subscription(
     memory: &mut ConnectionMemory,
     events: &mpsc::Sender<ClientEventItem>,
     event_bytes: &Arc<Semaphore>,
+    commands: &mut mpsc::Receiver<ClientCommand>,
 ) -> Result<(), ClientError> {
     loop {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let request_id = new_request_id();
-        send_json(
-            socket,
-            &ClientMessage::WorkspaceSubscribe {
-                request_id: request_id.clone(),
-                after,
-            },
-        )
-        .await?;
+        let subscribe = ClientMessage::WorkspaceSubscribe {
+            request_id: request_id.clone(),
+            after,
+        };
+        wait_during_restore(send_json(socket, &subscribe), deadline, commands, memory).await?;
         loop {
-            match recv_server(socket, Duration::from_secs(60)).await? {
+            match wait_during_restore(recv_server(socket), deadline, commands, memory).await? {
                 ServerMessage::WorkspaceSubscription {
                     request_id: id,
+                    workspace: response_workspace,
                     events: page,
                     next_cursor,
                     live,
-                    ..
                 } if id == request_id => {
+                    if response_workspace != workspace {
+                        return Err(ClientError::Router(RouterErrorCode::InvalidMessage));
+                    }
+                    if memory.desired_workspace.as_ref() != Some(&workspace)
+                        || memory.subscribed_workspace.as_ref() != Some(&workspace)
+                    {
+                        return Ok(());
+                    }
                     for event in page {
-                        enqueue_event(
+                        enqueue_restored_event(
                             events,
                             event_bytes,
                             memory,
+                            commands,
                             ClientEvent::WorkspaceEvent(event),
-                        )?;
+                            deadline,
+                        )
+                        .await?;
                     }
                     after = next_cursor;
                     if live {
-                        memory.subscribed_workspace = Some(workspace);
                         return Ok(());
                     }
                     break;
                 }
-                ServerMessage::TaskAttemptChanged {
-                    workspace,
-                    task_id,
-                    attempt,
-                    closed_attempt_id,
-                    current,
-                    stop_pending,
-                } => {
-                    memory.set_attempts(current.clone(), stop_pending.clone());
-                    enqueue_event(
-                        events,
-                        event_bytes,
-                        memory,
-                        ClientEvent::TaskAttemptChanged {
-                            workspace,
-                            task_id,
-                            attempt,
-                            closed_attempt_id,
-                            current,
-                            stop_pending,
-                        },
-                    )?;
+                message => {
+                    let event = restore_notification(message, memory)?;
+                    enqueue_restored_event(events, event_bytes, memory, commands, event, deadline)
+                        .await?;
                 }
-                message => return Err(server_error(message)),
             }
         }
     }
@@ -1300,10 +1456,21 @@ async fn pump(
                             let _ = reply.send(Err(ClientError::Disconnected));
                             return PumpResult::Disconnected(pending);
                         }
+                        let subscription_call = matches!(
+                            effect,
+                            CallEffect::WorkspaceSubscribe(_) | CallEffect::WorkspaceUnsubscribe
+                        );
+                        if subscription_call {
+                            memory.subscription_revision += 1;
+                        }
                         pending.insert(request_id, PendingCall {
                             reply: PendingReply::Rpc(reply),
                             deadline,
                             effect,
+                            workspace: subscription_call
+                                .then(|| memory.desired_workspace.clone())
+                                .flatten(),
+                            subscription_revision: memory.subscription_revision,
                         });
                     }
                     Some(ClientCommand::Barrier {
@@ -1335,6 +1502,8 @@ async fn pump(
                                 reply: PendingReply::Barrier(reply),
                                 deadline,
                                 effect: CallEffect::None,
+                                workspace: None,
+                                subscription_revision: 0,
                             },
                         );
                     }
@@ -1368,6 +1537,7 @@ async fn pump(
                     }
                     Some(ClientCommand::Close { reply }) => {
                         let _ = sink.close().await;
+                        memory.closed(None);
                         let _ = reply.send(());
                         for (_, pending_call) in pending.drain() {
                             pending_call.fail(ClientError::Closed);
@@ -1395,14 +1565,8 @@ async fn pump(
                         }
                         match parsed {
                             ServerMessage::WorkspaceChanged { workspace, cursor } => {
-                                if memory.subscribed_workspace.as_ref() != workspace.as_ref() {
-                                    memory.subscribed_workspace = None;
-                                }
-                                memory.desired_workspace.clone_from(&workspace);
-                                if let Some(workspace) = &workspace {
-                                    memory.acked_cursors.entry(workspace.clone()).or_insert(cursor);
-                                }
-                                if enqueue_event(events, event_bytes, memory, ClientEvent::MembershipChanged { workspace, cursor }).is_err() {
+                                let event = membership_changed(memory, workspace, cursor);
+                                if enqueue_event(events, event_bytes, memory, event).is_err() {
                                     return PumpResult::Disconnected(pending);
                                 }
                             }
@@ -1473,12 +1637,6 @@ async fn pump(
                                         memory.desired_workspace = None;
                                         memory.subscribed_workspace = None;
                                     }
-                                    ServerMessage::WorkspaceSubscription { workspace, live: true, .. } => {
-                                        memory.subscribed_workspace = Some(workspace.clone());
-                                    }
-                                    ServerMessage::WorkspaceUnsubscribed { .. } => {
-                                        memory.subscribed_workspace = None;
-                                    }
                                     ServerMessage::Error { request_id: None, code, .. }
                                         if terminal_router_code(*code) =>
                                     {
@@ -1488,13 +1646,34 @@ async fn pump(
                                 }
                                 if let Some(request_id) = response.request_id().map(str::to_owned) {
                                     if let Some(call) = pending.remove(&request_id) {
-                                        if let (
-                                            CallEffect::WorkspaceSubscribe(after),
-                                            ServerMessage::WorkspaceSubscription { workspace, .. },
-                                        ) = (call.effect, &response)
+                                        if call.subscription_revision == memory.subscription_revision
+                                            && call.workspace == memory.desired_workspace
                                         {
-                                            memory.acked_cursors.insert(workspace.clone(), after);
-                                            memory.highest_enqueued.remove(workspace);
+                                            match (call.effect, &response) {
+                                                (
+                                                    CallEffect::WorkspaceSubscribe(after),
+                                                    ServerMessage::WorkspaceSubscription {
+                                                        workspace,
+                                                        live,
+                                                        ..
+                                                    },
+                                                ) if call.workspace.as_ref() == Some(workspace) => {
+                                                    memory.acked_cursors.insert(workspace.clone(), after);
+                                                    memory.highest_enqueued.remove(workspace);
+                                                    if *live {
+                                                        memory.subscribed_workspace = Some(workspace.clone());
+                                                    }
+                                                }
+                                                (
+                                                    CallEffect::WorkspaceUnsubscribe,
+                                                    ServerMessage::WorkspaceUnsubscribed { workspace, .. },
+                                                ) if call.workspace.as_ref() == Some(workspace)
+                                                    && memory.subscribed_workspace.as_ref() == Some(workspace) =>
+                                                {
+                                                    memory.subscribed_workspace = None;
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                         call.finish(response, memory);
                                     } else if let ServerMessage::Result {
@@ -1568,36 +1747,82 @@ fn enqueue_event(
     memory: &mut ConnectionMemory,
     event: ClientEvent,
 ) -> Result<(), ClientError> {
-    let (workspace, seq) = match &event {
-        ClientEvent::WorkspaceEvent(event) => (Some(event.workspace.clone()), Some(event.seq)),
-        _ => (None, None),
-    };
-    if let (Some(workspace), Some(seq)) = (&workspace, seq)
-        && memory
-            .highest_enqueued
-            .get(workspace)
-            .is_some_and(|highest| *highest >= seq)
-    {
+    if event_already_enqueued(memory, &event) {
         return Ok(());
     }
-    let encoded_len = serde_json::to_vec(&event_size_value(&event))
-        .map_err(|_| ClientError::Transport)?
-        .len();
-    let permits = u32::try_from(encoded_len.max(1)).map_err(|_| ClientError::MessageTooLarge)?;
     let permit = bytes
         .clone()
-        .try_acquire_many_owned(permits)
+        .try_acquire_many_owned(event_permits(&event)?)
         .map_err(|_| ClientError::QueueFull)?;
-    sender
-        .try_send(ClientEventItem {
-            event,
-            _bytes: permit,
-        })
-        .map_err(|_| ClientError::QueueFull)?;
-    if let (Some(workspace), Some(seq)) = (workspace, seq) {
-        memory.highest_enqueued.insert(workspace, seq);
-    }
+    let slot = sender.try_reserve().map_err(|_| ClientError::QueueFull)?;
+    remember_enqueued_event(memory, &event);
+    slot.send(ClientEventItem {
+        event,
+        _bytes: permit,
+    });
     Ok(())
+}
+
+async fn enqueue_restored_event(
+    sender: &mpsc::Sender<ClientEventItem>,
+    bytes: &Arc<Semaphore>,
+    memory: &mut ConnectionMemory,
+    commands: &mut mpsc::Receiver<ClientCommand>,
+    event: ClientEvent,
+    deadline: tokio::time::Instant,
+) -> Result<(), ClientError> {
+    if event_already_enqueued(memory, &event) {
+        return Ok(());
+    }
+    let permits = event_permits(&event)?;
+    let (permit, slot) = wait_during_restore(
+        async {
+            let permit = bytes
+                .clone()
+                .acquire_many_owned(permits)
+                .await
+                .map_err(|_| ClientError::Closed)?;
+            let slot = sender.reserve().await.map_err(|_| ClientError::Closed)?;
+            Ok((permit, slot))
+        },
+        deadline,
+        commands,
+        memory,
+    )
+    .await?;
+    remember_enqueued_event(memory, &event);
+    slot.send(ClientEventItem {
+        event,
+        _bytes: permit,
+    });
+    Ok(())
+}
+
+fn event_already_enqueued(memory: &ConnectionMemory, event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::WorkspaceEvent(event)
+            if memory.highest_enqueued.get(&event.workspace).is_some_and(|highest| *highest >= event.seq)
+    )
+}
+
+fn remember_enqueued_event(memory: &mut ConnectionMemory, event: &ClientEvent) {
+    if let ClientEvent::WorkspaceEvent(event) = event {
+        memory
+            .highest_enqueued
+            .insert(event.workspace.clone(), event.seq);
+    }
+}
+
+fn event_permits(event: &ClientEvent) -> Result<u32, ClientError> {
+    let encoded_len = serde_json::to_vec(&event_size_value(event))
+        .map_err(|_| ClientError::Transport)?
+        .len()
+        .max(1);
+    if encoded_len > CLIENT_BYTE_CAPACITY {
+        return Err(ClientError::MessageTooLarge);
+    }
+    u32::try_from(encoded_len).map_err(|_| ClientError::MessageTooLarge)
 }
 
 fn event_size_value(event: &ClientEvent) -> serde_json::Value {
@@ -1661,14 +1886,11 @@ async fn send_json(socket: &mut WsStream, message: &ClientMessage) -> Result<(),
         .map_err(|_| ClientError::Transport)
 }
 
-async fn recv_server(
-    socket: &mut WsStream,
-    timeout: Duration,
-) -> Result<ServerMessage, ClientError> {
+async fn recv_server(socket: &mut WsStream) -> Result<ServerMessage, ClientError> {
     loop {
-        let message = tokio::time::timeout(timeout, socket.next())
+        let message = socket
+            .next()
             .await
-            .map_err(|_| ClientError::Transport)?
             .ok_or(ClientError::Disconnected)?
             .map_err(|_| ClientError::Transport)?;
         match message {

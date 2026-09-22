@@ -6,8 +6,11 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    credentials::{CredentialFile, CredentialRole, MAX_GRANTS, PublicCredentialClaims},
+    credentials::{
+        CredentialFile, CredentialRole, MAX_GRANTS, PublicCredentialClaims, SecretToken,
+    },
     integrations::IntegrationPublic,
+    onboarding::OnboardingProvider,
     tasks::{
         ExternalOperationSummary, ExternalProvider, ExternalPublishKind, ExternalResolution,
         ExternalResolutionOutcome, MAX_SAFE_INTEGER, PauseReason, TaskAttempt, TaskCheckpoint,
@@ -480,6 +483,20 @@ pub enum ClientMessage {
         request_id: String,
         id: Uuid,
     },
+    OnboardingInviteIssue {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        workspace: WorkspaceName,
+        #[serde(rename = "createWorkspace")]
+        create_workspace: bool,
+        provider: Option<OnboardingProvider>,
+    },
+    OnboardingInviteRevoke {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "inviteId")]
+        invite_id: Uuid,
+    },
     WorkspaceCreate {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -831,6 +848,8 @@ impl ClientMessage {
             | Self::CredentialIssue { request_id, .. }
             | Self::CredentialList { request_id, .. }
             | Self::CredentialRevoke { request_id, .. }
+            | Self::OnboardingInviteIssue { request_id, .. }
+            | Self::OnboardingInviteRevoke { request_id, .. }
             | Self::WorkspaceCreate { request_id, .. }
             | Self::WorkspaceList { request_id, .. }
             | Self::WorkspaceJoin { request_id, .. }
@@ -1003,6 +1022,26 @@ pub enum ServerMessage {
         request_id: String,
         id: Uuid,
     },
+    OnboardingInviteIssued {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "serverId")]
+        server_id: Uuid,
+        #[serde(rename = "inviteId")]
+        invite_id: Uuid,
+        #[serde(rename = "inviteToken")]
+        invite_token: SecretToken,
+        #[serde(rename = "expiresAt")]
+        expires_at: i64,
+        workspace: WorkspaceName,
+        provider: Option<OnboardingProvider>,
+    },
+    OnboardingInviteRevoked {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "inviteId")]
+        invite_id: Uuid,
+    },
     Integrations {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -1136,6 +1175,8 @@ impl ServerMessage {
             | Self::CredentialIssued { request_id, .. }
             | Self::Credentials { request_id, .. }
             | Self::CredentialRevoked { request_id, .. }
+            | Self::OnboardingInviteIssued { request_id, .. }
+            | Self::OnboardingInviteRevoked { request_id, .. }
             | Self::WorkspacePosted { request_id, .. }
             | Self::WorkspaceHistory { request_id, .. }
             | Self::WorkspaceSubscription { request_id, .. }
@@ -1395,6 +1436,11 @@ fn validate_client_message(message: &ClientMessage) -> Result<(), RouterErrorCod
                 return Err(RouterErrorCode::InvalidMessage);
             }
         }
+        ClientMessage::OnboardingInviteRevoke { invite_id, .. } => {
+            if invite_id.is_nil() {
+                return Err(RouterErrorCode::InvalidMessage);
+            }
+        }
         ClientMessage::CredentialList { limit, .. } if !valid_limit(*limit) => {
             return Err(RouterErrorCode::InvalidMessage);
         }
@@ -1623,6 +1669,7 @@ fn validate_client_message(message: &ClientMessage) -> Result<(), RouterErrorCod
         ClientMessage::Ping { .. }
         | ClientMessage::Readiness { .. }
         | ClientMessage::List { .. }
+        | ClientMessage::OnboardingInviteIssue { .. }
         | ClientMessage::WorkspaceCreate { .. }
         | ClientMessage::WorkspaceJoin { .. }
         | ClientMessage::WorkspaceLeave { .. }
@@ -1797,6 +1844,24 @@ fn validate_server_message(message: &ServerMessage) -> Result<(), RouterErrorCod
             credential
                 .validate()
                 .map_err(|_| RouterErrorCode::InvalidMessage)?;
+        }
+        ServerMessage::OnboardingInviteIssued {
+            server_id,
+            invite_id,
+            invite_token,
+            expires_at,
+            ..
+        } => {
+            if server_id.is_nil()
+                || invite_id.is_nil()
+                || !valid_bearer(invite_token.expose())
+                || !(1..=MAX_SAFE_INTEGER).contains(expires_at)
+            {
+                return Err(RouterErrorCode::InvalidMessage);
+            }
+        }
+        ServerMessage::OnboardingInviteRevoked { invite_id, .. } if invite_id.is_nil() => {
+            return Err(RouterErrorCode::InvalidMessage);
         }
         ServerMessage::Credentials { credentials, .. }
             if credentials.iter().any(|credential| {
@@ -2017,6 +2082,17 @@ fn validate_server_unknown_fields(
         "credential_issued" => &["type", "requestId", "credential"],
         "credentials" => &["type", "requestId", "credentials", "nextCursor", "hasMore"],
         "credential_revoked" => &["type", "requestId", "id"],
+        "onboarding_invite_issued" => &[
+            "type",
+            "requestId",
+            "serverId",
+            "inviteId",
+            "inviteToken",
+            "expiresAt",
+            "workspace",
+            "provider",
+        ],
+        "onboarding_invite_revoked" => &["type", "requestId", "inviteId"],
         "result" => &[
             "type",
             "workspace",
@@ -2146,6 +2222,14 @@ fn validate_unknown_fields(
             "workspaces",
         ],
         "credential_revoke" => &["type", "requestId", "id"],
+        "onboarding_invite_issue" => &[
+            "type",
+            "requestId",
+            "workspace",
+            "createWorkspace",
+            "provider",
+        ],
+        "onboarding_invite_revoke" => &["type", "requestId", "inviteId"],
         "workspace_create" | "workspace_join" => &["type", "requestId", "name"],
         "workspace_list" | "workspace_history" | "credential_list" => {
             &["type", "requestId", "after", "limit"]

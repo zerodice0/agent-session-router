@@ -52,6 +52,27 @@ fn write_integrations(path: &Path) {
         0o644,
     );
     write_file(
+        &path.join("claude-plugin/.claude-plugin/marketplace.json"),
+        include_bytes!("../integrations/claude-plugin/.claude-plugin/marketplace.json"),
+        0o644,
+    );
+    write_file(
+        &path.join("claude-plugin/plugins/asr/.claude-plugin/plugin.json"),
+        include_bytes!("../integrations/claude-plugin/plugins/asr/.claude-plugin/plugin.json"),
+        0o644,
+    );
+    for relative in [
+        "claude-plugin/plugins/asr/skills/workspace/SKILL.md",
+        "codex/skills/asr/SKILL.md",
+        "omp/skills/asr/SKILL.md",
+    ] {
+        write_file(
+            &path.join(relative),
+            include_bytes!("../integrations/skills/asr/SKILL.md"),
+            0o644,
+        );
+    }
+    write_file(
         &path.join("claude-sdk/node_modules/@anthropic-ai/claude-agent-sdk/index.js"),
         b"export {};\n",
         0o644,

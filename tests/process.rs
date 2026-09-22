@@ -4,7 +4,7 @@ use std::{
     fs,
     net::{Ipv4Addr, SocketAddr},
     os::unix::fs::{PermissionsExt as _, symlink},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -768,6 +768,10 @@ async fn concurrent_start_start_and_start_stop_have_one_lock_owner() {
         stopping.stop().await,
         Err(RouterLaunchError::RouterBusy)
     ));
+    assert!(matches!(
+        stopping.stop_if_instance(record.instance_id).await,
+        Err(RouterLaunchError::RouterBusy)
+    ));
     release.notify_one();
     assert_eq!(
         start.await.expect("start task").expect("start result"),
@@ -1121,6 +1125,129 @@ async fn authenticated_stop_waits_then_removes_exact_runtime_record() {
     assert!(runtime_store.read().expect("runtime").is_none());
 }
 
+#[tokio::test]
+async fn conditional_stop_preserves_replacement_instance_before_any_probe_or_cleanup() {
+    let directory = private_temp();
+    let runtime_store = store(&directory);
+    let original = local_record(Uuid::new_v4(), 46011);
+    runtime_store.write(&original).expect("original runtime");
+    let replacement = tailscale_record(Uuid::new_v4(), 46012);
+    let serve = replacement.owned_serve.as_ref().expect("owned mapping");
+    let mut snapshot = valid_snapshot();
+    snapshot
+        .tcp_forwards
+        .insert(serve.port, serve.target.clone());
+    let tailscale = FakeTailscale::new(snapshot);
+    let mapping = tailscale.clone();
+    let admin = FakeAdmin::default();
+    let events = Arc::clone(&admin.events);
+    let mut native = launcher(
+        runtime_store.clone(),
+        FakeHealth::default(),
+        admin,
+        tailscale,
+        FakeProfile::default(),
+        FakeChild::new("ws://127.0.0.1:46013/ws"),
+    );
+    // The console selected the old record, then another launcher replaced it.
+    {
+        let _lock = runtime_store.lock().expect("replacement launcher lock");
+        runtime_store
+            .write(&replacement)
+            .expect("replacement runtime");
+    }
+    for response in [
+        Ok(marker(replacement.instance_id)),
+        Err(ProbeFailure::ConnectionRefused),
+    ] {
+        native.health.responses.push_back(response);
+        assert!(matches!(
+            native.stop_if_instance(original.instance_id).await,
+            Err(RouterLaunchError::InstanceChanged)
+        ));
+        assert_eq!(native.health.probes, 0);
+        assert!(events.lock().expect("admin events").is_empty());
+        assert!(
+            mapping
+                .0
+                .lock()
+                .expect("tailscale events")
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            runtime_store.read().expect("retained record"),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            mapping.snapshot_value().tcp_forwards.get(&serve.port),
+            Some(&serve.target)
+        );
+        native.health.responses.clear();
+    }
+}
+
+#[tokio::test]
+async fn conditional_stop_removes_only_the_confirmed_live_or_stale_instance() {
+    let directory = private_temp();
+    let runtime_store = store(&directory);
+    let record = tailscale_record(Uuid::new_v4(), 46021);
+    let serve = record.owned_serve.as_ref().expect("owned mapping");
+    for stale in [false, true] {
+        runtime_store.write(&record).expect("runtime");
+        let mut snapshot = valid_snapshot();
+        snapshot
+            .tcp_forwards
+            .insert(serve.port, serve.target.clone());
+        let tailscale = FakeTailscale::new(snapshot);
+        let mapping = tailscale.clone();
+        let admin = FakeAdmin::default();
+        let events = Arc::clone(&admin.events);
+        let mut health = FakeHealth::default();
+        if stale {
+            health
+                .responses
+                .push_back(Err(ProbeFailure::ConnectionRefused));
+        }
+        let mut native = launcher(
+            runtime_store.clone(),
+            health,
+            admin,
+            tailscale,
+            FakeProfile::default(),
+            FakeChild::new("ws://127.0.0.1:46022/ws"),
+        );
+        let result = native
+            .stop_if_instance(record.instance_id)
+            .await
+            .expect("conditional stop");
+        if stale {
+            assert_eq!(result, StopOutcome::StaleRecovered);
+            assert!(events.lock().expect("admin events").is_empty());
+        } else {
+            assert_eq!(result, StopOutcome::Stopped(record.clone()));
+            assert_eq!(
+                events.lock().expect("admin events").as_slice(),
+                ["admin.verify", "admin.shutdown", "admin.stopped"]
+            );
+        }
+        assert!(runtime_store.read().expect("record removed").is_none());
+        assert!(
+            !mapping
+                .snapshot_value()
+                .tcp_forwards
+                .contains_key(&serve.port)
+        );
+        assert_eq!(
+            native
+                .stop_if_instance(record.instance_id)
+                .await
+                .expect("absent instance"),
+            StopOutcome::NotRunning
+        );
+    }
+}
+
 async fn serve_http_once(status: &str, body: &str) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -1315,6 +1442,214 @@ async fn native_child_supervisor_reads_ready_sends_ack_and_reaps_startup_crash()
         child.launch(Uuid::new_v4(), true).await,
         Err(RouterLaunchError::StartupProtocol)
     ));
+}
+
+#[tokio::test]
+async fn native_child_supervisor_allows_explicit_readiness_budget_beyond_default() {
+    let directory = private_temp();
+    let instance = Uuid::new_v4();
+    let ready = serde_json::to_string(&StartupReady {
+        instance_id: instance,
+        control_url: "ws://127.0.0.1:48002/ws".into(),
+    })
+    .expect("ready");
+    // Pace the fixture relative to the ordinary deadline rather than fixing
+    // the public contract to a particular number of seconds.
+    let delay = process::STARTUP_TIMEOUT + Duration::from_secs(1);
+    let config = NativeChildConfig {
+        program: PathBuf::from("/bin/sh"),
+        arguments: vec![
+            OsString::from("-c"),
+            OsString::from(format!(
+                "sleep {}; printf '%s\\n' '{ready}'; read ack",
+                delay.as_secs_f64()
+            )),
+        ],
+        cwd: directory.path().to_path_buf(),
+        environment: vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+        stderr_file: directory.path().join("ordinary.stderr"),
+        signal_process_group: false,
+    };
+    let mut extended_config = config.clone();
+    extended_config.stderr_file = directory.path().join("extended.stderr");
+    let mut ordinary = NativeChildSupervisor::new(config);
+    let mut extended = NativeChildSupervisor::new(extended_config)
+        .with_startup_timeout(delay + process::STARTUP_TIMEOUT);
+    let (ordinary_result, extended_result) = tokio::join!(
+        ordinary.launch(instance, true),
+        extended.launch(instance, true)
+    );
+    assert!(matches!(
+        ordinary_result,
+        Err(RouterLaunchError::StartupTimeout)
+    ));
+    assert_eq!(
+        extended_result.expect("extended readiness").instance_id,
+        instance
+    );
+    extended.acknowledge(instance).await.expect("ack");
+    assert_eq!(extended.wait().await.expect("wait"), 0);
+}
+
+#[tokio::test]
+async fn native_child_readiness_timeout_reaps_process_without_publishing_runtime() {
+    let directory = private_temp();
+    let runtime_store = store(&directory);
+    let child = NativeChildSupervisor::new(NativeChildConfig {
+        program: PathBuf::from("/bin/sh"),
+        arguments: vec![
+            OsString::from("-c"),
+            OsString::from("printf '%s' \"$$\" > child.pid; exec sleep 30"),
+        ],
+        cwd: directory.path().to_path_buf(),
+        environment: vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+        stderr_file: directory.path().join("timeout.stderr"),
+        signal_process_group: false,
+    })
+    .with_startup_timeout(Duration::from_secs(1));
+    let mut native = NativeLauncher::new(
+        runtime_store.clone(),
+        FakeHealth::default(),
+        FakeAdmin::default(),
+        FakeTailscale::new(valid_snapshot()),
+        FakeProfile::default(),
+        child,
+    );
+    assert!(matches!(
+        native.start(local_options(Uuid::new_v4(), true)).await,
+        Err(RouterLaunchError::StartupTimeout)
+    ));
+    assert!(runtime_store.read().expect("runtime").is_none());
+    let pid = fs::read_to_string(directory.path().join("child.pid")).expect("child started");
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-0", pid.trim()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("query child process");
+    assert!(!status.success(), "timed-out child must no longer exist");
+}
+
+async fn assert_foreground_startup_interrupted(directory: &Path) {
+    let runtime_store = RuntimeStore::new(directory.to_path_buf()).expect("runtime store");
+    let child = NativeChildSupervisor::new(NativeChildConfig {
+        program: PathBuf::from("/bin/sh"),
+        arguments: vec![
+            OsString::from("-c"),
+            OsString::from(
+                "trap 'printf stopped > child.stopped; exit 130' INT; \
+                         printf '%s' \"$$\" > child.pid.tmp; mv child.pid.tmp child.pid; \
+                         while :; do :; done",
+            ),
+        ],
+        cwd: directory.to_path_buf(),
+        environment: vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+        stderr_file: directory.join("startup.stderr"),
+        signal_process_group: true,
+    })
+    .with_startup_timeout(Duration::from_secs(60));
+    let mut native = NativeLauncher::new(
+        runtime_store.clone(),
+        FakeHealth::default(),
+        FakeAdmin::default(),
+        FakeTailscale::new(valid_snapshot()),
+        FakeProfile::default(),
+        child,
+    );
+    assert!(matches!(
+        native.start(local_options(Uuid::new_v4(), false)).await,
+        Err(RouterLaunchError::Interrupted)
+    ));
+    assert!(
+        runtime_store
+            .read()
+            .expect("no published runtime")
+            .is_none()
+    );
+}
+
+#[test]
+fn native_foreground_sigint_during_readiness_reaps_child_without_runtime() {
+    const TEST: &str = "native_foreground_sigint_during_readiness_reaps_child_without_runtime";
+    if let Some(directory) = std::env::var_os("ASR_FOREGROUND_STARTUP_TEST") {
+        let directory = PathBuf::from(directory);
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(assert_foreground_startup_interrupted(&directory));
+        return;
+    }
+
+    let directory = private_temp();
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("canonical fixture directory");
+    let mut driver = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", TEST, "--nocapture"])
+        .env("ASR_FOREGROUND_STARTUP_TEST", &path)
+        .env("HOME", &path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("isolated foreground launcher");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let child_pid = loop {
+        if let Ok(pid) = fs::read_to_string(path.join("child.pid")) {
+            break rustix::process::Pid::from_raw(pid.parse().expect("child PID"))
+                .expect("child PID");
+        }
+        assert!(
+            driver.try_wait().expect("driver status").is_none(),
+            "launcher exited before its child entered the readiness window"
+        );
+        if std::time::Instant::now() >= deadline {
+            driver.kill().expect("kill timed-out driver");
+            let _ = driver.wait();
+            panic!("fixture child did not enter readiness window");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let driver_pid = rustix::process::Pid::from_raw(i32::try_from(driver.id()).unwrap()).unwrap();
+    rustix::process::kill_process(driver_pid, rustix::process::Signal::INT)
+        .expect("signal launcher");
+    let deadline = std::time::Instant::now() + process::SHUTDOWN_TIMEOUT + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = driver.try_wait().expect("driver exit") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            driver.kill().expect("kill timed-out driver");
+            break driver.wait().expect("reap driver");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let interrupted = path.join("child.stopped").exists();
+    if !interrupted {
+        // Clean the deliberately blocked fixture even when exercising the pre-fix failure.
+        let _ = rustix::process::kill_process(child_pid, rustix::process::Signal::KILL);
+    }
+    assert!(
+        status.success(),
+        "foreground launcher did not handle SIGINT"
+    );
+    assert!(
+        interrupted,
+        "SIGINT must reach the child before readiness is published"
+    );
+    let alive = std::process::Command::new("/bin/kill")
+        .args(["-0", &child_pid.as_raw_nonzero().get().to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("query fixture child");
+    assert!(!alive.success(), "interrupted startup child must be reaped");
+    assert!(
+        store(&directory)
+            .read()
+            .expect("runtime after interruption")
+            .is_none()
+    );
 }
 
 #[allow(clippy::too_many_lines)]

@@ -6,16 +6,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
     credentials::{
-        CredentialError, CredentialFile, CredentialRole, PublicCredentialClaims,
-        ensure_private_directory,
+        CREDENTIAL_VERSION, CredentialError, CredentialFile, CredentialRole,
+        PublicCredentialClaims, SecretToken, TOKEN_BYTES, TOKEN_LENGTH, ensure_private_directory,
+        hash_token,
+    },
+    onboarding::{
+        EnrollmentError, EnrollmentRequest, INVITE_LIFETIME_MS, IssuedInvite, OnboardingProvider,
+        VERSION as ONBOARDING_VERSION, invite_subject,
     },
     protocol::{
         AgentClient, AgentSide, RouterErrorCode, WorkspaceEvent, WorkspaceEventKind, WorkspaceName,
@@ -27,7 +34,7 @@ use crate::{
     },
 };
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub const DATABASE_FILE_NAME: &str = "router.sqlite";
 
 pub struct RouterStore {
@@ -48,6 +55,17 @@ pub struct StoredCredential {
     pub token_hash: [u8; 32],
     pub created_at: i64,
     pub revoked_at: Option<i64>,
+}
+
+struct StoredOnboardingInvite {
+    token_hash: [u8; 32],
+    provider: Option<String>,
+    workspace: WorkspaceName,
+    subject: String,
+    expires_at: i64,
+    revoked_at: Option<i64>,
+    enrollment_id: Option<Uuid>,
+    credential_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +93,10 @@ pub enum StoreError {
     InUse,
     #[error("request_conflict")]
     Conflict,
+    #[error("workspace_not_found")]
+    WorkspaceNotFound,
+    #[error("request_not_found")]
+    RequestNotFound,
     #[error("unsupported_schema")]
     UnsupportedSchema,
     #[error("storage_error")]
@@ -92,6 +114,8 @@ impl From<StoreError> for RouterErrorCode {
         match value {
             StoreError::InUse => Self::StoreInUse,
             StoreError::Conflict => Self::RequestConflict,
+            StoreError::WorkspaceNotFound => Self::WorkspaceNotFound,
+            StoreError::RequestNotFound => Self::RequestNotFound,
             StoreError::UnsupportedSchema | StoreError::InvalidData => Self::ConfigurationRequired,
             StoreError::Sqlite(_) | StoreError::Io(_) | StoreError::Overflow => Self::StorageError,
         }
@@ -169,25 +193,7 @@ impl RouterStore {
     }
 
     pub fn insert_credential(&mut self, credential: &CredentialFile) -> Result<(), StoreError> {
-        let now = now_millis()?;
-        let workspaces = serde_json::to_string(&credential.public_claims().workspaces)
-            .map_err(|_| StoreError::InvalidData)?;
-        self.connection
-            .execute(
-                "INSERT INTO credentials(id,token_hash,role,subject,agent_side,agent_client,workspaces_json,created_at,revoked_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
-                params![
-                    credential.id.to_string(),
-                    credential.token_hash().as_slice(),
-                    credential.role.as_str(),
-                    credential.subject,
-                    credential.agent_side.map(agent_side_str),
-                    credential.agent_client.map(agent_client_str),
-                    workspaces,
-                    now,
-                ],
-            )
-            .map_err(StoreError::Sqlite)?;
-        Ok(())
+        insert_credential_connection(&self.connection, credential, now_millis()?)
     }
 
     pub fn credential_by_hash(
@@ -205,14 +211,7 @@ impl RouterStore {
     }
 
     pub fn credential_by_id(&self, id: Uuid) -> Result<Option<StoredCredential>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT id,token_hash,role,subject,agent_side,agent_client,workspaces_json,created_at,revoked_at FROM credentials WHERE id=?1",
-                [id.to_string()],
-                credential_from_row,
-            )
-            .optional()
-            .map_err(StoreError::Sqlite)
+        credential_by_id_connection(&self.connection, id)
     }
 
     pub fn revoke_credential(&mut self, id: Uuid) -> Result<bool, StoreError> {
@@ -250,6 +249,206 @@ impl RouterStore {
         }
         let cursor = credentials.last().map(|credential| credential.claims.id);
         Ok((credentials, cursor, has_more))
+    }
+
+    pub fn server_id(&self) -> Result<Uuid, StoreError> {
+        server_id_connection(&self.connection)
+    }
+
+    pub fn issue_onboarding_invite(
+        &mut self,
+        workspace: &WorkspaceName,
+        create_workspace: bool,
+        provider: Option<OnboardingProvider>,
+        now: i64,
+    ) -> Result<IssuedInvite, StoreError> {
+        if !(0..=MAX_SAFE_INTEGER - INVITE_LIFETIME_MS).contains(&now) {
+            return Err(StoreError::InvalidData);
+        }
+        let invite_id = Uuid::new_v4();
+        let mut token_bytes = [0_u8; TOKEN_BYTES];
+        getrandom::fill(&mut token_bytes).map_err(|_| StoreError::InvalidData)?;
+        let invite_token = SecretToken::parse(URL_SAFE_NO_PAD.encode(token_bytes))
+            .map_err(map_credential_error)?;
+        let expires_at = now + INVITE_LIFETIME_MS;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let server_id = server_id_connection(&transaction)?;
+        if create_workspace {
+            transaction
+                .execute(
+                    "INSERT INTO workspaces(name,created_at,next_seq,next_task_id) VALUES(?1,?2,1,1) ON CONFLICT(name) DO NOTHING",
+                    params![workspace.as_str(), now],
+                )
+                .map_err(StoreError::Sqlite)?;
+        } else {
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE name=?1)",
+                    [workspace.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::Sqlite)?;
+            if !exists {
+                return Err(StoreError::WorkspaceNotFound);
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO onboarding_invites(id,token_hash,provider,workspace,subject,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    invite_id.to_string(),
+                    hash_token(invite_token.expose()).as_slice(),
+                    provider.map(OnboardingProvider::as_str),
+                    workspace.as_str(),
+                    invite_subject(invite_id),
+                    now,
+                    expires_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(IssuedInvite {
+            server_id,
+            invite_id,
+            invite_token,
+            expires_at,
+            workspace: workspace.clone(),
+            provider,
+        })
+    }
+
+    pub fn revoke_onboarding_invite(
+        &mut self,
+        invite_id: Uuid,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        if invite_id.is_nil() || !(0..=MAX_SAFE_INTEGER).contains(&now) {
+            return Err(StoreError::InvalidData);
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE onboarding_invites SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1",
+                params![invite_id.to_string(), now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if changed == 0 {
+            return Err(StoreError::RequestNotFound);
+        }
+        Ok(())
+    }
+
+    pub fn redeem_onboarding(
+        &mut self,
+        request: &EnrollmentRequest,
+        now: i64,
+    ) -> Result<PublicCredentialClaims, EnrollmentError> {
+        if request.version != ONBOARDING_VERSION
+            || request.server_id.is_nil()
+            || request.invite_id.is_nil()
+            || request.enrollment_id.is_nil()
+            || request.credential_id.is_nil()
+            || !valid_invite_token(&request.invite_token)
+        {
+            return Err(EnrollmentError::Malformed);
+        }
+        if !(0..=MAX_SAFE_INTEGER).contains(&now) {
+            return Err(EnrollmentError::Unavailable);
+        }
+        let (agent_side, agent_client) = request.provider.identity();
+        let mut credential = CredentialFile {
+            version: CREDENTIAL_VERSION,
+            id: request.credential_id,
+            token: request.credential_token.clone(),
+            role: CredentialRole::Agent,
+            subject: invite_subject(request.invite_id),
+            agent_side: Some(agent_side),
+            agent_client: Some(agent_client),
+            workspaces: Vec::new(),
+        };
+        credential
+            .validate()
+            .map_err(|_| EnrollmentError::Malformed)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| EnrollmentError::Unavailable)?;
+        if server_id_connection(&transaction).map_err(|_| EnrollmentError::Unavailable)?
+            != request.server_id
+        {
+            return Err(EnrollmentError::InviteUnavailable);
+        }
+        let invite = transaction
+            .query_row(
+                "SELECT token_hash,provider,workspace,subject,expires_at,revoked_at,enrollment_id,credential_id FROM onboarding_invites WHERE id=?1",
+                [request.invite_id.to_string()],
+                onboarding_invite_from_row,
+            )
+            .optional()
+            .map_err(|_| EnrollmentError::Unavailable)?
+            .ok_or(EnrollmentError::InviteUnavailable)?;
+        if !bool::from(
+            invite
+                .token_hash
+                .ct_eq(&hash_token(request.invite_token.expose())),
+        ) || invite.revoked_at.is_some()
+            || invite
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider != request.provider.as_str())
+        {
+            return Err(EnrollmentError::InviteUnavailable);
+        }
+        if invite.subject != credential.subject {
+            return Err(EnrollmentError::Unavailable);
+        }
+        credential.workspaces.push(invite.workspace);
+        if let Some(enrollment_id) = invite.enrollment_id {
+            if enrollment_id != request.enrollment_id
+                || invite.credential_id != Some(request.credential_id)
+            {
+                return Err(EnrollmentError::InviteUnavailable);
+            }
+            let stored = credential_by_id_connection(&transaction, request.credential_id)
+                .map_err(|_| EnrollmentError::Unavailable)?
+                .ok_or(EnrollmentError::InviteUnavailable)?;
+            if !bool::from(stored.token_hash.ct_eq(&credential.token_hash()))
+                || stored.revoked_at.is_some()
+                || stored.claims != credential.public_claims()
+            {
+                return Err(EnrollmentError::InviteUnavailable);
+            }
+            transaction
+                .commit()
+                .map_err(|_| EnrollmentError::Unavailable)?;
+            return Ok(stored.claims);
+        }
+        if now >= invite.expires_at {
+            return Err(EnrollmentError::InviteUnavailable);
+        }
+        insert_credential_connection(&transaction, &credential, now)
+            .map_err(|error| enrollment_insert_error(&error))?;
+        let changed = transaction
+            .execute(
+                "UPDATE onboarding_invites SET enrollment_id=?2,credential_id=?3,redeemed_at=?4 WHERE id=?1 AND enrollment_id IS NULL AND revoked_at IS NULL",
+                params![
+                    request.invite_id.to_string(),
+                    request.enrollment_id.to_string(),
+                    request.credential_id.to_string(),
+                    now,
+                ],
+            )
+            .map_err(|_| EnrollmentError::Unavailable)?;
+        if changed != 1 {
+            return Err(EnrollmentError::InviteUnavailable);
+        }
+        transaction
+            .commit()
+            .map_err(|_| EnrollmentError::Unavailable)?;
+        Ok(credential.public_claims())
     }
 
     pub fn create_workspace(&mut self, name: &WorkspaceName) -> Result<(i64, bool), StoreError> {
@@ -592,17 +791,29 @@ impl RouterStore {
         let version: i64 = transaction
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(StoreError::Sqlite)?;
-        if version > SCHEMA_VERSION {
+        if !(0..=SCHEMA_VERSION).contains(&version) {
             return Err(StoreError::UnsupportedSchema);
         }
         if version == 0 {
             transaction
                 .execute_batch(SCHEMA)
                 .map_err(StoreError::Sqlite)?;
+        }
+        if version < 2 {
+            transaction
+                .execute_batch(ONBOARDING_SCHEMA)
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "INSERT INTO server_metadata(key,value) VALUES('server_id',?1)",
+                    [Uuid::new_v4().to_string()],
+                )
+                .map_err(StoreError::Sqlite)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(StoreError::Sqlite)?;
         }
+        server_id_connection(&transaction)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
     }
@@ -626,6 +837,108 @@ impl RouterStore {
         recover_external_operations(&transaction)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
+    }
+}
+
+fn server_id_connection(connection: &Connection) -> Result<Uuid, StoreError> {
+    let value: String = connection
+        .query_row(
+            "SELECT value FROM server_metadata WHERE key='server_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    let id = Uuid::parse_str(&value).map_err(|_| StoreError::InvalidData)?;
+    if id.is_nil() {
+        return Err(StoreError::InvalidData);
+    }
+    Ok(id)
+}
+
+fn insert_credential_connection(
+    connection: &Connection,
+    credential: &CredentialFile,
+    now: i64,
+) -> Result<(), StoreError> {
+    credential.validate().map_err(map_credential_error)?;
+    if credential.id.is_nil() || !(0..=MAX_SAFE_INTEGER).contains(&now) {
+        return Err(StoreError::InvalidData);
+    }
+    let workspaces =
+        serde_json::to_string(&credential.workspaces).map_err(|_| StoreError::InvalidData)?;
+    connection
+        .execute(
+            "INSERT INTO credentials(id,token_hash,role,subject,agent_side,agent_client,workspaces_json,created_at,revoked_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
+            params![
+                credential.id.to_string(),
+                credential.token_hash().as_slice(),
+                credential.role.as_str(),
+                credential.subject,
+                credential.agent_side.map(agent_side_str),
+                credential.agent_client.map(agent_client_str),
+                workspaces,
+                now,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn credential_by_id_connection(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<StoredCredential>, StoreError> {
+    connection
+        .query_row(
+            "SELECT id,token_hash,role,subject,agent_side,agent_client,workspaces_json,created_at,revoked_at FROM credentials WHERE id=?1",
+            [id.to_string()],
+            credential_from_row,
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
+fn valid_invite_token(token: &SecretToken) -> bool {
+    // The no-padding decoder also rejects nonzero trailing bits (noncanonical encodings).
+    let mut decoded = [0_u8; TOKEN_BYTES + 2];
+    token.expose().len() == TOKEN_LENGTH
+        && URL_SAFE_NO_PAD.decode_slice(token.expose(), &mut decoded) == Ok(TOKEN_BYTES)
+}
+
+fn onboarding_invite_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOnboardingInvite> {
+    let hash: Vec<u8> = row.get(0)?;
+    let workspace: String = row.get(2)?;
+    let enrollment_id: Option<String> = row.get(6)?;
+    let credential_id: Option<String> = row.get(7)?;
+    Ok(StoredOnboardingInvite {
+        token_hash: hash.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+        provider: row.get(1)?,
+        workspace: WorkspaceName::parse(workspace).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        subject: row.get(3)?,
+        expires_at: row.get(4)?,
+        revoked_at: row.get(5)?,
+        enrollment_id: enrollment_id
+            .map(|id| Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()?,
+        credential_id: credential_id
+            .map(|id| Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()?,
+    })
+}
+
+fn enrollment_insert_error(error: &StoreError) -> EnrollmentError {
+    match error {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            ) =>
+        {
+            EnrollmentError::InviteUnavailable
+        }
+        StoreError::InvalidData => EnrollmentError::Malformed,
+        _ => EnrollmentError::Unavailable,
     }
 }
 
@@ -1241,5 +1554,29 @@ CREATE TABLE external_resolutions(
     PRIMARY KEY(workspace,resolution_id),
     UNIQUE(workspace,operation_id),
     FOREIGN KEY(workspace,operation_id) REFERENCES external_operations(workspace,operation_id)
+) STRICT;
+";
+
+const ONBOARDING_SCHEMA: &str = r"
+CREATE TABLE server_metadata(
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+) STRICT;
+CREATE TABLE onboarding_invites(
+    id TEXT PRIMARY KEY NOT NULL,
+    token_hash BLOB UNIQUE NOT NULL CHECK(length(token_hash)=32),
+    provider TEXT NULL CHECK(provider IS NULL OR provider IN('claude-code','codex-cli','omp')),
+    workspace TEXT NOT NULL REFERENCES workspaces(name),
+    subject TEXT UNIQUE NOT NULL,
+    created_at INTEGER NOT NULL CHECK(created_at>=0 AND created_at<=9007199254740991),
+    expires_at INTEGER NOT NULL CHECK(expires_at=created_at+600000 AND expires_at<=9007199254740991),
+    revoked_at INTEGER NULL CHECK(revoked_at IS NULL OR (revoked_at>=0 AND revoked_at<=9007199254740991)),
+    enrollment_id TEXT NULL,
+    credential_id TEXT NULL REFERENCES credentials(id),
+    redeemed_at INTEGER NULL CHECK(redeemed_at IS NULL OR (redeemed_at>=0 AND redeemed_at<expires_at)),
+    CHECK(
+      (enrollment_id IS NULL AND credential_id IS NULL AND redeemed_at IS NULL) OR
+      (enrollment_id IS NOT NULL AND credential_id IS NOT NULL AND redeemed_at IS NOT NULL)
+    )
 ) STRICT;
 ";

@@ -27,6 +27,7 @@ async fn operator_can_create_join_post_and_read_history_over_websocket() {
         tls_key_file: None,
         public_url: None,
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     })
     .await
     .expect("start router");
@@ -165,6 +166,7 @@ async fn operator_can_create_join_post_and_read_history_over_websocket() {
         tls_key_file: None,
         public_url: None,
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     })
     .await
     .expect("restart router");

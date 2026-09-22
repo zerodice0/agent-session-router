@@ -456,6 +456,7 @@ async fn router_reloads_lists_and_restores_durable_bindings() {
         tls_key_file: None,
         public_url: None,
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     })
     .await
     .expect("start router");
@@ -631,6 +632,7 @@ async fn router_reloads_lists_and_restores_durable_bindings() {
         tls_key_file: None,
         public_url: None,
         exposure: RouterExposure::Direct,
+        onboarding_assets_dir: None,
     })
     .await
     .expect("restart router");

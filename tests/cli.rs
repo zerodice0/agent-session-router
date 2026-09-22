@@ -25,7 +25,51 @@ fn parses_complete_public_command_surface() {
     let commands: Vec<Vec<&str>> = vec![
         vec!["asr", "router"],
         vec!["asr", "router", "start", "--background", "--share"],
+        vec!["asr", "router", "start", "--no-ui"],
+        vec!["asr", "ui"],
+        vec!["asr", "ui", "--workspace", "project-room"],
         vec!["asr", "router", "stop"],
+        vec!["asr", "onboarding", "revoke", operation],
+        vec![
+            "asr",
+            "onboarding",
+            "install",
+            "--provider",
+            "codex-cli",
+            "--stdin",
+        ],
+        vec![
+            "asr",
+            "onboarding",
+            "resume",
+            operation,
+            "--provider",
+            "omp",
+        ],
+        vec![
+            "asr",
+            "--profile",
+            "office",
+            "onboarding",
+            "status",
+            "--provider",
+            "claude-code",
+            "--json",
+        ],
+        vec![
+            "asr",
+            "onboarding",
+            "prompt",
+            "--workspace",
+            "room",
+            "--name",
+            "office",
+            "--create-workspace",
+            "--provider",
+            "omp",
+            "--endpoint",
+            "local=ws://127.0.0.1:8787/ws",
+        ],
         vec![
             "asr",
             "codex",
@@ -481,6 +525,105 @@ fn semantic_parse_boundaries_are_rejected_before_effects() {
     assert!(
         Cli::try_parse_from(["asr", "task", "list", "room", "--all", "--state", "todo"]).is_err()
     );
+}
+
+#[test]
+fn console_parser_rejects_invalid_headless_modes_and_workspace_before_effects() {
+    assert!(Cli::try_parse_from(["asr", "router", "start", "--background", "--no-ui"]).is_err());
+    let stopped = Cli::try_parse_from(["asr", "router", "stop", "--no-ui"]).unwrap();
+    assert_eq!(
+        cli::validate_command(stopped.command.as_ref().unwrap())
+            .unwrap_err()
+            .exit_code(),
+        2
+    );
+    let invalid = Cli::try_parse_from(["asr", "--dry-run", "ui", "--workspace", ""]).unwrap();
+    assert_eq!(
+        cli::plan_dry_run(&invalid, &mut FixedIds(Uuid::nil()))
+            .unwrap_err()
+            .exit_code(),
+        2
+    );
+    assert!(Cli::try_parse_from(["asr", "ui", "--background"]).is_err());
+    assert!(Cli::try_parse_from(["asr", "ui", "--no-ui"]).is_err());
+}
+
+#[test]
+fn console_dry_run_preserves_initial_workspace_without_opening_credentials_or_stdin() {
+    let parsed = Cli::try_parse_from([
+        "asr",
+        "--credential",
+        "/missing/operator.json",
+        "--profile",
+        "missing",
+        "--dry-run",
+        "ui",
+        "--workspace",
+        "project-room",
+    ])
+    .unwrap();
+    let plan = cli::plan_dry_run(&parsed, &mut FixedIds(Uuid::nil())).unwrap();
+    assert_eq!(plan.command, "ui");
+    assert_eq!(plan.room.as_deref(), Some("project-room"));
+    assert_eq!(plan.operation_id, None);
+    assert_eq!(
+        cli::read_command_stdin(parsed.command.as_ref().unwrap(), &mut PanicReader).unwrap(),
+        None
+    );
+    let foreground =
+        Cli::try_parse_from(["asr", "--dry-run", "router", "start", "--no-ui"]).unwrap();
+    let Some(Command::Router(args)) = &foreground.command else {
+        panic!("router command")
+    };
+    assert!(args.no_ui);
+    assert!(!args.background);
+    assert_eq!(
+        cli::plan_dry_run(&foreground, &mut FixedIds(Uuid::nil()))
+            .unwrap()
+            .command,
+        "router"
+    );
+}
+
+#[test]
+fn explicit_console_rejects_nonterminal_before_reading_configuration_or_starting_router() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("absent-data");
+    let config = directory.path().join("invalid-config");
+    std::fs::write(&config, b"not JSON").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_asr"))
+        .args(["--profile", "missing", "ui"])
+        .env("ASR_DATA_DIR", &data)
+        .env("ASR_CONFIG_PATH", &config)
+        .env("TERM", "xterm-256color")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("terminal_required"));
+    assert!(output.stdout.is_empty());
+    assert!(!data.exists());
+    let dry_run = std::process::Command::new(env!("CARGO_BIN_EXE_asr"))
+        .args([
+            "--profile",
+            "missing",
+            "--dry-run",
+            "ui",
+            "--workspace",
+            "room",
+        ])
+        .env("ASR_DATA_DIR", &data)
+        .env("ASR_CONFIG_PATH", &config)
+        .env("TERM", "dumb")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(dry_run.status.success());
+    let plan: Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(plan["command"], "ui");
+    assert_eq!(plan["room"], "room");
+    assert!(!data.exists());
 }
 
 struct FixedIds(Uuid);
@@ -985,5 +1128,60 @@ fn command_model_keeps_os_arguments_opaque() {
             );
         }
         command => panic!("unexpected command: {command:?}"),
+    }
+}
+
+#[test]
+fn onboarding_authority_overrides_are_rejected_even_during_dry_run() {
+    for arguments in [
+        vec![
+            "asr",
+            "--profile",
+            "other",
+            "--dry-run",
+            "onboarding",
+            "install",
+            "--provider",
+            "omp",
+            "--stdin",
+        ],
+        vec![
+            "asr",
+            "--credential",
+            "/missing",
+            "--dry-run",
+            "onboarding",
+            "resume",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "--provider",
+            "codex-cli",
+        ],
+        vec![
+            "asr",
+            "--dry-run",
+            "onboarding",
+            "status",
+            "--provider",
+            "omp",
+            "--json",
+        ],
+    ] {
+        let parsed = Cli::try_parse_from(arguments).unwrap();
+        let error = cli::plan_dry_run(&parsed, &mut FixedIds(Uuid::nil())).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
+    for arguments in [
+        vec!["asr", "onboarding", "install", "--stdin"],
+        vec!["asr", "onboarding", "install", "--provider", "omp"],
+        vec![
+            "asr",
+            "onboarding",
+            "install",
+            "--provider",
+            "unknown",
+            "--stdin",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
     }
 }

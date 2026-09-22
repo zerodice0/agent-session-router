@@ -37,6 +37,7 @@ fn config(data_dir: &Path, exposure: RouterExposure) -> RouterConfig {
         tls_key_file: None,
         public_url: None,
         exposure,
+        onboarding_assets_dir: None,
     }
 }
 

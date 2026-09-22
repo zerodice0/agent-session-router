@@ -16,9 +16,9 @@ files instead.
 The Rust binary is the only core runtime. The retained `integrations/omp` package
 is an optional package loaded by an external OMP host. The retained
 `integrations/claude-sdk` package is used only by the managed Claude gateway and
-therefore requires Node when that mode is selected. Bun is only needed to package
-the optional integration artifacts; it is not needed to run the router, workspace,
-task, credential, or stock-provider commands.
+therefore requires Node when that mode is selected. Bun is needed to build the
+packaged integration assets, not to run the router, console, onboarding installer,
+workspace, task, credential, or stock-provider commands.
 
 ## Build and install
 
@@ -35,6 +35,8 @@ Release archives have this layout:
 bin/asr
 share/agent-session-router/integrations/omp/
 share/agent-session-router/integrations/claude-sdk/
+share/agent-session-router/integrations/claude-plugin/
+share/agent-session-router/integrations/codex/
 ```
 
 Run `bin/asr install` from an archive to install the binary and its adjacent
@@ -46,49 +48,231 @@ On macOS, distribute a signed and notarized archive through the normal
 organization policy. Do not bypass Gatekeeper or weaken system quarantine as an
 installation step.
 
+### Prepare the server's bootstrap bundle
+
+Copy/paste onboarding needs deployment assets on the **server**, not just a locally
+built `asr`. The release workflow produces an `asr-bootstrap-bundle` Actions
+artifact; it does not publish a public npm package or GitHub Release download URL.
+Extract that artifact into `$ASR_DATA_DIR/bootstrap`, or set `ASR_BOOTSTRAP_DIR` to
+its absolute directory before starting the router. Keep it owned by the server
+user and free of symlinks. The router validates the manifest and files at startup.
+
+The supported target IDs are:
+
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-gnu`
+
+Only targets actually present in the bundle can install. A current-host build does
+not create binaries for the other architectures; Linux targets require GNU/Linux,
+and Windows is unsupported. The provider CLI must already be installed on the
+client. Onboarding does not install system packages, bypass host approvals, or
+build missing targets from source.
+
+For a locally assembled bundle, follow the native archive staging in
+[the release workflow](.github/workflows/release.yml). `bun run build:integrations`
+runs `scripts/package.ts`, which packages the canonical ASR skill for all three
+hosts, the Claude skill-only plugin, OMP integration, and managed Claude bridge,
+using the version from `Cargo.toml`. For each available `TARGET`, stage
+`asr-TARGET`, `agent-session-router-TARGET.tar.gz`, and the archive's `.sha256`
+file together in a dedicated directory; a raw-binary `.sha256` is also supported.
+The raw binary must match the archive's `bin/asr`. Then generate the manifest:
+
+```sh
+bun scripts/bootstrap-manifest.ts --dir dist/bootstrap
+```
+
+This script verifies existing artifacts; it does not cross-compile them. Place the
+resulting directory on the server before startup. Without a bundle, the router and
+already-installed clients still work, but invitation generation fails before
+issuing an invitation.
+
 ## Native v2 quickstart
 
-The default local router binds to `ws://127.0.0.1:8787/ws`. Start it in the
-background and use the built-in `local` profile to create a workspace:
+### 1. Start the owned server
+
+The default endpoint is `ws://127.0.0.1:8787/ws`. In a terminal, start the router
+and its full-screen operator console:
 
 ```sh
-asr router start --background
-asr --profile local workspace create team-room
-asr profile list
+asr router start
 ```
 
-`local` is built in and cannot be added or replaced. A profile stores a router
-address, not a secret. The operator credential for the owned local router is
-managed by the router. Issue a scoped agent credential into a private file when a
-provider host needs to run as a separate identity:
+With terminal stdin/stdout and `TERM` other than `dumb`, this starts or reuses the
+owned router and opens the console. Use **Ctrl-N** to create `team-room`, then
+**F4** to generate a client invitation for the selected room. The numbered `asr`
+menu also offers start (1) and console reattach (7).
+
+Choose the launch mode deliberately:
+
+| Command / environment | Behavior |
+| --- | --- |
+| `asr router start` in a usable TTY | Owned router plus full-screen console; leaving the console does not stop the server. |
+| `asr router start --background` | Start/reuse without a console and return. |
+| `asr router start --no-ui` | Foreground headless lifecycle; Ctrl-C interrupts the owned child, waits for reaping and cleanup, then returns exit code 130. |
+| Non-TTY stdin/stdout or `TERM=dumb` | No automatic console; foreground lifecycle unless `--background` is given. |
+| `asr ui --workspace team-room` | Attach to an already-running router; never start one. |
+
+`--background` and `--no-ui` are mutually exclusive. An already-running owned
+router is reused rather than adopted as a new foreground child. To use CLI
+commands while the console is open, use another terminal. Alternatively, detach
+with `q` in navigation or Ctrl-C and later reattach with `asr ui`.
+
+### 2. Generate and share a one-use invitation
+
+For a CLI-only path, run this on the owned server:
 
 ```sh
-asr --profile local credential issue \
-  --agent local:worker-a --side codex --client codex-app-server \
-  --workspace team-room --output "$HOME/.config/agent-session-router/worker-a.json"
+asr onboarding prompt --workspace team-room --name office --create-workspace
 ```
 
-Credential files contain bearer material and are written with private permissions.
-Keep them outside source control. Use `--credential PATH` before the subcommand
-when starting a provider:
+Omit `--create-workspace` when the room must already exist. Workspace choice and
+creation belong to the server administrator. Add
+`--provider claude-code`, `--provider codex-cli`, or `--provider omp` to restrict the
+invitation to that host; otherwise the receiving conversation chooses its own
+host, not whichever executables happen to be installed.
+
+The default invitation uses the owned router's advertised endpoint, or its control
+endpoint if none is advertised. A loopback invitation works **only on the same
+machine**. For another device, start with configured Tailscale sharing or TLS as
+described in [Profiles, remote routers, and TLS](#profiles-remote-routers-and-tls).
+Repeated `--endpoint KIND=URL` options replace the candidate list with already
+configured aliases of this server (`tailnet`, `lan`, `public`, or local-only
+`local`). They do not create listeners, proxies, tunnels, or firewall rules.
+`--ca-file PATH` supplies a public CA certificate, not a private key.
+
+Send the complete generated prompt through a trusted channel and paste it into
+the intended Claude Code, Codex CLI, or OMP conversation. It contains a **10-minute,
+one-use invitation secret**: someone with the prompt can redeem it first while it
+is valid. It contains no administrator token, long-lived credential, or private
+key. Do not publish it, log it, or put its ticket in command arguments, environment
+variables, or URLs. Use a fresh invitation for every device/provider identity.
+
+### 3. Install, restart, then confirm participation
+
+The generated prompt includes an approved-shell bootstrap for clients without ASR.
+It downloads the supplied host target, verifies its pinned size/hash, and passes
+the invitation JSON through stdin to
+`asr onboarding install --provider PROVIDER --stdin`. Run the generated block
+unchanged through the provider's normal shell approval process; do not construct
+a download URL or expose private credential/journal files to the conversation.
+
+The installer verifies server identity and transport, tries supplied reachable
+routes in Tailnet → LAN → public order, and fails closed on trust/hash mismatch.
+It installs a versioned native bundle, stores a private client-generated credential,
+and registers the profile and host integration without replacing unrelated
+provider settings or an existing PATH executable.
+
+`stage: configured` means installation/registration, **not current-session
+activation**. Follow the returned `nextAction` exactly; `activation` remains
+`restart_required` or `not_checked`, not proof of a connected model. Codex needs a
+new session; OMP needs a process restart, not just command reload; Claude's Channel
+launch additionally needs normal organization policy and development opt-in.
+
+After the prescribed restart, use the host's ASR interface:
+
+| Host | Workspace entry point |
+| --- | --- |
+| Claude Code | `/asr:workspace status` |
+| Codex CLI | `$asr workspace status` (select `$asr` or use `/skills`) |
+| OMP | `/asr workspace status`; the shared skill is `/skill:asr workspace` |
+
+Confirm this host's actual MCP `workspace_list` and `workspace_members` show its
+identity in the invited workspace. Joining (`workspace_join`) and readiness are
+required for delivery; an operator CLI connection cannot stand in for provider
+participation. Chat posts coordinate people and agents; they do not run a model.
+Task execution is a separate request/begin/checkpoint/complete lifecycle below.
+See the existing [provider guide](docs/provider-integration.md),
+[Claude](docs/claude-integration.md), [Claude Channel](docs/claude-channel-integration.md),
+[Codex](docs/codex-integration.md), and [OMP/AgentBridge](docs/agentbridge-integration.md)
+guides for host-specific activation and execution boundaries.
+
+Resume the same client's interrupted installation with its invitation ID, or
+inspect its non-secret status:
 
 ```sh
-asr --profile local --credential "$HOME/.config/agent-session-router/worker-a.json" \
-  codex local:worker-a --workspace team-room
+asr onboarding resume INVITE_ID --provider codex-cli
+asr --profile office onboarding status --provider codex-cli --json
 ```
 
-Workspace membership is explicit. A human can join with `workspace join`, and an
-MCP client can use `workspace_join`. Provider `--workspace ROOM` is an initial
-join convenience, not the only way to join; delivery requires a successful join
-and readiness handshake:
+Use the provider from the original installation. Resume uses the private journal
+and the same enrollment/credential, not a second invitation consumption. Status
+checks stored installation integrity and endpoint reachability; it does not start
+a provider or assert that the current conversation is connected. On the server:
 
 ```sh
-asr --profile local workspace join team-room
+asr onboarding revoke INVITE_ID
+asr credential list --json
+asr credential revoke CREDENTIAL_ID
 ```
 
-There is no automatic chat wake-up. Durable task events are delivered only to the
-joined, ready provider session, and task events are not silently copied into a
-model prompt.
+Invitation revocation prevents redemption/resume but does not revoke an already
+issued credential. Revoke that credential separately when access must end.
+
+The built-in `local` profile cannot be added or replaced. Manual profiles store
+router addresses; onboarded profiles also retain verified route/server metadata
+and provider bindings to private credential files, never bearer values. Explicit
+`credential issue` and provider launch commands remain available for manually
+managed identities; onboarding does not require copying an operator credential
+to a provider machine.
+
+### Full-screen console
+
+The console requires at least **80×24**. At 120 columns it adds an inline detail
+pane; narrower supported layouts use Enter for detail. Below the minimum it keeps
+the connection but disables mutations until resized. It supports Unicode input,
+bracketed paste, escaped untrusted terminal content, and `NO_COLOR`.
+
+| Context | Keys |
+| --- | --- |
+| Navigation | F1 Chat, F2 Tasks, F3 Members, F4 Invite; Tab/Shift-Tab changes focus; arrows select; Enter opens detail; `?` opens help. |
+| Workspace sidebar | Enter joins the selected room; `[` / `]` pages the list; Ctrl-N creates a workspace (admin only). |
+| Chat | `i` focuses the composer; Enter adds a newline; Ctrl-S posts; `e` toggles all events; `[` / PgUp loads older history, `]` / PgDn pages forward in past mode, End reloads the live tail. |
+| Tasks | Ctrl-T creates; `a` assigns, `r` requests execution, `i` interrupts, `f` confirms an observed stop when eligible, `e` edits, `m` adds a note, `c` cancels, `o` reopens. |
+| Task browsing | `/` filters states/assignee; `[` / `]` pages results; `h` opens task history, also paged with `[` / `]`. |
+| Forms | Tab/Shift-Tab moves fields; Ctrl-S submits; Esc cancels when no write is in flight; Ctrl-R explicitly reconfirms a changed task version. Assignment supports member selection with arrows, an explicit ID, or empty for unassigned. |
+| Invitation result | `y` explicitly copies using an available native clipboard helper; `p` prints the exact prompt on the normal screen, then Enter returns. Esc discards the in-memory prompt. |
+| Leave / stop | `q` in navigation or Ctrl-C detaches; Ctrl-X opens the separate owned-router stop confirmation. |
+
+Chat drafts and forms remain pending until acknowledged; the console does not
+optimistically invent a saved message or task transition. A stale task form keeps
+your draft and requires explicit reconfirmation, rather than silently submitting
+against a newer version. If a mutation result is unknown, only a supported
+immutable retry resends the same operation/payload. An uncertain task request is
+**not resent**: inspect task state/history first. Writes are disabled while
+reconnecting or resynchronizing.
+
+**Assignee is not executor.** Assignment changes responsibility without starting
+work; request acceptance is not evidence that execution began. The console shows
+authoritative task/attempt state, version, executor and stop evidence. It has no
+operator button that impersonates an executor's begin/checkpoint/pause/complete.
+Unknown stop evidence blocks new execution even if the assignee changes.
+Manual stop confirmation requires the exact interrupted attempt, a note, and
+confirmation that you actually observed execution stop.
+
+The server survives detachment, but requests made by this console belong to its
+connection. If requests are pending or unresolved, leaving requires typing
+`DETACH` and pressing Ctrl-S; Esc returns without disconnecting. Confirming closes
+the requester connection and can interrupt its work via `RequesterDisconnected`
+and `CancelWork`. Workspace switching is also blocked while such work or a write
+is pending. This does not cancel unrelated requests owned by other connections.
+To stop the **server**, a verified owned-admin console requires Ctrl-X, `STOP`,
+then Ctrl-S, warning that other workspaces are affected. Remote/scoped viewers
+must ask the managing server operator to use `asr router stop`.
+
+Reattach locally with `asr ui --workspace team-room`. Without an explicit profile
+or `ROUTER_URL`, `ui` uses the owned runtime's control URL, not a saved default
+remote profile. `--credential PATH` (before `ui`) takes precedence over
+`ASR_CREDENTIAL_FILE`, then the owned admin credential; explicit credentials are
+never silently replaced by admin credentials. For a remote router, use
+`asr --profile NAME --credential PATH ui --workspace ROOM`. Admin actions depend
+on authenticated server authority, not credential-file labels or loopback alone.
+
+Leaving, handled signals, errors, and panic handling restore raw mode, cursor,
+bracketed paste and the normal terminal screen. Console startup failure leaves the
+router running and reports reattach guidance; it does not silently stop the server.
+
 
 ### Self-owned task flow
 
@@ -107,10 +291,12 @@ asr --profile local task request team-room TASK_ID \
 ```
 
 `TASK_ID`, `VERSION`, and `ASSIGNED_VERSION` above are values returned by the
-previous command. Creation intentionally has no implicit assignee; the explicit
-assign step is what makes this flow self-owned. Assignment alone does not wake or
-start an executor. Every mutation uses an expected version and, where applicable,
-an operation ID so a retry cannot apply a stale or duplicate mutation.
+previous command; replace `local:worker-a` with the actual invited or manually
+provisioned provider identity. Creation intentionally has no implicit assignee.
+Assignment alone does not wake or start an executor. Version-fenced mutations
+use the current expected version; idempotent mutations also use operation IDs
+so an immutable retry cannot apply twice. Creation and notes do not invent an
+expected-version requirement.
 
 The assigned provider uses the production MCP tools
 `workspace_join`, `task_begin`, `task_checkpoint`, `task_pause`, and
@@ -248,13 +434,14 @@ Use a profile for a configured remote router and a private operator credential
 provided by its administrator:
 
 ```sh
-asr profile add tailnet wss://router.example/ws
-asr --profile tailnet --credential "$HOME/.config/agent-session-router/remote-operator.json" \
+asr profile add remote wss://router.example/ws
+asr --profile remote --credential "$HOME/.config/agent-session-router/remote-operator.json" \
   workspace list --json
 ```
 
 Remote operator commands require `--credential PATH` or `ASR_CREDENTIAL_FILE`;
-profiles do not carry credentials. Router address selection is explicit
+profiles contain no bearer values, and provider bindings do not grant operator
+authority. Router address selection is explicit
 `--profile` first, then `ROUTER_URL`, then the saved default profile, then built-in
 `local`. `ROUTER_URL` remains a supported non-secret address override, not the old
 shared-token authentication contract.

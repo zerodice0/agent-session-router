@@ -93,13 +93,18 @@ jobs:
           test -f dist/integrations/claude-sdk/bridge.js
           test -f dist/integrations/claude-sdk/manifest.json
           test -f dist/integrations/claude-sdk/package.json
+          test -f dist/integrations/claude-plugin/.claude-plugin/marketplace.json
+          test -f dist/integrations/claude-plugin/plugins/asr/.claude-plugin/plugin.json
+          test -f dist/integrations/claude-plugin/plugins/asr/skills/workspace/SKILL.md
+          test -f dist/integrations/codex/skills/asr/SKILL.md
+          test -f dist/integrations/omp/skills/asr/SKILL.md
           test ! -e dist/integrations/claude-sdk/node_modules/.bin
           platform_package="@anthropic-ai/claude-agent-sdk-$(node -p 'process.platform + "-" + process.arch')"
           test -d "dist/integrations/claude-sdk/node_modules/$platform_package"
           bun -e "await import('./dist/integrations/omp/index.js')"
           node -e "await import('./dist/integrations/claude-sdk/bridge.js')"
 
-      - name: Stage native archive and SHA256 through Rust contract
+      - name: Stage native archive, raw binary, and SHA256 through Rust contract
         env:
           TARGET: ${{ matrix.target }}
           ASR_PACKAGE_BINARY: ${{ github.workspace }}/target/release/asr
@@ -108,16 +113,20 @@ jobs:
         run: |
           release_dir="$PWD/dist/release"
           archive_name="agent-session-router-$TARGET.tar.gz"
+          binary_name="asr-$TARGET"
           cargo test --locked --test install packaged_archive_contract -- --ignored --exact
-          tar -C "$ASR_PACKAGE_ROOT" -czf "$release_dir/$archive_name" bin share
+          COPYFILE_DISABLE=1 tar -C "$ASR_PACKAGE_ROOT" -czf "$release_dir/$archive_name" bin share
+          cp "$ASR_PACKAGE_ROOT/bin/asr" "$release_dir/$binary_name"
           (
             cd "$release_dir"
             shasum -a 256 "$archive_name" > "$archive_name.sha256"
+            shasum -a 256 "$binary_name" > "$binary_name.sha256"
           )
           tar -tzf "$release_dir/$archive_name" bin/asr >/dev/null
           tar -tzf "$release_dir/$archive_name" share/agent-session-router/integrations/omp/index.js >/dev/null
           tar -tzf "$release_dir/$archive_name" share/agent-session-router/integrations/claude-sdk/bridge.js >/dev/null
           (cd "$release_dir" && shasum -a 256 -c "$archive_name.sha256")
+          (cd "$release_dir" && shasum -a 256 -c "$binary_name.sha256")
 
       - name: Record unsigned macOS archive status
         if: runner.os == 'macOS'
@@ -136,5 +145,49 @@ jobs:
         with:
           name: agent-session-router-${{ matrix.target }}-sha256
           path: dist/release/agent-session-router-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload raw binary and SHA256
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-session-router-${{ matrix.target }}-binary
+          path: |
+            dist/release/asr-${{ matrix.target }}
+            dist/release/asr-${{ matrix.target }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  bootstrap-bundle:
+    name: Assemble verified bootstrap bundle
+    needs: archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Download all successful native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-session-router-*
+          path: dist/bootstrap
+          merge-multiple: true
+
+      - name: Verify artifacts and generate deterministic manifest
+        run: |
+          bun scripts/bootstrap-manifest.ts --dir dist/bootstrap
+          bun -e 'const manifest = await Bun.file("dist/bootstrap/bootstrap-manifest.json").json(); if (manifest.artifacts.length !== 4) throw new Error("Bootstrap release bundle requires all four supported targets");'
+
+      - name: Upload bootstrap bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: asr-bootstrap-bundle
+          path: dist/bootstrap/*
           if-no-files-found: error
           compression-level: 0

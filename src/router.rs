@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
@@ -16,24 +16,29 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
-        ConnectInfo, State, WebSocketUpgrade,
+        ConnectInfo, Path, Request, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, Utf8Bytes, WebSocket},
     },
-    response::Response,
-    routing::get,
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use hyper_util::rt::TokioTimer;
 use serde::Serialize;
 use tokio::time::Instant;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
 };
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
+    bootstrap::{BootstrapAssets, BootstrapError},
     credentials::{
         CredentialFile, CredentialRole, PublicCredentialClaims, hash_token, read_credential,
         write_credential_atomic_no_replace,
@@ -46,6 +51,10 @@ use crate::{
         external_status as load_external_status, mark_external_dispatched,
         prepare_external_operation, prepare_external_resolution, replay_external_operation,
         terminal_external_error, validate_external_snapshot, validate_resolution_snapshot,
+    },
+    onboarding::{
+        EnrollmentError, EnrollmentRequest, EnrollmentResponse, MAX_ENROLLMENT_BYTES,
+        OnboardingInfo, VERSION as ONBOARDING_VERSION,
     },
     protocol::{
         AgentDescriptor, AgentRegistration, AgentStatus, ClientMessage, CredentialSummary,
@@ -83,6 +92,12 @@ pub const PENDING_REQUEST_LIMIT: usize = 256;
 pub const INTEGRATION_REQUEST_LIMIT: usize = 4;
 pub const CREDENTIAL_MESSAGES_PER_SECOND: u64 = 20;
 pub const CREDENTIAL_MESSAGE_BURST: u64 = 40;
+pub const ENROLLMENT_IN_FLIGHT_LIMIT: usize = 8;
+pub const ENROLLMENT_GLOBAL_PER_MINUTE: usize = 60;
+pub const ENROLLMENT_PEER_PER_MINUTE: usize = 10;
+pub const ENROLLMENT_PEER_LIMIT: usize = 1024;
+const ENROLLMENT_WINDOW: Duration = Duration::from_secs(60);
+const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouterExposure {
@@ -99,6 +114,7 @@ pub struct RouterConfig {
     pub tls_key_file: Option<PathBuf>,
     pub public_url: Option<url::Url>,
     pub exposure: RouterExposure,
+    pub onboarding_assets_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -256,6 +272,91 @@ impl Drop for PreAuthPermit {
     }
 }
 
+#[derive(Clone)]
+struct EnrollmentLimiter {
+    slots: Arc<Semaphore>,
+    rate: Arc<Mutex<EnrollmentRate>>,
+}
+
+#[derive(Default)]
+struct EnrollmentRate {
+    recent: VecDeque<(Instant, IpAddr)>,
+    peers: HashMap<IpAddr, usize>,
+}
+
+impl EnrollmentLimiter {
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(ENROLLMENT_IN_FLIGHT_LIMIT)),
+            rate: Arc::new(Mutex::new(EnrollmentRate::default())),
+        }
+    }
+
+    fn try_acquire(&self, peer: IpAddr) -> Option<OwnedSemaphorePermit> {
+        let slot = self.slots.clone().try_acquire_owned().ok()?;
+        let mut rate = self.rate.lock().ok()?;
+        rate.record(peer, Instant::now()).then_some(slot)
+    }
+}
+
+impl EnrollmentRate {
+    fn record(&mut self, peer: IpAddr, now: Instant) -> bool {
+        while self
+            .recent
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= ENROLLMENT_WINDOW)
+        {
+            let Some((_, expired_peer)) = self.recent.pop_front() else {
+                return false;
+            };
+            if let Some(count) = self.peers.get_mut(&expired_peer) {
+                *count -= 1;
+                if *count == 0 {
+                    self.peers.remove(&expired_peer);
+                }
+            }
+        }
+        if self.recent.len() >= ENROLLMENT_GLOBAL_PER_MINUTE
+            || self.peers.get(&peer).copied().unwrap_or(0) >= ENROLLMENT_PEER_PER_MINUTE
+            || (!self.peers.contains_key(&peer) && self.peers.len() >= ENROLLMENT_PEER_LIMIT)
+        {
+            return false;
+        }
+        self.recent.push_back((now, peer));
+        *self.peers.entry(peer).or_default() += 1;
+        true
+    }
+}
+
+#[cfg(test)]
+mod enrollment_rate_tests {
+    use super::*;
+
+    #[test]
+    fn sliding_window_enforces_global_and_peer_limits_until_exact_expiration() {
+        let mut rate = EnrollmentRate::default();
+        let now = Instant::now();
+        let peer = IpAddr::from([192, 0, 2, 1]);
+        for _ in 0..ENROLLMENT_PEER_PER_MINUTE {
+            assert!(rate.record(peer, now));
+        }
+        assert!(!rate.record(peer, now));
+        for index in 2..=6 {
+            for _ in 0..ENROLLMENT_PEER_PER_MINUTE {
+                assert!(rate.record(IpAddr::from([192, 0, 2, index]), now));
+            }
+        }
+        let another = IpAddr::from([192, 0, 2, 7]);
+        assert!(!rate.record(another, now));
+        assert!(!rate.record(another, now + ENROLLMENT_WINDOW - Duration::from_nanos(1)));
+        assert!(rate.record(another, now + ENROLLMENT_WINDOW));
+        for _ in 0..ENROLLMENT_PEER_PER_MINUTE {
+            assert!(rate.record(peer, now + ENROLLMENT_WINDOW));
+        }
+        assert!(!rate.record(peer, now + ENROLLMENT_WINDOW));
+    }
+}
+
 pub struct RouterRuntime {
     pub address: SocketAddr,
     pub instance_id: Uuid,
@@ -276,6 +377,10 @@ impl RouterRuntime {
     async fn start_inner(config: RouterConfig, paused: bool) -> Result<Self, RouterRuntimeError> {
         install_crypto_provider().map_err(|_| RouterRuntimeError::Configuration)?;
         let tls_config = validate_transport_config(&config)?;
+        let onboarding_assets = match config.onboarding_assets_dir.as_deref() {
+            Some(directory) => BootstrapAssets::load(directory)?.map(Arc::new),
+            None => None,
+        };
         let listener = TcpListener::bind(config.bind).map_err(RouterRuntimeError::Io)?;
         listener
             .set_nonblocking(true)
@@ -300,10 +405,20 @@ impl RouterRuntime {
             pre_auth: PreAuthLimiter::new(config.exposure),
             next_generation: Arc::new(AtomicI64::new(1)),
             instance_id: config.instance_id,
+            onboarding_assets,
+            enrollment_limiter: EnrollmentLimiter::new(),
         };
+        let onboarding = Router::new()
+            .route("/info", get(onboarding_info))
+            .route("/files/{name}", get(onboarding_file))
+            .route("/enroll", post(onboarding_enroll))
+            .fallback(onboarding_malformed)
+            .method_not_allowed_fallback(onboarding_malformed)
+            .layer(middleware::from_fn(onboarding_no_store));
         let app = Router::new()
             .route("/healthz", get(health))
             .route("/ws", get(websocket_upgrade))
+            .nest("/onboarding", onboarding)
             .with_state(app_state);
         let shutdown_handle = handle.clone();
         let completion_handle = handle.clone();
@@ -424,6 +539,8 @@ pub enum RouterRuntimeError {
     Store(#[from] StoreError),
     #[error("credential_error")]
     Credential(#[from] crate::credentials::CredentialError),
+    #[error("bootstrap_assets_invalid")]
+    Bootstrap(#[from] BootstrapError),
     #[error("router_io")]
     Io(#[source] std::io::Error),
     #[error("router_actor_stopped")]
@@ -494,6 +611,195 @@ struct AppState {
     pre_auth: PreAuthLimiter,
     next_generation: Arc<AtomicI64>,
     instance_id: Uuid,
+    onboarding_assets: Option<Arc<BootstrapAssets>>,
+    enrollment_limiter: EnrollmentLimiter,
+}
+
+#[derive(Serialize)]
+struct OnboardingHttpError {
+    code: &'static str,
+}
+
+fn onboarding_error(status: StatusCode, code: &'static str) -> Response {
+    (status, Json(OnboardingHttpError { code })).into_response()
+}
+
+async fn onboarding_malformed() -> Response {
+    onboarding_error(StatusCode::BAD_REQUEST, "malformed_request")
+}
+
+async fn onboarding_no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn onboarding_info(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    let Some(_pre_auth) = state.pre_auth.try_acquire(peer.ip()) else {
+        return onboarding_error(StatusCode::TOO_MANY_REQUESTS, "overloaded");
+    };
+    let (manifest_sha256, available_targets) = state.onboarding_assets.as_ref().map_or_else(
+        || (None, Vec::new()),
+        |assets| {
+            (
+                Some(assets.manifest_sha256().to_owned()),
+                assets
+                    .manifest()
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.target.clone())
+                    .collect(),
+            )
+        },
+    );
+    Json(OnboardingInfo {
+        version: ONBOARDING_VERSION,
+        server_id: state.handle.server_id,
+        protocol_version: PROTOCOL_VERSION,
+        manifest_sha256,
+        available_targets,
+    })
+    .into_response()
+}
+
+async fn onboarding_file(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    name: Result<Path<String>, axum::extract::rejection::PathRejection>,
+) -> Response {
+    let Some(pre_auth) = state.pre_auth.try_acquire(peer.ip()) else {
+        return onboarding_error(StatusCode::TOO_MANY_REQUESTS, "overloaded");
+    };
+    let Ok(Path(name)) = name else {
+        return onboarding_malformed().await;
+    };
+    let Some(assets) = state.onboarding_assets else {
+        return onboarding_error(StatusCode::SERVICE_UNAVAILABLE, "bootstrap_assets_missing");
+    };
+    let content_type = if name == "bootstrap-manifest.json" {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    };
+    let opened = tokio::task::spawn_blocking(move || assets.file(&name)).await;
+    let (file, length) = match opened {
+        Ok(Ok(Some(file))) => file,
+        Ok(Ok(None)) => return onboarding_malformed().await,
+        Ok(Err(_)) | Err(_) => {
+            return onboarding_error(StatusCode::SERVICE_UNAVAILABLE, "bootstrap_assets_invalid");
+        }
+    };
+    let stream =
+        ReaderStream::with_capacity(tokio::fs::File::from_std(file).take(length), 64 * 1024).map(
+            move |chunk| {
+                // A slow download retains its pre-auth slot until the body is dropped.
+                let _permit = &pre_auth;
+                chunk
+            },
+        );
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn enrollment_body(body: Body) -> Result<Vec<u8>, (StatusCode, &'static str)> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| (StatusCode::BAD_REQUEST, "malformed_request"))?;
+        if chunk.len() > MAX_ENROLLMENT_BYTES - bytes.len() {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn onboarding_enroll(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    let Some(_pre_auth) = state.pre_auth.try_acquire(peer.ip()) else {
+        return onboarding_error(StatusCode::TOO_MANY_REQUESTS, "overloaded");
+    };
+    let Some(slot) = state.enrollment_limiter.try_acquire(peer.ip()) else {
+        return onboarding_error(StatusCode::TOO_MANY_REQUESTS, "overloaded");
+    };
+    let deadline = Instant::now() + ENROLLMENT_TIMEOUT;
+    let headers = request.headers();
+    if headers.contains_key(header::ORIGIN)
+        || headers.contains_key(header::CONTENT_ENCODING)
+        || headers.get_all(header::CONTENT_TYPE).iter().count() != 1
+        || !headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return onboarding_malformed().await;
+    }
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_ENROLLMENT_BYTES as u64)
+    {
+        return onboarding_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large");
+    }
+    let bytes = match tokio::time::timeout_at(deadline, enrollment_body(request.into_body())).await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err((status, code))) => return onboarding_error(status, code),
+        Err(_) => return onboarding_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let Ok(request) = serde_json::from_slice::<EnrollmentRequest>(&bytes) else {
+        return onboarding_malformed().await;
+    };
+    let invite_id = request.invite_id;
+    let (reply, received) = oneshot::channel();
+    // The actor owns the slot after enqueue, so a timed-out HTTP handler cannot
+    // admit more than eight outstanding store operations.
+    match state.handle.controls.try_send(ControlCommand::Enroll {
+        request,
+        reply,
+        deadline,
+        _slot: slot,
+    }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            return onboarding_error(StatusCode::TOO_MANY_REQUESTS, "overloaded");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return onboarding_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+        }
+    }
+    match tokio::time::timeout_at(deadline, received).await {
+        Ok(Ok(Ok(claims))) => Json(EnrollmentResponse {
+            version: ONBOARDING_VERSION,
+            server_id: state.handle.server_id,
+            invite_id,
+            claims,
+        })
+        .into_response(),
+        Ok(Ok(Err(EnrollmentError::Malformed))) => onboarding_malformed().await,
+        Ok(Ok(Err(EnrollmentError::InviteUnavailable))) => {
+            onboarding_error(StatusCode::UNAUTHORIZED, "invite_unavailable")
+        }
+        Ok(Ok(Err(EnrollmentError::Unavailable)) | Err(_)) | Err(_) => {
+            onboarding_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -788,6 +1094,7 @@ pub struct RouterHandle {
     command_bytes: Arc<Semaphore>,
     shutdown: Arc<tokio::sync::Notify>,
     healthy: Arc<AtomicBool>,
+    server_id: Uuid,
 }
 
 impl RouterHandle {
@@ -911,6 +1218,12 @@ enum ControlCommand {
     RevokeCredential {
         id: Uuid,
         reply: oneshot::Sender<Result<bool, RouterRuntimeError>>,
+    },
+    Enroll {
+        request: EnrollmentRequest,
+        reply: oneshot::Sender<Result<PublicCredentialClaims, EnrollmentError>>,
+        deadline: Instant,
+        _slot: OwnedSemaphorePermit,
     },
     IntegrationCheckFinished {
         connection_id: Uuid,
@@ -1075,6 +1388,7 @@ fn run_actor_thread(
     runtime.block_on(async move {
         let mut store = RouterStore::open(&config.data_dir)?;
         bootstrap_admin(&mut store, &config.data_dir)?;
+        let server_id = store.server_id()?;
         let integrations = IntegrationRegistry::load(&mut store, &config.data_dir);
         let integration_client = if integrations.has_active() {
             IntegrationClient::new(None).ok()
@@ -1091,6 +1405,7 @@ fn run_actor_thread(
             command_bytes: Arc::new(Semaphore::new(ACTOR_BYTE_CAPACITY)),
             shutdown: shutdown.clone(),
             healthy: healthy.clone(),
+            server_id,
         };
         ready
             .send(Ok(handle))
@@ -1250,6 +1565,24 @@ impl RouterState {
                     Err(error)
                 }
             },
+            ControlCommand::Enroll {
+                request,
+                reply,
+                deadline,
+                _slot,
+            } => {
+                if !reply.is_closed() {
+                    let result = if self.shutting_down || Instant::now() >= deadline {
+                        Err(EnrollmentError::Unavailable)
+                    } else {
+                        crate::store::now_millis()
+                            .map_err(|_| EnrollmentError::Unavailable)
+                            .and_then(|now| self.store.redeem_onboarding(&request, now))
+                    };
+                    let _ = reply.send(result);
+                }
+                Ok(false)
+            }
             ControlCommand::IntegrationCheckFinished {
                 connection_id,
                 generation,
@@ -1664,6 +1997,51 @@ impl RouterState {
                     connection_id,
                     generation,
                     &ServerMessage::CredentialRevoked { request_id, id },
+                );
+                Ok(())
+            }
+            ClientMessage::OnboardingInviteIssue {
+                request_id,
+                workspace,
+                create_workspace,
+                provider,
+            } => {
+                self.require_admin(connection_id)?;
+                let invite = self.store.issue_onboarding_invite(
+                    &workspace,
+                    create_workspace,
+                    provider,
+                    crate::store::now_millis()?,
+                )?;
+                self.send(
+                    connection_id,
+                    generation,
+                    &ServerMessage::OnboardingInviteIssued {
+                        request_id,
+                        server_id: invite.server_id,
+                        invite_id: invite.invite_id,
+                        invite_token: invite.invite_token,
+                        expires_at: invite.expires_at,
+                        workspace: invite.workspace,
+                        provider: invite.provider,
+                    },
+                );
+                Ok(())
+            }
+            ClientMessage::OnboardingInviteRevoke {
+                request_id,
+                invite_id,
+            } => {
+                self.require_admin(connection_id)?;
+                self.store
+                    .revoke_onboarding_invite(invite_id, crate::store::now_millis()?)?;
+                self.send(
+                    connection_id,
+                    generation,
+                    &ServerMessage::OnboardingInviteRevoked {
+                        request_id,
+                        invite_id,
+                    },
                 );
                 Ok(())
             }

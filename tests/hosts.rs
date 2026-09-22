@@ -380,8 +380,10 @@ struct InteractiveRouterState {
 async fn run_no_room_interactive_router(
     listener: tokio::net::TcpListener,
     state: Arc<InteractiveRouterState>,
+    ready: oneshot::Sender<()>,
 ) {
     let mut socket = accept_router(listener).await;
+    let _ = ready.send(());
     while let Some(message) = recv_client(&mut socket).await {
         match message {
             ClientMessage::Readiness { ready } => {
@@ -402,8 +404,10 @@ async fn run_targeted_interactive_router(
     listener: tokio::net::TcpListener,
     workspace: WorkspaceName,
     state: Arc<InteractiveRouterState>,
+    ready: oneshot::Sender<()>,
 ) {
     let mut socket = accept_router(listener).await;
+    let mut ready = Some(ready);
     let mut delivered = false;
     loop {
         tokio::select! {
@@ -430,6 +434,9 @@ async fn run_targeted_interactive_router(
                     ClientMessage::WorkspaceJoin { request_id, name } => {
                         assert_eq!(name, workspace);
                         join_response(&mut socket, request_id, &workspace).await;
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
                     }
                     ClientMessage::Readiness { ready } => {
                         state.readiness.lock().await.push(ready);
@@ -466,8 +473,13 @@ fn peer_agent() -> AgentDescriptor {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_slash_interactive_router(listener: tokio::net::TcpListener, workspace: WorkspaceName) {
+async fn run_slash_interactive_router(
+    listener: tokio::net::TcpListener,
+    workspace: WorkspaceName,
+    ready: oneshot::Sender<()>,
+) {
     let mut socket = accept_router(listener).await;
+    let _ = ready.send(());
     while let Some(message) = recv_client(&mut socket).await {
         match message {
             ClientMessage::Readiness { .. } => panic!("Push client sent explicit readiness"),
@@ -593,9 +605,13 @@ async fn run_slash_interactive_router(listener: tokio::net::TcpListener, workspa
     }
 }
 
+// Provider startup includes two 5-second Codex RPC budgets, then router registration.
+const INTERACTIVE_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
+
 struct InteractiveTasks {
     host: tokio::task::JoinHandle<Result<(), HostError>>,
     router: tokio::task::JoinHandle<()>,
+    router_ready: oneshot::Receiver<()>,
     shutdown: CancellationToken,
     record: PathBuf,
 }
@@ -609,6 +625,34 @@ impl Drop for InteractiveTasks {
 }
 
 impl InteractiveTasks {
+    async fn wait_until_ready(&mut self) {
+        let observed = tokio::time::timeout(INTERACTIVE_STARTUP_TIMEOUT, async {
+            tokio::select! {
+                biased;
+                result = &mut self.host => report_host_exit(result, "router startup"),
+                result = &mut self.router => report_router_exit(result, "router startup"),
+                ready = &mut self.router_ready => ready,
+            }
+        })
+        .await;
+        match observed {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("fake router dropped its startup signal"),
+            Err(_) => {
+                if self.host.is_finished() {
+                    report_host_exit((&mut self.host).await, "router startup");
+                }
+                if self.router.is_finished() {
+                    report_router_exit((&mut self.router).await, "router startup");
+                }
+                panic!(
+                    "router startup timed out while host and router tasks were active; {}",
+                    fixture_progress(&self.record)
+                );
+            }
+        }
+    }
+
     async fn finish(&mut self) {
         match (&mut self.host).await {
             Ok(Ok(())) => {}
@@ -627,6 +671,7 @@ impl InteractiveTasks {
                 tokio::select! {
                     biased;
                     result = &mut self.host => report_host_exit(result, "provider record"),
+                    result = &mut self.router => report_router_exit(result, "provider record"),
                     () = tokio::time::sleep(Duration::from_millis(10)) => {}
                 }
             }
@@ -636,8 +681,11 @@ impl InteractiveTasks {
             if self.host.is_finished() {
                 report_host_exit((&mut self.host).await, "provider record");
             }
+            if self.router.is_finished() {
+                report_router_exit((&mut self.router).await, "provider record");
+            }
             panic!(
-                "provider record timed out while host task was still active; {}",
+                "provider record timed out while host and router tasks were still active; {}",
                 fixture_progress(&self.record)
             );
         }
@@ -661,6 +709,20 @@ fn report_host_exit(
                 _ => "failed to join",
             };
             panic!("host task {state} before {waiting_for}");
+        }
+    }
+}
+
+fn report_router_exit(result: Result<(), tokio::task::JoinError>, waiting_for: &str) -> ! {
+    match result {
+        Ok(()) => panic!("fake router exited before {waiting_for}"),
+        Err(error) => {
+            let state = match (error.is_panic(), error.is_cancelled()) {
+                (true, _) => "panicked",
+                (_, true) => "was cancelled",
+                _ => "failed to join",
+            };
+            panic!("fake router task {state} before {waiting_for}");
         }
     }
 }
@@ -727,6 +789,7 @@ async fn read_terminal_line(
         tokio::select! {
             biased;
             result = &mut tasks.host => report_host_exit(result, "terminal output"),
+            result = &mut tasks.router => report_router_exit(result, "terminal output"),
             result = reader.read_line(&mut line) => result,
         }
     })
@@ -742,8 +805,11 @@ async fn read_terminal_line(
             if tasks.host.is_finished() {
                 report_host_exit((&mut tasks.host).await, "terminal output");
             }
+            if tasks.router.is_finished() {
+                report_router_exit((&mut tasks.router).await, "terminal output");
+            }
             panic!(
-                "terminal output timed out while host task was still active; {}",
+                "terminal output timed out while host and router tasks were still active; {}",
                 fixture_progress(&tasks.record)
             );
         }
@@ -1118,7 +1184,12 @@ async fn interactive_codex_local_prompt_is_ephemeral_escaped_and_uses_caller_cwd
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = Arc::new(InteractiveRouterState::default());
-    let router = tokio::spawn(run_no_room_interactive_router(listener, Arc::clone(&state)));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let router = tokio::spawn(run_no_room_interactive_router(
+        listener,
+        Arc::clone(&state),
+        ready_tx,
+    ));
     let files = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let (options, record) = interactive_codex_options(&files, &cwd, 0);
@@ -1136,11 +1207,13 @@ async fn interactive_codex_local_prompt_is_ephemeral_escaped_and_uses_caller_cwd
     let mut tasks = InteractiveTasks {
         host,
         router,
+        router_ready: ready_rx,
         shutdown,
         record: record.clone(),
     };
     let mut output = BufReader::new(output);
 
+    tasks.wait_until_ready().await;
     input.write_all(b"hello local\n").await.unwrap();
     let rendered = read_terminal_line(&mut output, &mut tasks).await;
     assert!(rendered.contains("answer:hello local"));
@@ -1169,10 +1242,12 @@ async fn interactive_codex_push_rejects_competing_delivery_without_readiness_mes
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = Arc::new(InteractiveRouterState::default());
+    let (ready_tx, ready_rx) = oneshot::channel();
     let router = tokio::spawn(run_targeted_interactive_router(
         listener,
         workspace.clone(),
         Arc::clone(&state),
+        ready_tx,
     ));
     let files = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
@@ -1191,11 +1266,13 @@ async fn interactive_codex_push_rejects_competing_delivery_without_readiness_mes
     let mut tasks = InteractiveTasks {
         host,
         router,
+        router_ready: ready_rx,
         shutdown,
         record: record.clone(),
     };
     let mut output = BufReader::new(output);
 
+    tasks.wait_until_ready().await;
     input.write_all(b"one local turn\n").await.unwrap();
     tasks
         .wait_for_record("\"turn\":\"one local turn\"", Duration::from_secs(2))
@@ -1234,7 +1311,8 @@ async fn interactive_codex_slash_commands_use_router_and_errors_never_become_pro
     let workspace = WorkspaceName::parse("host-room").unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let router = tokio::spawn(run_slash_interactive_router(listener, workspace));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let router = tokio::spawn(run_slash_interactive_router(listener, workspace, ready_tx));
     let files = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let (options, record) = interactive_codex_options(&files, &cwd, 0);
@@ -1252,11 +1330,13 @@ async fn interactive_codex_slash_commands_use_router_and_errors_never_become_pro
     let mut tasks = InteractiveTasks {
         host,
         router,
+        router_ready: ready_rx,
         shutdown,
         record: record.clone(),
     };
     let mut output = BufReader::new(output);
 
+    tasks.wait_until_ready().await;
     for (command, expected) in [
         ("/workspace join host-room\n", "\"workspace\":\"host-room\""),
         ("/agents\n", "local:peer"),
@@ -1283,7 +1363,12 @@ async fn interactive_codex_shutdown_interrupts_turn_and_closes_provider_and_rout
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = Arc::new(InteractiveRouterState::default());
-    let router = tokio::spawn(run_no_room_interactive_router(listener, Arc::clone(&state)));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let router = tokio::spawn(run_no_room_interactive_router(
+        listener,
+        Arc::clone(&state),
+        ready_tx,
+    ));
     let files = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let (options, record) = interactive_codex_options(&files, &cwd, 10_000);
@@ -1301,10 +1386,12 @@ async fn interactive_codex_shutdown_interrupts_turn_and_closes_provider_and_rout
     let mut tasks = InteractiveTasks {
         host,
         router,
+        router_ready: ready_rx,
         shutdown: shutdown.clone(),
         record: record.clone(),
     };
 
+    tasks.wait_until_ready().await;
     input.write_all(b"block until signal\n").await.unwrap();
     tasks
         .wait_for_record("\"turn\":\"block until signal\"", Duration::from_secs(3))

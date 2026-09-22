@@ -1,148 +1,134 @@
-# Claude Agent SDK provider adapter
+# Claude integration
 
-## Status and supported boundary
+ASR has two Claude paths:
 
-The repository contains a managed Claude provider adapter built on the official
-TypeScript Agent SDK. It owns a resumable SDK session for one gateway identity;
-it does not attach to or inject work into an arbitrary Claude UI session that
-was started elsewhere.
+- `asr claude` runs the installed Claude Code host with the Claude Channel MCP
+  boundary.
+- `asr gateway claude` owns a managed Claude bridge and uses the retained Node
+  Claude SDK package.
 
-The adapter implementation and fake-SDK lifecycle tests are complete. A live
-development-machine check reached SDK initialization and router registration,
-then stopped at the provider authentication boundary. An authenticated live
-turn and the mixed Claude <-> Codex exchange remain integration gates.
+Both paths accept an optional workspace and a credential whose claims match the
+selected client. Router collaboration and task delivery require an explicit
+workspace join. Pass `--workspace ROOM` to join at startup, or use
+`workspace_join` through stock Claude's MCP tools after launch. Until joined,
+the provider can run local work but receives no router transcript or task delivery:
 
-Sources checked on 2026-07-30:
-
-- [Claude Agent SDK TypeScript reference](https://code.claude.com/docs/en/agent-sdk/typescript)
-- [Claude Agent SDK sessions](https://code.claude.com/docs/en/agent-sdk/sessions)
-- [Claude Agent SDK MCP](https://code.claude.com/docs/en/agent-sdk/mcp)
-- [Claude Agent SDK permissions](https://code.claude.com/docs/en/agent-sdk/permissions)
-- [official TypeScript SDK repository](https://github.com/anthropics/claude-agent-sdk-typescript)
-
-The implementation pins the current npm stable SDK and uses only its public
-`startup()` and `query()` surfaces.
-
-## Components
-
-- `ClaudeAgentSdkAdapter` prewarms the SDK subprocess, accepts one router
-  delivery at a time, captures the result `session_id`, and passes it as
-  `resume` on the next delivery.
-- `claude-agent-sdk-config` constructs a locked-down SDK option set and exposes
-  the existing agent tool handlers through an in-process SDK MCP server.
-- `claude-gateway` creates the delegation token, initializes the adapter, then
-  registers the primary Claude identity with the router.
-- `bun run gateway:claude` starts the complete provider connector.
-
-## Request and response flow
-
-```text
-coordinator       router        Claude gateway       Agent SDK       SDK MCP
-    | send(id)       |                |                  |               |
-    |--------------->| deliver(id)    |                  |               |
-    |                |--------------->| query(prompt)    |               |
-    |                |                |----------------->|               |
-    |                |                |                  | agent_send    |
-    |                |                |                  |-------------->|
-    |                |                |                  |   router call |
-    |                |                |                  |<--------------|
-    |                |                | result/session_id|               |
-    |                |                |<-----------------|               |
-    |                | reply(id)      |                  |               |
-    |                |<---------------|                  |               |
-    | result(id)     |                |                  |               |
-    |<---------------|                |                  |               |
+```sh
+asr --profile local --credential "$HOME/.config/agent-session-router/claude-code.json" \
+  claude local:claude --workspace team-room
+asr --profile local --credential "$HOME/.config/agent-session-router/claude-sdk.json" \
+  gateway claude local:claude --workspace team-room
 ```
 
-The router `requestId` remains the only central correlation identifier. The
-provider `session_id` is local runtime state and never enters router messages.
-Only an SDK message with `type=result`, a valid session ID, and a successful,
-non-error terminal state becomes a successful router reply. SDK exception text
-and provider error bodies are reduced to stable generic error codes.
+## Stock Claude Code and Channel
 
-## MCP tools and permissions
+Prepare the local MCP registration once:
 
-Claude receives the same tool contract used by Codex through the Agent SDK's
-in-process `createSdkMcpServer()` boundary. The SDK configuration:
+```sh
+asr setup-claude
+```
 
-- exposes only `mcp__agent_session_router__agent_list` and
-  `mcp__agent_session_router__agent_send`;
-- sets the built-in tool list to empty;
-- uses `permissionMode: "dontAsk"`, so anything not explicitly allowed is
-  denied instead of prompting;
-- uses `settingSources: []`, `skills: []`, and `plugins: []`;
-- enables `strictMcpConfig` so user, project, plugin, and other on-disk MCP
-  configurations are ignored;
-- keeps an agent-scoped delegation token inside the gateway process and never
-  gives the Agent SDK subprocess the router's primary registration credential
-  or the delegation token.
+Then obtain the required development/organization channel opt-in and restart the
+Claude host. The native host launches Claude with the Channel MCP registration;
+it does not rely on a legacy Python process or a shared router environment token.
 
-The in-process tool service opens an outbound-only delegated router connection
-when its first tool is called. The delegate is hidden from discovery, sends
-with the owning Claude identity, cannot receive deliveries or reply, and is
-revoked when the primary gateway disconnects. Its nested timeout cannot exceed
-the owning request's remaining deadline.
+Stock Claude uses an explicit readiness boundary. A successful process launch is
+not a workspace join: join with `--workspace team-room` at startup or
+`workspace_join` after launch, using a credential that grants the room. The
+Channel server must also report ready. Ordinary workspace chat does not wake a
+Claude turn. Claude must inspect task state and explicitly call lifecycle tools.
 
-## Busy, timeout, disconnect, and resume
+Claude Code's provider resume option is explicit:
 
-| Condition | Result/action |
-| --- | --- |
-| another SDK query is active | `session_busy` |
-| router delivery deadline expires | abort controller + query close, then `request_timeout` |
-| SDK throws or returns an error terminal | generic `claude_*` error code |
-| SDK stream ends without a terminal result | `claude_no_result` |
-| adapter closes during a query | `provider_disconnected` |
-| adapter is already closed | `provider_not_ready` |
-| successful first turn | capture local `session_id` |
-| later turn | start `query()` with `resume=<captured session_id>` |
+```sh
+asr --profile local --credential "$HOME/.config/agent-session-router/claude-code.json" \
+  claude local:claude --workspace team-room --resume SESSION_ID
+```
 
-There is no automatic router replay. A timed-out or disconnected delivery must
-be retried explicitly by its caller with a new `requestId`.
+Review the durable task checkpoint before resuming. If a prior attempt was
+interrupted, do not reuse it until stop evidence is confirmed.
 
-## Authentication and privacy
+## Managed Claude gateway
 
-Claude authentication is owned by the local Agent SDK/Claude Code runtime.
-Provider credentials are never put in router messages. The Claude subprocess
-inherits the local provider environment after the connector removes central
-router credentials, router addressing, gateway identity, and provider-selection
-variables. The in-process MCP implementation keeps router URL, owning agent ID,
-and its scoped delegation token in gateway memory; none are serialized into the
-Claude subprocess command line.
+The gateway owns the Claude child through the packaged Node bridge:
 
-SDK stderr is discarded and debug logging is not enabled. Router, gateway, and
-MCP logs do not emit prompts, responses, credentials, provider session IDs, or
-runtime paths. The Agent SDK may persist its session transcript locally so the
-gateway can resume the managed session; that transcript remains on the provider
-machine and is never copied to the router.
+```sh
+asr --profile local --credential "$HOME/.config/agent-session-router/claude-sdk.json" \
+  gateway claude local:claude --workspace team-room
+```
 
-## Authenticated development-machine validation
+Node is required for this mode only. The release archive must contain
+`share/agent-session-router/integrations/claude-sdk/bridge.js`, its manifest, and
+its packaged Claude SDK dependencies. The native executable resolves this
+installed asset layout; it does not search a source checkout.
 
-Use only a disposable workspace and neutral identifiers. Do not record machine
-names, account details, paths, tokens, or provider session IDs in this
-repository.
+The gateway filters provider environment variables, keeps router credentials out
+of the child, and terminates the child when the host is interrupted. The current
+gateway command has no implicit chat-resume behavior; start a new managed session
+after reviewing the checkpoint and use an explicit task transition.
 
-1. Authenticate the installed Claude runtime and verify its auth status without
-   capturing account output.
-2. Run `bun install --frozen-lockfile` and `bun test`.
-3. Start the router on an available loopback port, optionally with a temporary
-   `ROUTER_TOKEN`.
-4. Start `local:claude-a` with `ROUTER_URL`, `GATEWAY_AGENT_ID`, and a disposable
-   `CLAUDE_CWD` using `bun run gateway:claude`.
-5. Send one harmless coordinator request and verify exactly one correlated
-   result returns without content appearing in logs.
-6. Send a second request while the first is active and verify `session_busy`.
-7. Use a short deadline and verify `request_timeout`, SDK cancellation, and no
-   late router result.
-8. Stop the provider during an active request and verify
-   `provider_disconnected` with no automatic replay.
-9. Start a Codex gateway as `local:codex-a`. Direct Claude to call
-   `agent_send(local:codex-a, ...)`, then direct Codex to call
-   `agent_send(local:claude-a, ...)`. Verify authoritative `from`, correlation,
-   and response isolation in both directions.
-10. If persistence is required across gateway restart, capture the session ID
-    privately and restart with `CLAUDE_SESSION_ID`; never commit that value.
+## Credentials and setup
 
-The separate Claude Code Channel adapter is implemented for an already-running
-interactive session that explicitly opts in. It does not replace this
-managed-session baseline; see
-[claude-channel-integration.md](claude-channel-integration.md).
+Issue separate credentials for the stock and managed clients:
+
+```sh
+asr --profile local credential issue \
+  --agent local:claude-code --side claude --client claude-code \
+  --workspace team-room --output "$HOME/.config/agent-session-router/claude-code.json"
+asr --profile local credential issue \
+  --agent local:claude-sdk --side claude --client claude-sdk \
+  --workspace team-room --output "$HOME/.config/agent-session-router/claude-sdk.json"
+```
+
+Credential files are private JSON. A `claude-code` credential is rejected for
+`gateway claude`, and vice versa. Do not put bearer values in `ROUTER_TOKEN`,
+`AGENT_ROUTER_TOKEN`, or provider prompts.
+
+## Task lifecycle and handoff
+
+The Claude MCP catalog exposes:
+
+```text
+workspace_join
+task_list / task_get / task_history
+task_request
+task_begin
+task_checkpoint
+task_pause or task_complete
+```
+
+The executor calls `task_begin` for the assigned attempt, records summary,
+next steps, artifacts, and risks in `task_checkpoint`, then explicitly pauses or
+completes. A Claude response or readiness event does not begin or complete work.
+
+`task interrupt` requests a stop but initially leaves stop evidence unknown.
+Assignment to a replacement is allowed while evidence is unknown, but new
+`task_request` and `task_begin` operations remain fenced. Managed hosts can
+automatically confirm matching terminal/reap evidence. Read `task get` again;
+only if evidence is still unknown and the operator has observed the real
+execution stop should the operator call `task confirm-stopped` with the exact
+interrupted attempt and freshly read task version. A replacement Claude session
+reviews the checkpoint and uses an authorized identity; it never shares an
+unconfirmed provider process.
+
+## Optional external work tracking
+
+GitHub and Linear access is configured by the router administrator per workspace
+with private token files. Claude does not log into a personal backlog. Operators
+explicitly choose any import, link, or publish operation and resolve an
+unconfirmed external write before retrying.
+
+## Trust and networking
+
+Local Claude sessions use the built-in `local` loopback profile; do not add or
+replace it. Remote operation uses WSS and scoped credentials, with `ASR_CA_FILE`
+for a private CA when needed. Remote operator commands require `--credential FILE`
+or `ASR_CREDENTIAL_FILE`.
+
+`router --share=lan` requires nonloopback `ASR_BIND` and all of `ROUTER_TLS_CERT`,
+`ROUTER_TLS_KEY`, and `ROUTER_PUBLIC_URL` (WSS, `/ws`, matching bind port).
+Explicit Tailscale sharing requires loopback and no ASR TLS. With TLS configured,
+auto sharing selects local or LAN by bind; without TLS it selects valid Tailscale
+or local on loopback, never plaintext LAN. See the
+[README transport examples](../README.md#profiles-remote-routers-and-tls).
+Certificate verification is never disabled to make Claude connect.

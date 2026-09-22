@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: 1.98.1
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Verify native target
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          actual_target="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$actual_target" = "$EXPECTED_TARGET"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Rust lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build native release binary
+        run: cargo build --locked --release
+
+      - name: Test all Rust targets
+        run: cargo test --locked --all-targets
+
+      - name: Release binary native black-box gates
+        env:
+          ASR_TEST_EXECUTABLE: ${{ github.workspace }}/target/release/asr
+        run: |
+          cargo test --locked --test native_cli native_cli_owns_router_profiles_install_workspaces_and_credentials -- --exact
+          cargo test --locked --test native_cli native_dispatch_executes_stock_and_setup_host_plans_exactly -- --exact
+          cargo test --locked --test native_cli native_codex_gateway_and_interactive_host_use_managed_api_and_close_on_sigint -- --exact
+          cargo test --locked --test native_cli internal_mcp_child_roundtrips_with_official_client -- --exact
+          cargo test --locked --test native_cli native_cli_tls_process_is_trusted_reused_authenticated_and_fail_closed -- --exact
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Set up managed-bridge Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frozen integration dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck retained integrations
+        run: bun run typecheck:integrations
+
+      - name: Test retained integrations
+        run: bun run test:integrations
+
+      - name: Build integration packages
+        run: bun run build:integrations
+
+      - name: Validate integration packages and native archive contract
+        env:
+          TARGET: ${{ matrix.target }}
+          ASR_PACKAGE_BINARY: ${{ github.workspace }}/target/release/asr
+          ASR_PACKAGE_INTEGRATIONS: ${{ github.workspace }}/dist/integrations
+          ASR_PACKAGE_ROOT: ${{ github.workspace }}/dist/native-${{ matrix.target }}
+        run: |
+          test -f dist/integrations/omp/index.js
+          test -f dist/integrations/omp/package.json
+          test -f dist/integrations/claude-sdk/bridge.js
+          test -f dist/integrations/claude-sdk/manifest.json
+          test -f dist/integrations/claude-sdk/package.json
+          test ! -e dist/integrations/claude-sdk/node_modules/.bin
+          platform_package="@anthropic-ai/claude-agent-sdk-$(node -p 'process.platform + "-" + process.arch')"
+          test -d "dist/integrations/claude-sdk/node_modules/$platform_package"
+          bun -e "await import('./dist/integrations/omp/index.js')"
+          node -e "await import('./dist/integrations/claude-sdk/bridge.js')"
+          cargo test --locked --test install packaged_archive_contract -- --ignored --exact
+          archive="dist/agent-session-router-$TARGET.tar.gz"
+          tar -C "$ASR_PACKAGE_ROOT" -czf "$archive" bin share
+          tar -tzf "$archive" bin/asr >/dev/null
+          tar -tzf "$archive" share/agent-session-router/integrations/omp/index.js >/dev/null
+          tar -tzf "$archive" share/agent-session-router/integrations/claude-sdk/bridge.js >/dev/null

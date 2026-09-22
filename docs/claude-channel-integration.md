@@ -1,21 +1,35 @@
-# Claude Code Channel provider adapter
+# Claude Code Channel integration
 
-## Status and boundary
+Claude Channel is an optional, explicitly enabled stock-Claude path. It is not
+the managed Claude gateway and it is not a native AgentBridge adapter. The
+current host command is:
 
-The repository contains an optional two-way Claude Code Channel adapter for an
-interactive session that explicitly loads it. It does not invoke `claude -p` or
-the Agent SDK. The user starts Claude Code and approves the development Channel;
-Claude Code then spawns the local stdio MCP process.
+```sh
+asr setup-claude
+asr --profile local --credential "$HOME/.config/agent-session-router/claude-code.json" \
+  claude local:claude --workspace team-room
+```
 
-This avoids Agent SDK credit usage for the connector path, but the interactive
-Claude turn still consumes the usage allowance of the active Claude Code
-authentication method.
+The first command installs the local stdio MCP registration. The second starts
+the installed Claude Code host and passes the Channel development flag used by
+the native launcher. Claude Code must be restarted after setup or any policy
+change.
 
-Automated MCP wire and loopback router tests are complete. The remaining live
-gate is manual because starting an interactive Claude turn consumes provider
-usage and displays local consent dialogs.
+## Opt-in and policy
 
-Official sources checked on 2026-07-31:
+Claude Channels are a research-preview surface. Custom Channels require
+explicit development opt-in, and organization policy may disable them. Obtain
+approval for the development/organization Channel before using this adapter; ASR
+does not attempt to bypass account policy.
+
+The native launch uses
+`--dangerously-load-development-channels server:agent-session-router-channel`.
+This is the Claude Code development-Channel opt-in, not
+`--dangerously-skip-permissions`, and it does not select
+`bypassPermissions`. Use it only with the trusted repository-local MCP
+registration installed by `setup-claude`.
+
+Relevant upstream documentation:
 
 - [Push events into a running session with Channels](https://code.claude.com/docs/en/channels)
 - [Channels reference](https://code.claude.com/docs/en/channels-reference)
@@ -23,199 +37,115 @@ Official sources checked on 2026-07-31:
 - [Claude Code authentication](https://code.claude.com/docs/en/iam)
 - [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes)
 
-Channels are a research preview. Custom Channels require explicit development
-opt-in, and organization policy may disable them. This adapter remains optional
-and does not change the managed Agent SDK gateway.
+## MCP negotiation and legacy clients
 
-## Components and startup
+The native server advertises the experimental `claude/channel` capability only
+for the `claude-channel` MCP role. Channel delivery uses the
+`notifications/claude/channel` notification and correlates `request_id`, sender,
+and timeout metadata with exactly one `agent_reply`. A reply is not a task
+completion.
 
-- `ClaudeChannelAdapter` owns one pending router request and accepts one
-  correlated reply.
-- `claude-channel-mcp` declares `claude/channel`, emits Channel notifications,
-  and exposes `agent_reply`, `agent_list`, and `agent_send`.
-- `claude-channel` connects the MCP lifecycle to one primary `GatewayClient`.
-- `bun run channel:claude` is the stdio entrypoint spawned by Claude Code.
+MCP initialization remains protocol-negotiated. An older official MCP client can
+use the ordinary tool negotiation path, but Channel-specific notifications
+require the `claude/channel` capability and current Channel behavior. There is
+no legacy `ROUTER_TOKEN` authentication, Python launcher, or shared-token
+negotiation fallback. `ROUTER_URL` remains supported as non-secret endpoint
+configuration: URL precedence is explicit `--profile`, then nonempty
+`ROUTER_URL`, then the saved default profile, then built-in `local`. Credentials
+come from `--credential FILE` or `ASR_CREDENTIAL_FILE`, not from a shared token.
+If an old Claude Code release does not advertise or accept the Channel
+capability, upgrade it or use `asr gateway claude`; do not silently downgrade
+security or inject task text into chat.
 
-The Python launcher reduces the one-time setup and later startup commands:
+## Workspace and readiness
 
-```bash
-agent-session-router setup-claude
-agent-session-router
-agent-session-router claude reviewer
-agent-session-router claude reviewer --activity "reviewing tests" --auto
+Channel initialization is not router membership. For router delivery, the
+credential must identify the Claude Code client and grant the selected workspace,
+and the provider must explicitly join it with `--workspace ROOM` at startup or
+`workspace_join` after launch. Until joined, Claude may run a local provider
+session but the MCP process receives no workspace delivery. The MCP process
+registers only after initialization and readiness; closing it removes the agent
+registration. An operator's separate `workspace join` does not join Claude.
+
+```sh
+asr --profile local credential issue \
+  --agent local:claude --side claude --client claude-code \
+  --workspace team-room --output "$HOME/.config/agent-session-router/claude-code.json"
+asr --profile local workspace join team-room
 ```
 
-The first command registers the repository-local MCP entry. Running
-`agent-session-router`
-without a command opens the interactive selector: choose a saved router or add
-a router address, then enter the agent ID, activity, and permission mode. The
-explicit forms remain available for automation. They start Claude with the
-neutral `local:reviewer` identity and the development Channel opt-in; the last
-form additionally publishes a non-sensitive activity and requests Auto
-permission mode when the account supports it.
+Durable task events are delivered only after the joined-ready boundary. A
+workspace chat message does not wake Claude, and the Channel adapter never starts
+a second concurrent request while one targeted request is pending. Claude must
+inspect task state, call `task_begin`, checkpoint progress, and explicitly pause
+or complete.
 
-Router profiles live in the user's local configuration outside this repository
-and contain only the WebSocket URL. The launcher injects the selected URL as
-`ROUTER_URL` into Claude Code, whose Channel child inherits it. Router tokens
-remain in the process environment and are not saved in the profile.
-
-The launcher's `--dangerously-load-development-channels` is not
-`--dangerously-skip-permissions` and does not select `bypassPermissions`. It is
-currently required because custom Channels are outside Claude's research-
-preview plugin allowlist. It can bypass a configured Channel allowlist for this
-explicit server, so it must be used only with the trusted repository-local MCP
-entry. Auto mode is independent and does not make the development flag
-unnecessary. Removing the flag before packaging and approving this Channel as
-a plugin prevents the Channel from registering.
-
-The Channel process connects to the router only after Claude Code completes the
-MCP initialization handshake. Closing the MCP session disconnects the gateway
-and removes the agent registration. MCP initialization does not prove that
-Channel policy accepted notifications: Claude Code can silently discard a
-notification when the Channel is not enabled. Only `agent_reply` is a delivery
-and completion acknowledgement.
-
-## Request and response flow
+The Channel MCP tool names are prefixed for Claude Code:
 
 ```text
-coordinator       router       Channel MCP       interactive Claude
-    | send(id)       |              |                    |
-    |--------------->| deliver(id)  |                    |
-    |                |------------->| channel event(id)  |
-    |                |              |------------------->|
-    |                |              | agent_reply(id)    |
-    |                |              |<-------------------|
-    |                | reply(id)    |                    |
-    |                |<-------------|                    |
-    | result(id)     |              |                    |
-    |<---------------|              |                    |
+mcp__agent_session_router__workspace_join
+mcp__agent_session_router__task_list
+mcp__agent_session_router__task_begin
+mcp__agent_session_router__task_checkpoint
+mcp__agent_session_router__task_pause
+mcp__agent_session_router__task_complete
+mcp__agent_session_router__agent_reply
 ```
 
-Claude may also call `agent_list` and `agent_send` through the same MCP process.
-Those calls use the primary gateway connection, preserve their own opaque
-request IDs, and can run while one inbound Channel request is pending. The
-router derives `from` from the registered socket rather than model input.
-List results include router-derived `idle`/`busy` status and an optional public
-activity supplied when each connector starts.
+`agent_reply` requires the current targeted request and can be accepted only once.
+It does not mutate task state. Task state uses expected versions and operation IDs.
 
-## Channel notification schema
+## Stop and resume handoff
 
-```json
-{
-  "method": "notifications/claude/channel",
-  "params": {
-    "content": "Review the current change.",
-    "meta": {
-      "request_id": "request-001",
-      "from": "local:coordinator",
-      "timeout_ms": "60000"
-    }
-  }
-}
+`task interrupt` requests a stop but initially leaves stop evidence unknown.
+Assignment to a new executor is allowed, but new `task_request` and `task_begin`
+operations remain fenced until stop confirmation. Managed hosts can
+automatically confirm exact terminal/reap evidence; interruption alone is not
+proof of a stop. Read `task get` again; only if evidence remains unknown and the
+operator has observed the actual execution stop should the operator run
+`task confirm-stopped` with the exact interrupted attempt and freshly read task
+version. The replacement Claude session reviews the checkpoint and must not
+reuse an unconfirmed process.
+
+Stock Claude may resume an explicit provider session:
+
+```sh
+asr --profile local --credential "$HOME/.config/agent-session-router/claude-code.json" \
+  claude local:claude --workspace team-room --resume SESSION_ID
 ```
 
-Channel metadata values are strings and keys use only letters, digits, and
-underscores as required by Claude Code. `request_id` is the router correlation
-identifier. The Channel adapter does not introduce another provider session ID.
+Review the durable checkpoint before using `--resume`. ASR does not reconstruct
+provider context from chat history.
 
-The reply tool input is:
+## OMP restart boundary
 
-```json
-{
-  "request_id": "request-001",
-  "text": "The review is complete."
-}
+OMP is a separate optional host and does not share Claude Channel's MCP process.
+If its integration is installed or changed, run:
+
+```sh
+asr setup-omp
 ```
 
-A reply is accepted only when `request_id` matches the single current request,
-the text is non-empty, and no reply was previously accepted. Tool results never
-echo reply text.
+Enable the linked `@agent-session-router/omp-integration` package and restart OMP.
+Restarting only ASR does not reload OMP's plugin registry. This boundary is
+intentional: Claude Channel setup and OMP setup are independent, and neither is
+a legacy launcher alias.
 
-## Busy, timeout, and disconnect
+## Security and trust
 
-| Condition | Result/action |
-| --- | --- |
-| another inbound request is pending | `session_busy`; no second notification |
-| notification write fails | `provider_disconnected` |
-| no correlated reply before deadline | `request_timeout` |
-| mismatched or late reply | tool error `request_not_found` |
-| empty reply | tool error `invalid_reply` |
-| MCP closes during a request | gateway disconnect and `target_disconnected` |
-| adapter is already closed | `provider_not_ready` |
+The built-in `local` profile uses loopback and cannot be added or replaced.
+For remote use, select a WSS profile and scoped credential, with `ASR_CA_FILE`
+for a private CA when needed. Remote operator commands require `--credential FILE`
+or `ASR_CREDENTIAL_FILE`.
 
-Claude Code does not acknowledge processing a notification. It can queue
-Channel events while busy, but this adapter deliberately emits at most one
-pending event and rejects another router delivery. There is no replay after a
-timeout or disconnect.
+`router --share=lan` requires nonloopback `ASR_BIND` and all of `ROUTER_TLS_CERT`,
+`ROUTER_TLS_KEY`, and `ROUTER_PUBLIC_URL` (WSS, `/ws`, matching bind port).
+Explicit Tailscale sharing requires loopback and no ASR TLS. With TLS configured,
+auto sharing selects local or LAN by bind; otherwise it selects valid Tailscale
+or local on loopback, never plaintext LAN. See the
+[README transport examples](../README.md#profiles-remote-routers-and-tls).
+TLS verification is not disabled to make Channel startup succeed.
 
-## Authentication and trust boundary
-
-Claude authentication and usage accounting belong to the interactive Claude
-Code process. Before testing, use `/status` inside Claude Code to confirm the
-intended subscription authentication. An `ANTHROPIC_API_KEY` in the process
-environment can take precedence and cause API billing; do not print or record
-its value.
-
-For the current local test, keep the router tokenless and bound to
-`127.0.0.1`. Do not put credentials, real paths, hostnames, or machine-specific
-configuration in `.mcp.json` or this repository. The Channel is an inbound
-prompt boundary: load only this trusted local MCP entry and do not use the
-development allowlist bypass for untrusted servers.
-
-The central router sees routed message plaintext. Provider credentials and
-Claude session metadata never enter router messages, logs, or test fixtures.
-
-## Manual interactive validation
-
-Use a disposable local workspace and neutral identifiers.
-
-1. Install the locked dependencies and run the automated suite:
-
-   ```bash
-   bun install --frozen-lockfile
-   bun test
-   ```
-
-2. Start the tokenless loopback router in one terminal:
-
-   ```bash
-   bun run start
-   ```
-
-3. From the repository root, add the Channel only to the current local Claude
-   project configuration:
-
-   ```bash
-   claude mcp add --transport stdio --scope local agent-session-router-channel -- bun run channel:claude
-   ```
-
-4. Start an interactive session with the explicit research-preview opt-in and
-   approve only this local development Channel. Add `--permission-mode auto`
-   independently when the account supports Auto mode:
-
-   ```bash
-   claude --dangerously-load-development-channels server:agent-session-router-channel
-   ```
-
-5. Use `/mcp` to verify that `agent_reply`, `agent_list`, and `agent_send` are
-   available. The Channel registers as `local:claude-channel` only after this
-   MCP initialization.
-6. Start a mock or provider gateway under a neutral worker ID. Ask Claude to
-   call `agent_list`, then `agent_send` to that exact worker. Verify one
-   correlated result returns.
-7. From another connected coordinator, send a request to
-   `local:claude-channel`. Verify the event appears in the open session and
-   Claude calls `agent_reply` with the same `request_id`.
-8. Send another request before replying to the first and verify
-   `session_busy`. Then verify a short deadline produces `request_timeout` and
-   a late `agent_reply` is rejected.
-9. Close the Claude session during one pending request and verify the requester
-   receives `target_disconnected` without replay.
-10. Remove the local MCP entry after the test if it is no longer needed:
-
-    ```bash
-    claude mcp remove agent-session-router-channel
-    ```
-
-Do not capture prompts, responses, account output, tokens, or local configuration
-paths in test logs or repository files.
+Claude provider secrets stay with Claude Code. Router credentials and private
+integration token files are not placed in Channel notification content or child
+environment variables.

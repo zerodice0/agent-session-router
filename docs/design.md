@@ -1,340 +1,165 @@
-# Agent Session Router design
+# Native v2 design
 
-## 1. Purpose
+Agent Session Router is a native Rust process with one durable protocol boundary.
+The `asr` executable starts the router, runs operator and agent clients, owns
+provider subprocesses in managed modes, and exposes production MCP over stdio.
+There is no TypeScript or Python router runtime.
 
-Agent Session Router connects explicitly opted-in Claude, Codex, and future
-provider sessions through one provider-neutral routing layer. An agent sends a
-message to an `agentId`; the router resolves the currently connected gateway,
-forwards the request, and returns only the correlated result.
-
-AgentBridge informed the initial investigation but is not a runtime dependency.
-This project uses provider-native integration boundaries and does not modify or
-fork AgentBridge.
-
-## 2. Goals
-
-- Keep one active agent session per registered `agentId`.
-- Route a request to one explicit recipient.
-- Correlate the eventual result through a caller-provided `requestId`.
-- Report offline, duplicate, unauthorized, and timeout states clearly.
-- Bind to loopback by default for safe local integration testing.
-- Avoid storing message content or environment-specific connection details.
-- Let any connected agent use the same targeted send/list interface, not only a
-  privileged coordinator.
-- Detect an unresponsive router and restore a previously healthy connection
-  without replaying uncertain requests.
-- Let an operator publish a short, non-sensitive activity summary while the
-  router derives the agent's `idle` or `busy` state.
-
-## 3. Non-goals for the first version
-
-- Group chat or broadcast delivery.
-- Durable offline queues.
-- Automatic task scheduling or load balancing.
-- Shared state between router processes.
-- Public internet exposure.
-- Attaching to arbitrary provider sessions that were not launched by or
-  explicitly configured for a gateway.
-- Hiding provider approval or permission decisions behind automatic approval.
-
-These features should only be added after a concrete test demonstrates that the
-targeted request/reply flow is insufficient.
-
-## 4. Architecture
+## Runtime boundaries
 
 ```text
-System A                                      Central router
-+-------------------+                         +--------------------+
-| Agent session A   |                         | registry + pending |
-+---------+---------+                         | requests           |
-          | local delivery/tools              |                    |
-+---------v---------+ outbound WebSocket/WSS  |                    |
-| Connector A       |------------------------>|                    |
-+-------------------+                         |                    |
-                                              |                    |
-System B                                      |                    |
-+-------------------+                         |                    |
-| Agent session B   |                         |                    |
-+---------+---------+                         |                    |
-          | local delivery/tools              |                    |
-+---------v---------+ outbound WebSocket/WSS  |                    |
-| Connector B       |------------------------>|                    |
-+-------------------+                         +--------------------+
+asr router ── loopback/TLS WebSocket ── operator and provider clients
+     │
+     ├── SQLite state: credentials, workspaces, tasks, attempts, events
+     ├── native MCP server: workspace/task/integration tools
+     └── optional provider subprocess
+           ├── stock Codex CLI or Claude Code (MCP boundary)
+           ├── owned or managed Codex App Server
+           ├── packaged Node Claude bridge
+           └── external OMP host and linked package
 ```
 
-There are no direct agent-to-agent sockets. Each system initiates one outbound
-connection, and the router is the only component that resolves an `agentId` to
-an active connection.
+The default router endpoint is `ws://127.0.0.1:8787/ws`. The `local` profile is
+built in and cannot be added or replaced; profiles contain only a router address.
+Address selection prefers explicit `--profile`, then `ROUTER_URL`, then the saved
+default profile, then built-in `local`. `ROUTER_URL` is a supported non-secret
+address override. Authentication uses an operator credential or an agent
+credential whose grants include the requested workspace. Remote operator clients
+require `--credential PATH` or `ASR_CREDENTIAL_FILE`; automatic operator credential
+discovery is limited to the owned local router. Credential files are private JSON
+files; no shared `ROUTER_TOKEN` environment contract exists.
 
-### 4.1 Router
+The default data directory follows XDG conventions and can be overridden with
+`ASR_DATA_DIR`; configuration can be overridden with `ASR_CONFIG_PATH`. The
+router's local state is not a model prompt and is not an implicit chat transcript.
 
-The router owns two in-memory maps:
+## Protocol and identities
 
-- `agentId -> active WebSocket`
-- `requestId -> requester, recipient, timeout`
+Protocol version 2 validates every registration and request at the boundary.
+Agent identity includes an agent ID, side (`claude`, `codex`, or `generic`), and
+client (`omp`, `claude-code`, `claude-sdk`, `codex-cli`, `codex-app-server`, or
+`generic`). The router rejects an identity mismatch, duplicate registration,
+missing workspace grant, stale expected version, or invalid operation ID.
 
-It never chooses a recipient implicitly. Every `send` message names exactly one
-`agentId`.
+The primary agent may create a scoped delegate credential for a nested worker.
+Delegation is a capability, not a shared secret: the delegate is tied to its
+owner and cannot register as another agent or claim another workspace.
 
-### 4.2 Agent gateway
+## Workspace and delivery model
 
-The agent gateway owns one logical session registration and has two local
-directions:
+Joining a workspace is explicit. `workspace join` or MCP `workspace_join`
+establishes a cursor and emits the join event. Provider `--workspace ROOM` is an
+initial join convenience, not the only route to membership. A provider cannot
+receive delivery until its join and readiness handshake succeed; one that has
+not joined a workspace does not start delivery.
 
-- inbound: translate router `deliver` messages through one `SessionAdapter`;
-- outbound: expose router discovery and targeted send operations as tools the
-  local agent can call.
+The router delivers durable task events to the joined ready provider session. It
+uses one in-flight delivery per provider, acknowledgement and cursor fences,
+timeouts, disconnect handling, and stale-session protection. It does not replay a
+chat transcript or inject task text into an unsolicited provider turn. Stock
+Codex CLI uses an explicit MCP pull boundary; stock Claude Channel similarly
+requires the provider to be joined and ready.
 
-The included `GatewayClient` and mock adapter validate both directions. The
-client waits for outbound `agents`, `result`, and `error` messages without
-mixing them with inbound deliveries. `accepted` remains informational and does
-not complete an outbound call.
+Workspace events are durable records for coordination. `workspace list`,
+`workspace members`, `workspace history`, and `workspace watch` expose state
+without copying private content into provider environment variables or logs.
 
-After its first successful registration, the gateway sends an application
-`ping` every 15 seconds and requires the correlated `pong` within 5 seconds. A
-missed heartbeat closes the stale socket and starts reconnect attempts at 250
-milliseconds, doubling to a 10-second ceiling with bounded jitter. Pending
-requests fail on disconnect and are never replayed after registration returns.
+## Task state machine
 
-When a provider launches tools in a separate MCP child process, the gateway
-creates a high-entropy, agent-scoped delegation token. The child opens an
-outbound-only delegated router connection. It inherits the gateway's `agentId`
-for `list` and `send`, cannot receive `deliver`, cannot send `reply`, is not
-listed as another agent, and is revoked when the owning gateway disconnects.
-
-The gateway registers one neutral identifier such as `local:reviewer`. Provider
-session IDs, working directories, provider credentials, and local IPC details
-remain in runtime configuration outside the repository and are never forwarded
-to the router.
-
-The local launcher can store named router WebSocket profiles in user-local
-configuration outside the repository. Interactive provider startup selects a
-profile before choosing an agent ID and injects its URL through `ROUTER_URL`.
-Profiles never contain registration or delegation tokens; those remain in the
-process environment. The built-in profile always targets the loopback router.
-Shared startup creates or updates a separate `this-device` profile with the
-advertised Tailscale or LAN URL and leaves `local` unchanged. Startup probes
-the local health endpoint before binding: it reuses an existing router and
-rejects a port owned by another service before applying sharing changes.
-Interactive shutdown performs the same health check before sending `SIGTERM`
-to the listener and disabling the matching Tailscale Serve TCP forward.
-
-### 4.3 Agent-facing tool adapter
-
-Every agent that needs to contact another agent receives the same minimal tool
-surface:
+Tasks use optimistic versions and idempotent operation IDs:
 
 ```text
-agent_list()
-agent_send(target, prompt, timeoutMs?)
+todo ── request/begin ──> in_progress ── checkpoint ──> in_progress
+  │                            │  │
+  │                            │  ├── pause ──> paused or blocked
+  │                            │  └── complete ──> done
+  │                            └── interrupt ──> stop evidence pending
+  ├── cancel ──> cancelled
+  └── reopen <────────────── paused/blocked/cancelled
 ```
 
-`agent_list` returns the provider side, router-derived `idle`/`busy` status, and
-an optional public `activity` string. Activity is set explicitly at connector
-startup; it is never inferred from a prompt, response, provider transcript, or
-local working directory.
+An executor must call `task_begin` for the assigned attempt. It records progress
+with `task_checkpoint`, and must explicitly call `task_pause` or `task_complete`.
+Each checkpoint contains a summary, next steps, artifacts, and risks. Assignment
+alone does not wake or start an executor. Readiness, a chat reply, or a provider
+process that merely starts does not begin or complete a task.
 
-`agent_send` waits for the correlated final result. Asynchronous status polling
-is not added unless a real provider workflow proves that a single bounded tool
-call is insufficient. A coordinator is therefore an ordinary connected agent
-with these tools, not a special router role.
+An interrupt requests a provider stop and initially records `unknown` stop
+evidence. Assignment may change while that evidence is unknown, but new task
+requests and `task_begin` remain fenced; the old provider session must not be
+reused for execution. Managed hosts can automatically confirm the stop from
+terminal or child-reap evidence tied to the exact attempt and provider session.
+Read the task again after interruption: if evidence is already `confirmed`, no
+manual confirmation is needed. Only if it remains `unknown` and the operator
+actually observed execution stop should `task confirm-stopped` record that
+evidence, using the exact interrupted attempt UUID and a freshly read task version.
+If automatic confirmation or another mutation wins the race, read and reassess
+instead of retrying stale confirmation. Once confirmed, use the current version
+for handoff; the next executor reviews the prior checkpoint before `task_begin`.
 
-Provider integration details are in
-[provider-integration.md](provider-integration.md).
+## MCP boundary
 
-## 5. Protocol
+The production Rust MCP server uses the official MCP framing and client
+interoperability path. Roles include `delegate`, `codex-cli`,
+`claude-channel`, and `omp`. The catalog includes workspace operations, task
+inspection and lifecycle operations, agent coordination, and explicitly selected
+external integration operations.
 
-Protocol messages are JSON objects with a string `type`. Registration includes a
-numeric `protocolVersion`, currently `1`.
+MCP input is bounded and validated before dispatch. The server limits frame sizes
+and concurrent calls, rejects unknown fields and identity spoofing, and returns
+typed errors rather than embedding secrets in responses. Provider-facing
+instructions treat task, peer, and external text as untrusted data.
 
-### 5.1 Client to router
+## Optional external integrations
 
-- `register`: claim one `agentId` for the current connection.
-- `register_delegate`: claim outbound-only authority for one live agent using
-  its runtime delegation token.
-- `list`: request the active agent list.
-- `send`: deliver content to one active recipient.
-- `reply`: complete one request previously delivered to this connection.
-- `ping`: verify that the router is responsive.
+GitHub and Linear are optional server-private targets. Configuration associates a
+workspace and provider target with a private token file and read or write access.
+The router exposes only public metadata and explicit operations. `task import`,
+`task link`, and `task publish` never read an agent's personal backlog or initiate
+a provider login. External writes are serialized per target and use an operation
+record with `running`, `applied`, `not_applied`, or `unconfirmed` resolution; an
+operator must resolve an unconfirmed operation before retrying.
 
-### 5.2 Router to client
+## Provider process policy
 
-- `registered`: registration succeeded.
-- `agents`: active agent descriptors.
-- `accepted`: the request was delivered to the recipient socket.
-- `deliver`: a recipient should process the request.
-- `result`: successful or failed request completion.
-- `error`: protocol or routing failure.
-- `pong`: response to `ping`.
+Stock modes preserve the provider's own process and MCP contract. Managed modes
+own the child process, pass only an allowlisted environment, and terminate the
+child on router shutdown or interruption. The Claude SDK bridge is a retained
+Node package used only by `gateway claude`; the OMP and Claude Channel packages
+are optional integration surfaces, not alternate router implementations.
 
-### 5.3 Request lifecycle
+Resume is always explicit. A resumed provider reviews durable task state and the
+last checkpoint; a new provider session is never inferred from a chat message.
 
-```text
-requester            router                recipient
-    | send              |                       |
-    |------------------>|                       |
-    |                   | deliver               |
-    |                   |---------------------->|
-    | accepted          |                       |
-    |<------------------|                       |
-    |                   | reply                 |
-    |                   |<----------------------|
-    | result            |                       |
-    |<------------------|                       |
-```
+## Network and secret handling
 
-The router rejects duplicate live `requestId` values. A request is removed when
-it receives one valid reply, times out, or either relevant socket disconnects.
+Loopback is the safe default. `router start --share=tailscale` requires valid
+Tailscale configuration, a loopback bind, and no ASR TLS settings. Tailscale Serve
+forwards raw TCP and publishes `ws://<TAILSCALE_IP>:<PORT>/ws` over the encrypted
+tailnet, not an HTTPS/WSS endpoint. With ASR TLS configured, `--share=auto`
+selects local mode on loopback or LAN mode on a non-loopback bind. Without TLS,
+auto mode requires loopback and selects valid Tailscale sharing when available,
+otherwise local mode. There is no plaintext LAN fallback.
 
-An agent may send a child request while it is handling an inbound request. The
-child uses a new `requestId`; the gateway caps its timeout to the remaining
-parent budget when it can identify the parent request. For delegated MCP calls,
-the router enforces that cap against the owning gateway's active delivery. The
-router still treats the two requests independently.
+Direct `--share=lan` requires a non-loopback `ASR_BIND` and all of
+`ROUTER_TLS_CERT`, `ROUTER_TLS_KEY`, and `ROUTER_PUBLIC_URL`. The public URL must
+use WSS, the `/ws` path, and the same port as the bind address. Partial TLS
+configuration and non-loopback binds without TLS fail closed. Remote clients use
+private credentials and a trusted CA, with `ASR_CA_FILE` supplying private CA
+trust when needed.
 
-## 6. Identity and addressing
+Router credentials, provider credentials, and integration tokens remain in
+separate private files. The router stores hashes for authentication and does not
+print bearer values. Child provider environments are filtered; integration
+configuration errors fail closed. Content and secret values are not emitted to
+diagnostic logs.
 
-An `agentId` is a routing identifier, not a hostname or process address. It must
-match this pattern:
+## Verification invariants
 
-```text
-^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$
-```
-
-Recommended neutral structure:
-
-```text
-<scope>:<role>
-```
-
-Examples:
-
-- `local:coordinator`
-- `local:reviewer`
-- `lab:tester`
-
-Duplicate live registrations are rejected. This avoids silent replacement and
-makes session ownership visible.
-
-Registration may include an optional `activity` of at most 160 printable
-characters. It is public presence metadata, not a private task payload. The
-router adds `status` to list results and rejects client registrations that try
-to provide their own status. An agent is busy while at least one routed request
-to its primary connection remains active.
-
-## 7. Busy and failure behavior
-
-- Unknown recipient: return `target_offline` immediately.
-- Duplicate `agentId`: return `agent_conflict`.
-- Duplicate `requestId`: return `request_conflict`.
-- Recipient disconnect: return `target_disconnected` to the requester.
-- Requester disconnect: cancel the pending request without retrying.
-- Timeout: return `request_timeout` and discard a later reply.
-
-The first version does not queue or retry. Delivery is best-effort and
-at-most-once within one live request. Reconnect never replays an uncertain
-delivery.
-
-## 8. Security and privacy
-
-- Default listener: `127.0.0.1` only.
-- Optional shared token for local integration tests.
-- Never log prompts, responses, tokens, credentials, provider session IDs, or
-  environment-specific paths.
-- Never place real infrastructure identifiers in source, tests, or examples.
-- Reject a reply unless it comes from the connection that received the request.
-- Give delegated MCP connections only `list`, `send`, and `ping` authority;
-  revoke them with the owning gateway and never expose the central shared token
-  to the MCP child.
-- Keep a tailnet deployment on loopback and expose it through a Tailscale-only
-  TCP forwarder with a least-privilege Grant for the router port.
-- Treat direct LAN sharing as an explicit development fallback: warn before
-  binding all interfaces, keep tokens out of profiles, and recommend Tailscale.
-- Use TLS and per-gateway credentials before enabling any non-loopback listener
-  outside an encrypted, access-controlled overlay.
-
-A trusted tailnet deployment uses its encrypted data plane and least-privilege
-port policy while retaining the shared token as defense in depth. Deployment
-outside that boundary uses outbound WSS connections and credentials scoped to
-the `agentId` and allowed operations. Provider credentials stay on the agent
-system. The central router is trusted with message plaintext unless a future
-end-to-end encryption layer is added.
-
-## 9. Implementation phases
-
-### Phase 1: local routing foundation
-
-- WebSocket router
-- in-memory registry
-- targeted send/reply flow
-- unit tests
-
-### Phase 2: duplex agent gateway
-
-- provider-neutral gateway client and mock session adapter
-- outbound list/send request waiters
-- nested agent-to-agent round-trip coverage
-- router-to-session delivery, correlated completion, and busy translation
-
-Implemented and validated with the automated router and mock-session suite.
-
-### Phase 3: provider-native adapters
-
-- Codex App Server adapter for a gateway-owned thread (implemented; one live
-  CLI round trip, busy, timeout, and recovery validation completed)
-- prompt-capable Codex console for a human-operated gateway-owned thread
-  (implemented; stock TUI peer co-control remains unsupported)
-- stock Codex TUI MCP gateway with explicit `agent_wait`/`agent_reply` inbound
-  polling (implemented; no peer thread co-control or unsolicited turn injection)
-- Claude Agent SDK adapter for a gateway-owned resumable session (implemented;
-  fake-SDK lifecycle tests complete, authenticated live turn pending)
-- Claude Channel adapter for explicitly opted-in live sessions (implemented;
-  MCP wire and loopback router tests complete, interactive consent test pending)
-- provider approval and process-disconnect handling that fails closed
-
-### Phase 4: agent-facing MCP tools
-
-- expose `agent_list` and `agent_send` through each provider's supported local
-  tool boundary; add `agent_wait` and `agent_reply` where the provider requires
-  pull-based inbound delivery
-- use an agent-scoped outbound-only delegation when the provider starts a
-  separate stdio MCP child
-- keep provider credentials and central credentials out of model-visible input
-
-Implemented for Codex and both Claude boundaries. Codex uses the official stdio
-MCP server SDK and has a live A -> B nested exchange plus parallel
-response-isolation validation. Claude reuses the tool handlers through the
-Agent SDK's in-process MCP server so the delegation token stays outside
-subprocess arguments; its fake-SDK validation is complete and its authenticated
-live exchange remains pending. The interactive Channel uses one primary gateway
-inside its stdio MCP process and requires no delegated child connection.
-
-The stock Codex TUI uses a separate primary MCP gateway rather than a delegated
-child. It retains one inbound request until `agent_wait` claims it and accepts
-only one exact-ID `agent_reply`; this keeps the official CLI UI without claiming
-Claude Channel-style push semantics.
-
-### Phase 5: secure multi-system transport
-
-- authenticated outbound gateway connections
-- WSS and per-agent authorization
-- heartbeat and reconnect without automatic replay (implemented for primary
-  gateways)
-- operator-supplied activity and router-derived presence (implemented)
-- deployment configuration stored outside the repository
-
-## 10. Validation plan
-
-The first end-to-end test should run entirely on one development machine:
-
-1. Start the router on loopback.
-2. Register a coordinator and two mock workers.
-3. Send requests to each worker by `agentId`.
-4. Verify replies return only to the matching requester and `requestId`.
-5. Verify duplicate registration, offline target, timeout, and disconnect paths.
-6. Let worker A call worker B while A is processing an inbound request and
-   verify the nested result returns only through A's original request.
-7. Replace one mock worker with a provider-native adapter on a development
-   machine.
-
-Multi-host deployment is not required to validate the routing model.
+Native integration tests exercise router ownership, workspace grants, optimistic
+task transitions, provider child cleanup, the production MCP server with an
+official client, and TLS trust/reuse/fail-closed behavior. The implementation
+plan's concurrency requirement is normative: two workers' responses remain
+isolated under concurrency. Release CI repeats focused black-box scenarios
+against the compiled current-platform `asr` binary without live accounts or
+Tailscale.

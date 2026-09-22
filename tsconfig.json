@@ -1,12 +1,13 @@
 {
   "compilerOptions": {
-    "target": "ESNext",
+    "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["bun", "node"]
   },
-  "include": ["src", "tests"]
+  "include": ["integrations/**/*.ts", "scripts/package.ts"]
 }
 

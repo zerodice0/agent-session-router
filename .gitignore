@@ -6,4 +6,5 @@ coverage/
 *.log
 .DS_Store
 
+/target/
 /docs/implementation-plan.local.md

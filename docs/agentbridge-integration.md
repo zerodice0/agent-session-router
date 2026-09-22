@@ -1,34 +1,33 @@
-# AgentBridge integration decision
+# AgentBridge integration
 
-## Status
+## Current status
 
-Decision: not selected as a required runtime integration.
+Native v2 does not ship an AgentBridge adapter. The router's supported runtime is
+the Rust `asr` executable with its native WebSocket, task, workspace, and MCP
+boundaries. AgentBridge can remain an external system, but there is no built-in
+command that attaches it, imports its sessions, or translates its environment
+contract.
 
-AgentBridge was reviewed as a reference implementation while defining the
-session boundary for this project. `agent-session-router` will not patch, fork,
-vendor, or require AgentBridge. A future optional adapter may be considered only
-if AgentBridge publishes a stable external session request/result contract that
-can be consumed without modifying its source.
+Use the native provider commands for current integrations:
 
-## Why it was not selected
+```sh
+asr --profile local --credential "$HOME/.config/agent-session-router/codex.json" \
+  codex local:codex --workspace team-room
+asr --profile local --credential "$HOME/.config/agent-session-router/claude.json" \
+  claude local:claude --workspace team-room
+```
 
-The review used the official `v0.1.30` release (`55120e8`) available on
-2026-07-30. That stable control protocol did not provide the combination needed
-by this router:
+These commands use an explicit workspace for router collaboration and delivery,
+plus a scoped credential. A local provider prompt can omit the workspace and
+receives no router transcript or task delivery until explicitly joined. Stock
+Claude can call `workspace_join` through MCP after launch; interactive Codex
+supports `/workspace join ROOM`. The commands do not read an AgentBridge personal
+backlog or consume the old shared-token launcher environment.
 
-- a gateway connection role separate from the single attached Claude frontend;
-- a request identifier correlated through the final Codex response;
-- a control request that pushes work into Claude and receives a correlated
-  Claude reply;
-- an external API that preserves AgentBridge's existing busy, approval, and
-  disconnect ownership.
+## Upstream reference
 
-Using the existing Claude attach role for a sidecar would contend with the live
-frontend. Connecting another client directly to a Codex app-server would bypass
-AgentBridge's control ownership and would not turn the AgentBridge control
-socket into a supported request/result API.
-
-Primary source references:
+The following links are preserved as external design references; they are not
+claims that the corresponding adapter is included in this repository:
 
 - [AgentBridge `v0.1.30` release](https://github.com/raysonmeng/agent-bridge/releases/tag/v0.1.30)
 - [control protocol](https://github.com/raysonmeng/agent-bridge/blob/v0.1.30/src/control-protocol.ts#L76-L181)
@@ -37,50 +36,47 @@ Primary source references:
 - [final Codex message conversion](https://github.com/raysonmeng/agent-bridge/blob/v0.1.30/src/codex-adapter.ts#L2030-L2065)
 - [Claude channel and reply integration](https://github.com/raysonmeng/agent-bridge/blob/v0.1.30/src/claude-adapter.ts#L234-L260)
 
-## What remains useful
+Those references describe AgentBridge's own protocol and process assumptions.
+They do not define ASR v2's identity, workspace, or task lifecycle.
 
-The review produced provider-independent constraints that remain part of this
-project:
+## Mapping concepts to native v2
 
-- one explicit `agentId` maps to one active inbound session gateway;
-- caller `requestId` is preserved to the final result;
-- accepted delivery is not final completion;
-- busy defaults to rejection rather than implicit queue, steer, or interrupt;
-- timeout and disconnect remove pending state and never trigger automatic
-  replay;
-- provider credentials and session metadata stay on the agent system;
-- prompts, responses, credentials, and runtime paths are not logged.
+| AgentBridge concept | Native ASR v2 boundary |
+| --- | --- |
+| Attach/admission | A scoped credential plus explicit `workspace_join`. |
+| Agent identity | Credential subject, side, client, and workspace grants. |
+| Turn delivery | Durable task request to a joined-ready provider; stock Codex uses explicit MCP pull, while Channel uses a correlated notification. |
+| Reply correlation | `request_id` and provider-specific reply tools; replies do not complete tasks. |
+| Session handoff | `task interrupt`, confirmed stop evidence (automatic managed-host evidence or operator recovery), then a new request/attempt in a new provider session. |
+| External work item | An administrator-configured GitHub or Linear target and an explicit import/link/publish command. |
 
-The current router, `GatewayClient`, `SessionAdapter`, and mock isolation tests
-implement or validate these provider-neutral rules. None imports AgentBridge
-code or reads AgentBridge runtime state.
+No concept mapping automatically migrates an AgentBridge session. A migration
+must create or select an ASR workspace, issue scoped credentials, and review any
+prior checkpoint before beginning work.
 
-## Selected direction
+Assignment to a replacement is permitted while stop evidence is unknown, but a
+new `task_request` or `task_begin` is fenced. Managed hosts can automatically
+confirm exact terminal/reap evidence. Read `task get` again; only if evidence
+remains unknown and the operator has observed the real execution stop should the
+operator call `task confirm-stopped` with the exact interrupted attempt and
+freshly read task version.
 
-Provider-native adapters sit below the gateway boundary:
+## Coexistence and trust
 
-- Codex: the official App Server lifecycle (`initialize`, `thread/start` or
-  `thread/resume`, `turn/start`, item events, and `turn/completed`);
-- Claude managed session: the official Agent SDK or CLI streaming session;
-- Claude live session, optional: an explicitly enabled Claude Code Channel with
-  a correlated reply tool.
+An external AgentBridge installation may coexist with the native router on its
+own ports and credentials. Do not point it at ASR's native endpoint unless its
+operator has implemented and reviewed the protocol v2 registration, workspace
+grants, task fences, and TLS policy. ASR will reject an unknown or mismatched
+client identity rather than treating a legacy token as authorization.
 
-The exact connection, trust, and agent-to-agent message flow is documented in
-[provider-integration.md](provider-integration.md).
-
-## Reconsideration criteria
-
-AgentBridge can be reconsidered as an optional provider adapter if all of the
-following are true in a future stable release:
-
-1. A non-exclusive authenticated gateway role is public and versioned.
-2. The API returns final results correlated by a caller request ID.
-3. Claude and Codex target readiness, busy, timeout, and disconnect semantics
-   are defined.
-4. The integration can be implemented without modifying or depending on
-   internal pair files beyond documented read-only configuration.
-5. A development-machine test proves that using it does not displace or corrupt
-   an existing interactive session.
-
-Until then, AgentBridge remains a source reference rather than a delivery
-dependency or roadmap blocker.
+The built-in `local` profile is the loopback endpoint and cannot be added or
+replaced. Remote coexistence requires WSS, scoped credentials, and a trusted CA;
+remote operator commands require `--credential FILE` or `ASR_CREDENTIAL_FILE`.
+LAN sharing requires nonloopback `ASR_BIND` and all of `ROUTER_TLS_CERT`,
+`ROUTER_TLS_KEY`, and `ROUTER_PUBLIC_URL` (WSS, `/ws`, matching bind port).
+Explicit Tailscale sharing requires loopback and no ASR TLS. Auto sharing selects
+local or LAN by bind with TLS configured; otherwise it selects valid Tailscale or
+local on loopback, never plaintext LAN. See the
+[README transport examples](../README.md#profiles-remote-routers-and-tls).
+No live AgentBridge account, provider account, or Tailscale network is required
+for native tests.

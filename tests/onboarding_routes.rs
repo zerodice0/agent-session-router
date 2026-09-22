@@ -2,6 +2,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use agent_session_router::{
@@ -302,7 +303,7 @@ async fn assert_ca_environment_precedence(
     ca_directory: &Path,
 ) {
     for explicit in [false, true] {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "ca_environment_child", "--nocapture"])
             .env(
@@ -317,7 +318,9 @@ async fn assert_ca_environment_precedence(
                 "ASR_ROUTE_TEST_EXPLICIT",
                 if explicit { "yes" } else { "no" },
             )
-            .env("ASR_CA_FILE", if explicit { &certs.key } else { &certs.ca });
+            .env("ASR_CA_FILE", if explicit { &certs.key } else { &certs.ca })
+            .env_remove("SSL_CERT_FILE")
+            .env_remove("SSL_CERT_DIR");
         let status = tokio::task::spawn_blocking(move || command.status().unwrap())
             .await
             .unwrap();
@@ -328,8 +331,28 @@ async fn assert_ca_environment_precedence(
     }
 }
 
+#[test]
+fn actual_tls_alias_requires_the_public_ca_and_matching_hostname() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "actual_tls_alias_child", "--nocapture"])
+        .env("ASR_ROUTE_TLS_CHILD", "1")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "TLS route fixture failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
-async fn actual_tls_alias_requires_the_public_ca_and_matching_hostname() {
+async fn actual_tls_alias_child() {
+    if std::env::var_os("ASR_ROUTE_TLS_CHILD").is_none() {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let assets = bundle(&root);

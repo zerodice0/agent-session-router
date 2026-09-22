@@ -2044,6 +2044,27 @@ fn native_cli_rejects_partial_or_insecure_tls_before_launch() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn native_cli_tls_process_is_trusted_reused_authenticated_and_fail_closed() {
+    if std::env::var_os("ASR_NATIVE_CLI_TLS_FIXTURE_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().expect("native CLI test executable"))
+            .args([
+                "--exact",
+                "native_cli_tls_process_is_trusted_reused_authenticated_and_fail_closed",
+                "--nocapture",
+            ])
+            .env("ASR_NATIVE_CLI_TLS_FIXTURE_CHILD", "1")
+            .env_remove("SSL_CERT_FILE")
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("isolated native CLI TLS fixture");
+        assert!(
+            output.status.success(),
+            "isolated native CLI TLS fixture failed: stdout={} stderr={}",
+            stdout(&output),
+            stderr(&output)
+        );
+        return;
+    }
+
     let harness = NativeHarness::new();
     let fixture = certificate_fixture(harness.root.path());
     let port = reserve_loopback_port();

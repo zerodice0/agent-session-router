@@ -11,7 +11,7 @@ use agent_session_router::{
     credentials::read_credential,
     protocol::{ClientMessage, ServerMessage},
     router::{RouterConfig, RouterExposure, RouterRuntime, RouterRuntimeError},
-    tls::load_client_config,
+    tls::{TlsError, load_client_config},
 };
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -159,8 +159,28 @@ fn asr_ca_file_child_probe() {
     });
 }
 
+#[test]
+fn wss_and_https_use_shared_asr_ca_trust_and_reject_wrong_identity() {
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", "wss_and_https_child", "--nocapture"])
+        .env("ASR_TEST_WSS_CHILD", "1")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .expect("run isolated WSS test");
+    assert!(
+        output.status.success(),
+        "isolated WSS test failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn wss_and_https_use_shared_asr_ca_trust_and_reject_wrong_identity() {
+async fn wss_and_https_child() {
+    if std::env::var_os("ASR_TEST_WSS_CHILD").is_none() {
+        return;
+    }
     let fixture = certificate_fixture();
     let directory = tempdir().expect("router directory");
     let port = reserve_loopback_port();
@@ -220,6 +240,41 @@ async fn wss_and_https_use_shared_asr_ca_trust_and_reject_wrong_identity() {
 
     runtime.shutdown().await.expect("shutdown TLS router");
     runtime.wait().await.expect("join TLS router");
+}
+
+#[test]
+fn client_tls_rejects_ssl_certificate_overrides() {
+    for variable in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", "ssl_cert_override_child", "--nocapture"])
+            .env_remove("SSL_CERT_FILE")
+            .env_remove("SSL_CERT_DIR")
+            .env(variable, "/nonexistent-asr-test-ca")
+            .env("ASR_TEST_SSL_OVERRIDE", variable)
+            .output()
+            .expect("run isolated SSL override test");
+        assert!(
+            output.status.success(),
+            "{variable}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn ssl_cert_override_child() {
+    let Ok(variable) = std::env::var("ASR_TEST_SSL_OVERRIDE") else {
+        return;
+    };
+    assert!(matches!(
+        variable.as_str(),
+        "SSL_CERT_FILE" | "SSL_CERT_DIR"
+    ));
+    assert_eq!(
+        load_client_config(None).err(),
+        Some(TlsError::EnvironmentOverride)
+    );
 }
 
 fn assert_configuration_failure(config: RouterConfig) {

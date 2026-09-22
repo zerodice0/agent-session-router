@@ -231,8 +231,12 @@ fn certificates(directory: &Path, stem: &str) -> Certificates {
     }
 }
 
-#[tokio::test]
-async fn native_tls_route_uses_private_pinned_ca_and_enforces_hostname_and_trust() {
+#[test]
+fn native_tls_route_uses_private_pinned_ca_and_enforces_hostname_and_trust() {
+    run_clean_tls_fixture("native-route");
+}
+
+async fn check_native_tls_route_uses_private_pinned_ca_and_enforces_hostname_and_trust() {
     let directory = private_directory();
     let root = directory.path().canonicalize().unwrap();
     let certificates = certificates(&root, "server");
@@ -303,8 +307,12 @@ async fn native_tls_route_uses_private_pinned_ca_and_enforces_hostname_and_trust
     stop(runtime).await;
 }
 
-#[tokio::test]
-async fn ca_cache_rejects_symlinks_permissions_hardlinks_and_content_conflicts() {
+#[test]
+fn ca_cache_rejects_symlinks_permissions_hardlinks_and_content_conflicts() {
+    run_clean_tls_fixture("ca-cache");
+}
+
+async fn check_ca_cache_rejects_symlinks_permissions_hardlinks_and_content_conflicts() {
     let directory = private_directory();
     let root = directory.path().canonicalize().unwrap();
     let certificates = certificates(&root, "ca-storage");
@@ -397,6 +405,45 @@ async fn ca_cache_rejects_symlinks_permissions_hardlinks_and_content_conflicts()
         RouteError::InvalidCa
     );
     assert!(!untouched.exists());
+}
+
+fn run_clean_tls_fixture(mode: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "clean_tls_fixture_child", "--nocapture"])
+        .env("ASR_CLEAN_TLS_FIXTURE", mode)
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{mode}: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn clean_tls_fixture_child() {
+    let Ok(mode) = std::env::var("ASR_CLEAN_TLS_FIXTURE") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        match mode.as_str() {
+            "native-route" => {
+                check_native_tls_route_uses_private_pinned_ca_and_enforces_hostname_and_trust()
+                    .await;
+            }
+            "ca-cache" => {
+                check_ca_cache_rejects_symlinks_permissions_hardlinks_and_content_conflicts().await;
+            }
+            _ => panic!("unexpected clean TLS fixture mode: {mode}"),
+        }
+    });
 }
 
 async fn response_fixture(response: String) -> (OnboardingRoute, tokio::task::JoinHandle<String>) {

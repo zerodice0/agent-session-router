@@ -11,6 +11,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},
     os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -354,6 +355,27 @@ fn connection<'a>(
         .expect("integration connection")
 }
 
+async fn run_clean_integration_fixture(child_name: &'static str) {
+    let _guard = TEST_LOCK.lock().await;
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", child_name, "--nocapture"])
+            .env("ASR_CLEAN_INTEGRATION_FIXTURE", child_name)
+            .env_remove("SSL_CERT_FILE")
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("run isolated integration test")
+    })
+    .await
+    .expect("join isolated integration test");
+    assert!(
+        output.status.success(),
+        "{child_name}: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn private_configuration_is_strict_bounded_and_secret_free() {
     let _guard = TEST_LOCK.lock().await;
@@ -441,6 +463,16 @@ async fn private_configuration_is_strict_bounded_and_secret_free() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_reloads_lists_and_restores_durable_bindings() {
+    run_clean_integration_fixture("router_reloads_lists_and_restores_durable_bindings_child").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_reloads_lists_and_restores_durable_bindings_child() {
+    if std::env::var("ASR_CLEAN_INTEGRATION_FIXTURE").as_deref()
+        != Ok("router_reloads_lists_and_restores_durable_bindings_child")
+    {
+        return;
+    }
     let _guard = TEST_LOCK.lock().await;
     let directory = tempdir().expect("temporary directory");
     let data_dir = directory
@@ -766,6 +798,21 @@ async fn router_reloads_lists_and_restores_durable_bindings() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn github_adapter_validates_identity_headers_statuses_and_never_retries_mutations() {
+    run_clean_integration_fixture(
+        "github_adapter_validates_identity_headers_statuses_and_never_retries_mutations_child",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_adapter_validates_identity_headers_statuses_and_never_retries_mutations_child() {
+    if std::env::var("ASR_CLEAN_INTEGRATION_FIXTURE").as_deref()
+        != Ok(
+            "github_adapter_validates_identity_headers_statuses_and_never_retries_mutations_child",
+        )
+    {
+        return;
+    }
     let _guard = TEST_LOCK.lock().await;
     let fixture = TlsFixture::start();
     let (_config, catalog) = write_catalog(false, "write");
@@ -975,6 +1022,19 @@ async fn github_adapter_validates_identity_headers_statuses_and_never_retries_mu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linear_adapter_validates_graphql_identity_scope_and_single_mutation_attempt() {
+    run_clean_integration_fixture(
+        "linear_adapter_validates_graphql_identity_scope_and_single_mutation_attempt_child",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linear_adapter_validates_graphql_identity_scope_and_single_mutation_attempt_child() {
+    if std::env::var("ASR_CLEAN_INTEGRATION_FIXTURE").as_deref()
+        != Ok("linear_adapter_validates_graphql_identity_scope_and_single_mutation_attempt_child")
+    {
+        return;
+    }
     let _guard = TEST_LOCK.lock().await;
     let fixture = TlsFixture::start();
     let (_config, catalog) = write_catalog(true, "write");
@@ -1150,6 +1210,16 @@ async fn linear_adapter_validates_graphql_identity_scope_and_single_mutation_att
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admission_is_global_four_slot_and_fail_fast() {
+    run_clean_integration_fixture("admission_is_global_four_slot_and_fail_fast_child").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_is_global_four_slot_and_fail_fast_child() {
+    if std::env::var("ASR_CLEAN_INTEGRATION_FIXTURE").as_deref()
+        != Ok("admission_is_global_four_slot_and_fail_fast_child")
+    {
+        return;
+    }
     let _guard = TEST_LOCK.lock().await;
     let fixture = TlsFixture::start();
     let (_config, catalog) = write_catalog(false, "read");

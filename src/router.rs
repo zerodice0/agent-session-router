@@ -3199,6 +3199,9 @@ impl RouterState {
                 task,
             },
         ) {
+            // The failed delivery appends a terminal result. Publish the
+            // committed request first, even on this early return path.
+            self.fanout(&event);
             self.finish_pending_error(
                 &workspace,
                 &request_id,
@@ -4127,6 +4130,9 @@ impl RouterState {
                 result: result.mutation,
             },
         );
+        // finish_pending_error can append and publish a result for this task's
+        // active request. Subscribers must see this committed task event first.
+        self.fanout(&result.event);
         if let Some((pending_workspace, pending_request)) = interrupted_request {
             self.finish_pending_error(
                 &pending_workspace,
@@ -4144,7 +4150,6 @@ impl RouterState {
                 &agent_id,
             )?;
         }
-        self.fanout(&result.event);
         Ok(())
     }
 

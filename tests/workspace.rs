@@ -14,7 +14,7 @@ use agent_session_router::{
     },
     router::{RouterConfig, RouterExposure, RouterRuntime},
     store::RouterStore,
-    tasks::{AttemptStatus, PauseReason, TaskChange},
+    tasks::{AttemptStatus, PauseReason, TaskChange, TaskEvent},
 };
 use tempfile::{TempDir, tempdir};
 use url::Url;
@@ -594,7 +594,7 @@ async fn task_interrupt_requires_exact_idle_and_stop_confirmations() {
     let (_directory, runtime, url, red, _blue, agent_a_file, _agent_b, _agent_c, operator_file) =
         prepare().await;
     let (agent, mut agent_events) = connect_agent(&url, "agent-a", agent_a_file, None).await;
-    let (operator, _operator_events) = connect_operator(&url, operator_file).await;
+    let (operator, mut operator_events) = connect_operator(&url, operator_file).await;
     agent
         .workspace_join(red.clone())
         .await
@@ -603,6 +603,11 @@ async fn task_interrupt_requires_exact_idle_and_stop_confirmations() {
         .workspace_join(red.clone())
         .await
         .expect("operator joins workspace");
+    let (_, _, live) = operator
+        .workspace_subscribe(0)
+        .await
+        .expect("operator subscribes to workspace events");
+    assert!(live);
     let session_id = match operator
         .call(ClientMessage::List {
             request_id: "list-for-session-fence".to_owned(),
@@ -740,6 +745,37 @@ async fn task_interrupt_requires_exact_idle_and_stop_confirmations() {
         })
         .await
         .expect("interrupt task");
+    let (interrupt_seq, result_seq) = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut interrupt_seq = None;
+        loop {
+            let item = operator_events.recv().await.expect("operator event stream");
+            let ClientEvent::WorkspaceEvent(event) = item.event else {
+                continue;
+            };
+            if event.kind == WorkspaceEventKind::Task
+                && event.task_id == Some(task_id)
+                && event
+                    .content
+                    .as_deref()
+                    .and_then(|content| serde_json::from_str::<TaskEvent>(content).ok())
+                    .is_some_and(|task| task.change == TaskChange::Interrupted)
+            {
+                interrupt_seq = Some(event.seq);
+            }
+            if event.kind == WorkspaceEventKind::Result
+                && event.request_id.as_deref() == Some("interrupt-work")
+            {
+                assert_eq!(event.error, Some(RouterErrorCode::TaskInterrupted));
+                break (
+                    interrupt_seq.expect("interrupt event precedes result"),
+                    event.seq,
+                );
+            }
+        }
+    })
+    .await
+    .expect("interrupt event order timeout");
+    assert_eq!(result_seq, interrupt_seq + 1);
     let (cancel_workspace, cancel_request, reason, task) =
         next_cancellation(&mut agent_events).await;
     assert_eq!(cancel_request, "interrupt-work");

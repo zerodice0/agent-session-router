@@ -33,7 +33,7 @@ use agent_session_router::{
         journal::{ActionStatus, ConfigurationLock, InstallAction, Journal, Stage},
         providers::{preflight, verify_recorded},
     },
-    process::LaunchMode,
+    process::{LaunchError, LaunchMode},
     protocol::{
         AgentClient, AgentDescriptor, AgentRegistration, AgentSide, AgentStatus, ClientMessage,
         DeliveryMode, HistoryPage, PROTOCOL_VERSION, RegistrationRole, RouterErrorCode,
@@ -593,14 +593,161 @@ async fn run_slash_interactive_router(listener: tokio::net::TcpListener, workspa
     }
 }
 
-async fn read_terminal_line(reader: &mut BufReader<tokio::io::DuplexStream>) -> String {
+struct InteractiveTasks {
+    host: tokio::task::JoinHandle<Result<(), HostError>>,
+    router: tokio::task::JoinHandle<()>,
+    shutdown: CancellationToken,
+    record: PathBuf,
+}
+
+impl Drop for InteractiveTasks {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.host.abort();
+        self.router.abort();
+    }
+}
+
+impl InteractiveTasks {
+    async fn finish(&mut self) {
+        match (&mut self.host).await {
+            Ok(Ok(())) => {}
+            result => report_host_exit(result, "normal shutdown"),
+        }
+        (&mut self.router).await.unwrap();
+    }
+
+    async fn wait_for_record(&mut self, expected: &str, deadline: Duration) {
+        let observed = tokio::time::timeout(deadline, async {
+            loop {
+                if std::fs::read_to_string(&self.record).is_ok_and(|value| value.contains(expected))
+                {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    result = &mut self.host => report_host_exit(result, "provider record"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await;
+        if observed.is_err() {
+            if self.host.is_finished() {
+                report_host_exit((&mut self.host).await, "provider record");
+            }
+            panic!(
+                "provider record timed out while host task was still active; {}",
+                fixture_progress(&self.record)
+            );
+        }
+    }
+}
+
+fn report_host_exit(
+    result: Result<Result<(), HostError>, tokio::task::JoinError>,
+    waiting_for: &str,
+) -> ! {
+    match result {
+        Ok(Ok(())) => panic!("host exited before {waiting_for}"),
+        Ok(Err(error)) => panic!(
+            "host failed before {waiting_for}: {}",
+            host_error_kind(&error)
+        ),
+        Err(error) => {
+            let state = match (error.is_panic(), error.is_cancelled()) {
+                (true, _) => "panicked",
+                (_, true) => "was cancelled",
+                _ => "failed to join",
+            };
+            panic!("host task {state} before {waiting_for}");
+        }
+    }
+}
+
+fn fixture_progress(record: &Path) -> String {
+    let file_exists = record.exists();
+    let (initialized, turn_started) =
+        std::fs::read_to_string(record).map_or((false, false), |text| {
+            let mut initialized = false;
+            let mut turn_started = false;
+            for line in text.lines() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    initialized |= value.get("cwd").is_some() && value.get("argv").is_some();
+                    turn_started |= value.get("turn").is_some();
+                }
+            }
+            (initialized, turn_started)
+        });
+    format!(
+        "fixture progress: file_exists={file_exists}, initialized={initialized}, turn_started={turn_started}"
+    )
+}
+
+fn host_error_kind(error: &HostError) -> String {
+    match error {
+        HostError::Backend(error) => format!("Backend({error})"),
+        HostError::Mcp(_) => "Mcp".to_owned(),
+        HostError::Client(error) => format!("Client({error})"),
+        HostError::Provider(error) => format!("Provider({})", error.code()),
+        HostError::Asset(_) => "Asset".to_owned(),
+        HostError::Launch(LaunchError::Spawn(error)) => format!(
+            "Launch::Spawn(kind={:?}, os_error={:?})",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        HostError::Launch(LaunchError::InvalidPlan(_)) => "Launch::InvalidPlan".to_owned(),
+        HostError::Config(_) => "Config".to_owned(),
+        HostError::Credential(_) => "Credential".to_owned(),
+        HostError::Route(_) => "Route".to_owned(),
+        HostError::McpDryRun => "McpDryRun".to_owned(),
+        HostError::McpDelegateSelection => "McpDelegateSelection".to_owned(),
+        HostError::McpCredentialClaims => "McpCredentialClaims".to_owned(),
+        HostError::InteractiveCodexClaims => "InteractiveCodexClaims".to_owned(),
+        HostError::InteractiveIo => "InteractiveIo".to_owned(),
+        HostError::DelegationRequired => "DelegationRequired".to_owned(),
+        HostError::InvalidCaFile => "InvalidCaFile".to_owned(),
+        HostError::InvalidCurrentExecutable => "InvalidCurrentExecutable".to_owned(),
+        HostError::OmpPreflightFailed => "OmpPreflightFailed".to_owned(),
+        HostError::OmpSetupRequired => "OmpSetupRequired".to_owned(),
+        HostError::OmpEnableRequired => "OmpEnableRequired".to_owned(),
+        HostError::OmpSetupConflict => "OmpSetupConflict".to_owned(),
+        HostError::RouterClosed(code) => format!("RouterClosed({code})"),
+        HostError::CloseTimeout => "CloseTimeout".to_owned(),
+        HostError::ProviderTask => "ProviderTask".to_owned(),
+    }
+}
+
+async fn read_terminal_line(
+    reader: &mut BufReader<tokio::io::DuplexStream>,
+    tasks: &mut InteractiveTasks,
+) -> String {
     let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!line.is_empty());
-    line
+    let read = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            biased;
+            result = &mut tasks.host => report_host_exit(result, "terminal output"),
+            result = reader.read_line(&mut line) => result,
+        }
+    })
+    .await;
+    match read {
+        Ok(Ok(0)) => panic!(
+            "terminal output closed while host task was still active; {}",
+            fixture_progress(&tasks.record)
+        ),
+        Ok(Ok(_)) => line,
+        Ok(Err(error)) => panic!("terminal read failed: {:?}", error.kind()),
+        Err(_) => {
+            if tasks.host.is_finished() {
+                report_host_exit((&mut tasks.host).await, "terminal output");
+            }
+            panic!(
+                "terminal output timed out while host task was still active; {}",
+                fixture_progress(&tasks.record)
+            );
+        }
+    }
 }
 
 async fn run_success_router(
@@ -984,19 +1131,24 @@ async fn interactive_codex_local_prompt_is_ephemeral_escaped_and_uses_caller_cwd
         options,
         host_input,
         host_output,
-        shutdown,
+        shutdown.clone(),
     ));
+    let mut tasks = InteractiveTasks {
+        host,
+        router,
+        shutdown,
+        record: record.clone(),
+    };
     let mut output = BufReader::new(output);
 
     input.write_all(b"hello local\n").await.unwrap();
-    let rendered = read_terminal_line(&mut output).await;
+    let rendered = read_terminal_line(&mut output, &mut tasks).await;
     assert!(rendered.contains("answer:hello local"));
     assert!(rendered.contains("\\u{001B}"));
     assert!(!rendered.contains('\u{1b}'));
     input.write_all(b"quit\n").await.unwrap();
 
-    assert!(host.await.unwrap().is_ok());
-    router.await.unwrap();
+    tasks.finish().await;
     let records = std::fs::read_to_string(record).unwrap();
     let mut lines = records.lines();
     let initialized: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
@@ -1027,39 +1179,35 @@ async fn interactive_codex_push_rejects_competing_delivery_without_readiness_mes
     let (options, record) = interactive_codex_options(&files, &cwd, 500);
     let (mut input, host_input) = tokio::io::duplex(64 * 1024);
     let (host_output, output) = tokio::io::duplex(64 * 1024);
+    let shutdown = CancellationToken::new();
     let host = tokio::spawn(run_interactive_codex_io(
         client_config(address, true),
         Some(workspace),
         options,
         host_input,
         host_output,
-        CancellationToken::new(),
+        shutdown.clone(),
     ));
+    let mut tasks = InteractiveTasks {
+        host,
+        router,
+        shutdown,
+        record: record.clone(),
+    };
     let mut output = BufReader::new(output);
 
     input.write_all(b"one local turn\n").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if std::fs::read_to_string(&record)
-                .unwrap_or_default()
-                .contains("\"turn\":\"one local turn\"")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    tasks
+        .wait_for_record("\"turn\":\"one local turn\"", Duration::from_secs(2))
+        .await;
     state.deliver_competing.notify_one();
     assert!(
-        read_terminal_line(&mut output)
+        read_terminal_line(&mut output, &mut tasks)
             .await
             .contains("answer:one local turn")
     );
     input.write_all(b"/quit\n").await.unwrap();
-    assert!(host.await.unwrap().is_ok());
-    router.await.unwrap();
+    tasks.finish().await;
 
     assert!(state.readiness.lock().await.is_empty());
     assert_eq!(
@@ -1092,14 +1240,21 @@ async fn interactive_codex_slash_commands_use_router_and_errors_never_become_pro
     let (options, record) = interactive_codex_options(&files, &cwd, 0);
     let (mut input, host_input) = tokio::io::duplex(64 * 1024);
     let (host_output, output) = tokio::io::duplex(64 * 1024);
+    let shutdown = CancellationToken::new();
     let host = tokio::spawn(run_interactive_codex_io(
         client_config(address, true),
         None,
         options,
         host_input,
         host_output,
-        CancellationToken::new(),
+        shutdown.clone(),
     ));
+    let mut tasks = InteractiveTasks {
+        host,
+        router,
+        shutdown,
+        record: record.clone(),
+    };
     let mut output = BufReader::new(output);
 
     for (command, expected) in [
@@ -1114,12 +1269,11 @@ async fn interactive_codex_slash_commands_use_router_and_errors_never_become_pro
         ("/send local:peer\n", "error: usage: /send TARGET TEXT"),
     ] {
         input.write_all(command.as_bytes()).await.unwrap();
-        let line = read_terminal_line(&mut output).await;
+        let line = read_terminal_line(&mut output, &mut tasks).await;
         assert!(line.contains(expected), "{command:?}: {line:?}");
     }
     input.write_all(b"quit\n").await.unwrap();
-    assert!(host.await.unwrap().is_ok());
-    router.await.unwrap();
+    tasks.finish().await;
     let records = std::fs::read_to_string(record).unwrap();
     assert!(!records.contains("\"turn\""));
 }
@@ -1144,24 +1298,20 @@ async fn interactive_codex_shutdown_interrupts_turn_and_closes_provider_and_rout
         host_output,
         shutdown.clone(),
     ));
+    let mut tasks = InteractiveTasks {
+        host,
+        router,
+        shutdown: shutdown.clone(),
+        record: record.clone(),
+    };
 
     input.write_all(b"block until signal\n").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if std::fs::read_to_string(&record)
-                .is_ok_and(|value| value.contains("\"turn\":\"block until signal\""))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    tasks
+        .wait_for_record("\"turn\":\"block until signal\"", Duration::from_secs(3))
+        .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     shutdown.cancel();
-    assert!(host.await.unwrap().is_ok());
-    router.await.unwrap();
+    tasks.finish().await;
     assert!(
         std::fs::read_to_string(record)
             .unwrap()

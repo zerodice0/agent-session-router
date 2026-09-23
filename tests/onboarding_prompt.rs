@@ -387,11 +387,19 @@ fn each_supported_target_executes_only_the_verified_download_with_ticket_on_stdi
         assert!(!Path::new(executable.trim()).exists());
         let requests = server.requests();
         assert_eq!(requests.len(), 1);
+        let request = requests.last().unwrap();
+        let expected = format!("GET /onboarding/files/asr-{target} HTTP/1.1\r\n");
+        let request_line = request.lines().next().unwrap_or("<empty>");
+        let diagnostic_line = if request_line.contains(token) {
+            "<redacted: contains invite token>"
+        } else {
+            request_line
+        };
         assert!(
-            requests
-                .last()
-                .unwrap()
-                .starts_with(&format!("GET /onboarding/files/asr-{target} HTTP/1.1\r\n"))
+            request.starts_with(&expected),
+            "os={os} arch={arch} target={target}: expected request line {:?}, got {:?}",
+            expected.trim_end(),
+            diagnostic_line
         );
         assert!(requests.iter().all(|request| !request.contains(token)));
         client.assert_clean();

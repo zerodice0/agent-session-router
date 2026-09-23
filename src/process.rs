@@ -521,6 +521,14 @@ impl LauncherLock {
     }
 }
 
+impl Drop for LauncherLock {
+    fn drop(&mut self) {
+        // A duplicated or fork-inherited descriptor shares this lock. Closing only
+        // our descriptor can leave it held until every copy closes or execs.
+        while let Err(rustix::io::Errno::INTR) = flock(&self.file, FlockOperation::Unlock) {}
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeStore {
     data_dir: PathBuf,

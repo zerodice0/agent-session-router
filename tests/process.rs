@@ -519,6 +519,34 @@ fn launcher_lock_is_private_nonblocking_and_never_unlinked() {
 }
 
 #[test]
+fn launcher_lock_drop_releases_lock_with_duplicated_descriptor() {
+    let directory = private_temp();
+    let runtime_store = store(&directory);
+    let first = runtime_store.lock().expect("first lock");
+    let duplicate = first.file().try_clone().expect("duplicate lock descriptor");
+    assert!(matches!(
+        runtime_store.lock(),
+        Err(RouterLaunchError::RouterBusy)
+    ));
+
+    drop(first);
+    let second = runtime_store
+        .lock()
+        .expect("dropping the guard releases its lock despite a duplicate descriptor");
+    assert!(matches!(
+        runtime_store.lock(),
+        Err(RouterLaunchError::RouterBusy)
+    ));
+    drop(duplicate);
+    assert!(matches!(
+        runtime_store.lock(),
+        Err(RouterLaunchError::RouterBusy)
+    ));
+    drop(second);
+    drop(runtime_store.lock().expect("released lock"));
+}
+
+#[test]
 fn runtime_record_is_strict_atomic_private_and_instance_guarded() {
     let directory = private_temp();
     let runtime_store = store(&directory);

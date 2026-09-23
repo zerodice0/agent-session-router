@@ -4,7 +4,8 @@ use std::{
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use agent_session_router::{
@@ -128,6 +129,19 @@ async fn workspaces(client: &RouterClient) -> Vec<WorkspaceName> {
 async fn stop(runtime: RouterRuntime) {
     runtime.shutdown().await.unwrap();
     runtime.wait().await.unwrap();
+}
+
+fn stage(mode: &str, stage: &str) {
+    eprintln!("onboarding issue fixture [{mode}]: {stage}");
+}
+
+async fn stop_rejected(runtime: RouterRuntime, mode: &str, label: &str) {
+    stage(mode, &format!("{label} shutdown: before"));
+    runtime.shutdown().await.unwrap();
+    stage(mode, &format!("{label} shutdown: after"));
+    stage(mode, &format!("{label} wait: before"));
+    runtime.wait().await.unwrap();
+    stage(mode, &format!("{label} wait: after"));
 }
 
 fn invitation_counts(data_dir: &Path) -> (i64, i64) {
@@ -322,6 +336,7 @@ async fn reject_authority(
 }
 
 async fn rejected(mode: &str, home: &Path) {
+    stage(mode, "start");
     let data_dir = home.join("data");
     let assets = data_dir.join("bootstrap");
     // Let RouterRuntime create its private data directory in the missing case.
@@ -333,14 +348,21 @@ async fn rejected(mode: &str, home: &Path) {
     if manifest.is_some() {
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
+    stage(mode, "router start: before");
     let runtime = RouterRuntime::start(config(&data_dir, &assets))
         .await
         .unwrap();
+    stage(mode, "router start: after");
     let store = RuntimeStore::new(data_dir.clone()).unwrap();
     store.write(&record(&runtime)).unwrap();
+    stage(mode, "observer connect: before");
     let observer = admin(&runtime, &data_dir).await;
+    stage(mode, "observer connect: after");
+    stage(mode, "initial workspace check: before");
     assert!(workspaces(&observer).await.is_empty());
+    stage(mode, "initial workspace check: after");
     let mut request = options();
+    stage(mode, "configure rejection: before");
     let (expected, other) = match mode {
         "absent-runtime"
         | "runtime-instance-mismatch"
@@ -362,17 +384,25 @@ async fn rejected(mode: &str, home: &Path) {
             None,
         ),
     };
-    let Err(error) = issue_prompt(&data_dir, request).await else {
+    stage(mode, "configure rejection: after");
+    stage(mode, "issue_prompt: before");
+    let result = issue_prompt(&data_dir, request).await;
+    stage(mode, "issue_prompt: after");
+    let Err(error) = result else {
         panic!("issuance must fail for {mode}");
     };
     assert_eq!(error.0, expected, "case {mode}");
     // The independent authenticated connection observes the actor, not a mock.
+    stage(mode, "observer workspace check: before");
     assert!(
         workspaces(&observer).await.is_empty(),
         "failed issuance created a workspace"
     );
+    stage(mode, "observer workspace check: after");
+    stage(mode, "observer close: before");
     observer.close().await.unwrap();
-    stop(runtime).await;
+    stage(mode, "observer close: after");
+    stop_rejected(runtime, mode, "router").await;
     assert_eq!(
         invitation_counts(&data_dir),
         (0, 0),
@@ -380,11 +410,16 @@ async fn rejected(mode: &str, home: &Path) {
     );
     if let Some(foreign) = other {
         let observer = admin(&foreign, &home.join("foreign")).await;
+        stage(mode, "foreign observer workspace check: before");
         assert!(workspaces(&observer).await.is_empty());
+        stage(mode, "foreign observer workspace check: after");
+        stage(mode, "foreign observer close: before");
         observer.close().await.unwrap();
-        stop(foreign).await;
+        stage(mode, "foreign observer close: after");
+        stop_rejected(foreign, mode, "foreign router").await;
         assert_eq!(invitation_counts(&home.join("foreign")), (0, 0));
     }
+    stage(mode, "complete");
 }
 
 fn prompt_ticket(text: &str) -> OnboardingTicket {
@@ -577,9 +612,12 @@ fn onboarding_issue_fixture_child() {
 }
 
 fn run_case(mode: &str) {
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(20);
     let root = tempfile::tempdir().unwrap();
     let home = root.path().canonicalize().unwrap();
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    let stdout_path = home.join("fixture.stdout");
+    let stderr_path = home.join("fixture.stderr");
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", "onboarding_issue_fixture_child", "--nocapture"])
@@ -591,16 +629,34 @@ fn run_case(mode: &str) {
         .env_remove("ASR_CA_FILE")
         .env_remove("ASR_BOOTSTRAP_DIR")
         .env("ROUTER_URL", "ws://127.0.0.1:1/ws")
-        .current_dir(&home);
+        .current_dir(&home)
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()));
     if mode == "relative-assets" {
         command.env("ASR_BOOTSTRAP_DIR", "bundle");
     }
-    let output = command.output().unwrap();
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + FIXTURE_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            panic!(
+                "case {mode} timed out after {FIXTURE_TIMEOUT:?} (exit {status}):\n{}\n{}",
+                String::from_utf8_lossy(&fs::read(&stdout_path).unwrap()),
+                String::from_utf8_lossy(&fs::read(&stderr_path).unwrap())
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
     assert!(
-        output.status.success(),
+        status.success(),
         "case {mode}:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&fs::read(&stdout_path).unwrap()),
+        String::from_utf8_lossy(&fs::read(&stderr_path).unwrap())
     );
 }
 

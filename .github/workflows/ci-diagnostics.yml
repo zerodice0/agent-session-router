@@ -1,0 +1,79 @@
+name: CI onboarding diagnostics
+
+on:
+  push:
+    branches:
+      - fix/ci-interactive-host-diagnostics
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: 1.98.1
+
+jobs:
+  onboarding:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Check out repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node runtime
+        id: node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pinned Rust toolchain
+        id: rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+
+      - name: Verify native target
+        id: target
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          actual_target="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$actual_target" = "$EXPECTED_TARGET"
+
+      - name: Repeat runtime ownership issuance test
+        run: |
+          set -euo pipefail
+          for attempt in {1..15}; do
+            echo "runtime ownership attempt $attempt/15"
+            cargo test --locked --test onboarding_issue runtime_ownership_and_instance_must_be_verified_before_issuance -- --exact --nocapture
+          done
+
+      - name: Repeat verified download target test
+        if: always() && steps.checkout.outcome == 'success' && steps.node.outcome == 'success' && steps.rust.outcome == 'success' && steps.target.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for attempt in {1..15}; do
+            echo "verified download attempt $attempt/15"
+            cargo test --locked --test onboarding_prompt each_supported_target_executes_only_the_verified_download_with_ticket_on_stdin -- --exact --nocapture
+          done
+
+      - name: Repeat conditional instance stop test
+        if: always() && steps.checkout.outcome == 'success' && steps.node.outcome == 'success' && steps.rust.outcome == 'success' && steps.target.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for attempt in {1..15}; do
+            echo "conditional stop attempt $attempt/15"
+            cargo test --locked --test process conditional_stop_removes_only_the_confirmed_live_or_stale_instance -- --exact --nocapture
+          done
